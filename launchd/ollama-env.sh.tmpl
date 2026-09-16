@@ -1,0 +1,28 @@
+#!/bin/bash
+# Rendered by `ragctl install` from ollama-env.sh.tmpl — do not edit the
+# rendered copy in .runtime/launchd/, edit this template and reinstall.
+#
+# Applies rag-stack's Ollama tuning as session-wide launchd env vars, then
+# restarts Ollama.app so it picks them up. Runs at every login via the
+# com.ragstack.ollama-env LaunchAgent (RunAtLoad, no KeepAlive).
+
+set -euo pipefail
+
+launchctl setenv OLLAMA_HOST "127.0.0.1:__OLLAMA_PORT__"
+launchctl setenv OLLAMA_CONTEXT_LENGTH "__OLLAMA_CONTEXT_LENGTH__"
+launchctl setenv OLLAMA_NUM_PARALLEL "__OLLAMA_NUM_PARALLEL__"
+launchctl setenv OLLAMA_MAX_LOADED_MODELS "__OLLAMA_MAX_LOADED_MODELS__"
+launchctl setenv OLLAMA_KEEP_ALIVE "30m"
+launchctl setenv OLLAMA_FLASH_ATTENTION "1"
+
+# Restart Ollama.app so the new env vars actually take effect (launchctl
+# setenv doesn't affect an already-running process). Harmless if it wasn't
+# running yet.
+if pgrep -x "Ollama" >/dev/null 2>&1; then
+  osascript -e 'tell application "Ollama" to quit' >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    pgrep -x "Ollama" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+fi
+open -g -a "Ollama" 2>/dev/null || true

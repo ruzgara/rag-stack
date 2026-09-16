@@ -1,0 +1,19 @@
+#!/bin/bash
+# Rendered by `ragctl install` from docling-serve.sh.tmpl.
+# Runs docling-serve natively (so it can use Apple's MPS/Metal backend),
+# kept alive by the com.ragstack.docling LaunchAgent.
+
+set -euo pipefail
+
+export HF_HOME="__REPO_ROOT__/data/hf-cache"
+export DOCLING_SERVE_ARTIFACTS_PATH="__REPO_ROOT__/data/docling-artifacts"
+export DOCLING_SERVE_ENABLE_UI="true"
+export DOCLING_SERVE_ENABLE_REMOTE_SERVICES="true"
+export DOCLING_SERVE_ALLOW_CUSTOM_VLM_CONFIG="true"
+export DOCLING_SERVE_MAX_SYNC_WAIT="600"
+export DOCLING_SERVE_ENG_LOC_NUM_WORKERS="__DOCLING_LOC_NUM_WORKERS__"
+export DOCLING_NUM_THREADS="__DOCLING_NUM_THREADS__"
+export UVICORN_WORKERS="1"   # more than 1 breaks the local task orchestrator
+
+cd "__REPO_ROOT__/services/docling"
+exec uv run --python 3.12 docling-serve run --host 127.0.0.1 --port "__DOCLING_PORT__"

@@ -1,0 +1,14 @@
+# Runtime data — never committed, never touched by uninstall unless --purge-data
+data/
+.runtime/
+services/*/.venv/
+
+# Secrets / local overrides
+.env
+
+# macOS
+.DS_Store
+
+# uv / python
+__pycache__/
+*.pyc

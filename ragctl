@@ -1,0 +1,496 @@
+#!/bin/bash
+# ragctl — single entry point for the rag-stack deployment.
+#
+# Manages: Ollama.app tuning (native), docling-serve (native), Qdrant +
+# Open WebUI (Docker), and the batch ingestion pipeline. Everything it
+# installs lives inside this repo, in Docker volumes prefixed
+# "ragstack_", or in LaunchAgents labelled "com.ragstack.*".
+#
+# Run `./ragctl help` for the command list.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$REPO_ROOT/.env"
+ENV_EXAMPLE="$REPO_ROOT/.env.example"
+DATA_DIR="$REPO_ROOT/data"
+RUNTIME_DIR="$REPO_ROOT/.runtime"
+LAUNCHD_RENDERED="$RUNTIME_DIR/launchd"
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+LOG_DIR="$DATA_DIR/logs"
+
+# ---------------------------------------------------------------- colors --
+c_red() { printf '\033[31m%s\033[0m\n' "$*"; }
+c_green() { printf '\033[32m%s\033[0m\n' "$*"; }
+c_yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+ok() { c_green "✓ $*"; }
+warn() { c_yellow "! $*"; }
+err() { c_red "✗ $*" >&2; }
+die() { err "$*"; exit 1; }
+
+# ------------------------------------------------------------------ env --
+load_env() {
+    [[ -f "$ENV_FILE" ]] || die ".env not found. Run: cp .env.example .env, edit it, then re-run."
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+    OLLAMA_PORT="${OLLAMA_PORT:-11434}"
+    DOCLING_PORT="${DOCLING_PORT:-5001}"
+    WEBUI_PORT="${WEBUI_PORT:-3000}"
+    QDRANT_PORT="${QDRANT_PORT:-6333}"
+    BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+    MIN_FREE_GB="${MIN_FREE_GB:-41}"
+}
+
+compose() {
+    docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/compose.yaml" "$@"
+}
+
+# ------------------------------------------------------------- preflight --
+check_free_disk_gb() {
+    df -g "$REPO_ROOT" | awk 'NR==2 {print $4}'
+}
+
+cmd_preflight() {
+    local fail=0
+
+    [[ "$(uname -s)" == "Darwin" ]] || { err "This stack targets macOS."; fail=1; }
+    [[ "$(uname -m)" == "arm64" ]] || warn "Not running on arm64 — MLX/Metal acceleration assumptions won't hold."
+
+    local free_gb
+    free_gb="$(check_free_disk_gb)"
+    if (( free_gb < MIN_FREE_GB )); then
+        err "Only ${free_gb}GB free on disk; need at least ${MIN_FREE_GB}GB (see README for the breakdown)."
+        err "Free up $((MIN_FREE_GB - free_gb))GB more, then re-run. ragctl will not delete anything for you."
+        fail=1
+    else
+        ok "Disk space: ${free_gb}GB free (need ${MIN_FREE_GB}GB)"
+    fi
+
+    if ! command -v brew >/dev/null; then
+        err "Homebrew is required: https://brew.sh"
+        fail=1
+    else
+        ok "Homebrew found"
+    fi
+
+    if ! command -v uv >/dev/null && [[ ! -x "$HOME/.local/bin/uv" ]]; then
+        warn "uv not found yet — will be installed via Brewfile"
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        err "Docker is not running. Start Docker Desktop (or install it: https://www.docker.com/products/docker-desktop/), then re-run."
+        fail=1
+    else
+        local mem_bytes
+        mem_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
+        local mem_gb=$(( mem_bytes / 1073741824 ))
+        if (( mem_gb > 0 && mem_gb < 6 )); then
+            warn "Docker Desktop has only ${mem_gb}GB of RAM allocated. Recommend >=8GB in Docker Desktop -> Settings -> Resources."
+        fi
+        ok "Docker is running"
+    fi
+
+    if ! curl -sf "http://127.0.0.1:${OLLAMA_PORT}/api/version" >/dev/null 2>&1; then
+        err "Ollama is not reachable on 127.0.0.1:${OLLAMA_PORT}. Install/start Ollama.app: https://ollama.com/download"
+        fail=1
+    else
+        ok "Ollama is reachable"
+    fi
+
+    for p in "$WEBUI_PORT" "$DOCLING_PORT" "$QDRANT_PORT"; do
+        if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+            warn "Port $p is already in use — check it's not a leftover ragstack process (ragctl status)."
+        fi
+    done
+
+    return "$fail"
+}
+
+# --------------------------------------------------------------- render --
+render_template() {
+    local src="$1" dst="$2"
+    mkdir -p "$(dirname "$dst")"
+    sed \
+        -e "s#__REPO_ROOT__#${REPO_ROOT}#g" \
+        -e "s#__OLLAMA_PORT__#${OLLAMA_PORT}#g" \
+        -e "s#__DOCLING_PORT__#${DOCLING_PORT}#g" \
+        -e "s#__OLLAMA_CONTEXT_LENGTH__#${OLLAMA_CONTEXT_LENGTH:-32768}#g" \
+        -e "s#__OLLAMA_NUM_PARALLEL__#${OLLAMA_NUM_PARALLEL:-4}#g" \
+        -e "s#__OLLAMA_MAX_LOADED_MODELS__#${OLLAMA_MAX_LOADED_MODELS:-4}#g" \
+        -e "s#__DOCLING_NUM_THREADS__#${DOCLING_NUM_THREADS:-4}#g" \
+        -e "s#__DOCLING_LOC_NUM_WORKERS__#${DOCLING_LOC_NUM_WORKERS:-2}#g" \
+        "$src" > "$dst"
+}
+
+render_all() {
+    mkdir -p "$LAUNCHD_RENDERED" "$LOG_DIR"
+    render_template "$REPO_ROOT/launchd/ollama-env.sh.tmpl" "$LAUNCHD_RENDERED/ollama-env.sh"
+    render_template "$REPO_ROOT/launchd/docling-serve.sh.tmpl" "$LAUNCHD_RENDERED/docling-serve.sh"
+    render_template "$REPO_ROOT/launchd/ingest-watch.sh.tmpl" "$LAUNCHD_RENDERED/ingest-watch.sh"
+    chmod +x "$LAUNCHD_RENDERED"/*.sh
+
+    render_template "$REPO_ROOT/launchd/com.ragstack.ollama-env.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.ollama-env.plist"
+    render_template "$REPO_ROOT/launchd/com.ragstack.docling.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.docling.plist"
+    render_template "$REPO_ROOT/launchd/com.ragstack.ingest.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.ingest.plist"
+}
+
+launchd_label_loaded() {
+    launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1
+}
+
+load_agent() {
+    local plist_name="$1"
+    local src="$LAUNCHD_RENDERED/$plist_name.plist"
+    local dst="$LAUNCH_AGENTS_DIR/$plist_name.plist"
+    mkdir -p "$LAUNCH_AGENTS_DIR"
+    cp "$src" "$dst"
+    launchctl bootout "gui/$(id -u)/$plist_name" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$(id -u)" "$dst"
+}
+
+unload_agent() {
+    local plist_name="$1"
+    launchctl bootout "gui/$(id -u)/$plist_name" >/dev/null 2>&1 || true
+    rm -f "$LAUNCH_AGENTS_DIR/$plist_name.plist"
+}
+
+# --------------------------------------------------------------- install --
+cmd_install() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        cp "$ENV_EXAMPLE" "$ENV_FILE"
+        warn "Created .env from .env.example. Fill in CHAT_MODEL_EVERYDAY, CHAT_MODEL_HARD, EMBED_MODEL, VLM_MODEL, then re-run 'ragctl install'."
+        exit 1
+    fi
+    load_env
+
+    echo "== Preflight =="
+    cmd_preflight || die "Preflight failed. Fix the items above and re-run."
+
+    for m in CHAT_MODEL_EVERYDAY EMBED_MODEL; do
+        [[ -n "${!m:-}" ]] || die "$m is empty in .env. Set it (and run 'ollama pull <name>') before installing."
+    done
+
+    if [[ -z "${WEBUI_SECRET_KEY:-}" ]]; then
+        local secret
+        secret="$(openssl rand -hex 32)"
+        sed -i.bak "s#^WEBUI_SECRET_KEY=.*#WEBUI_SECRET_KEY=${secret}#" "$ENV_FILE"
+        rm -f "$ENV_FILE.bak"
+        load_env
+        ok "Generated WEBUI_SECRET_KEY"
+    fi
+
+    mkdir -p "$DATA_DIR"/{inbox,work,processed,failed,logs,docling-artifacts,hf-cache}
+
+    echo "== System dependencies (brew bundle) =="
+    brew bundle --file="$REPO_ROOT/Brewfile"
+
+    echo "== Python environments (uv sync) =="
+    (cd "$REPO_ROOT/services/docling" && uv sync --python 3.12)
+    (cd "$REPO_ROOT/services/ingest" && uv sync --python 3.12)
+
+    echo "== LaunchAgents =="
+    render_all
+    load_agent "com.ragstack.ollama-env"
+    load_agent "com.ragstack.docling"
+    if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
+        load_agent "com.ragstack.ingest"
+        ok "Ingest auto-run enabled (watching data/inbox)"
+    else
+        unload_agent "com.ragstack.ingest"
+    fi
+    ok "LaunchAgents installed and loaded"
+
+    echo "== Prefetching docling models (best-effort) =="
+    (cd "$REPO_ROOT/services/docling" && HF_HOME="$DATA_DIR/hf-cache" uv run --python 3.12 docling-tools models download -o "$DATA_DIR/docling-artifacts") \
+        || warn "Model prefetch skipped/failed — docling-serve will download models into data/docling-artifacts on first use instead."
+
+    echo "== Docker services =="
+    compose pull
+    compose up -d
+
+    echo
+    ok "Install complete."
+    cat <<EOF
+
+Next steps:
+  1. Open http://${BIND_ADDR}:${WEBUI_PORT} and create the admin account.
+  2. In Open WebUI: Admin Panel -> Settings -> Users, then your user ->
+     Settings -> Account -> API keys, create a key, and set OWUI_API_KEY
+     in .env to it.
+  3. Run: ./ragctl webui-setup
+  4. Run: ./ragctl health
+EOF
+}
+
+# ------------------------------------------------------------- up/down --
+cmd_up() {
+    load_env
+    render_all
+    load_agent "com.ragstack.ollama-env"
+    load_agent "com.ragstack.docling"
+    if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
+        load_agent "com.ragstack.ingest"
+    fi
+    compose up -d
+    ok "Stack is up."
+}
+
+cmd_down() {
+    load_env
+    compose down
+    unload_agent "com.ragstack.docling"
+    unload_agent "com.ragstack.ingest"
+    ok "Docker services stopped and docling-serve unloaded. Ollama.app is left running (it's a shared, native app)."
+}
+
+cmd_restart() {
+    cmd_down
+    cmd_up
+}
+
+cmd_reload() {
+    # Re-render configs from .env and restart the native services + containers
+    # so changed settings actually take effect.
+    load_env
+    render_all
+    load_agent "com.ragstack.ollama-env"
+    load_agent "com.ragstack.docling"
+    if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
+        load_agent "com.ragstack.ingest"
+    else
+        unload_agent "com.ragstack.ingest"
+    fi
+    compose up -d --force-recreate
+    ok "Reloaded. Note: most Open WebUI RAG settings are PersistentConfig and only apply on a FIRST start of a fresh volume — change them in Admin -> Settings -> Documents if they don't take effect."
+}
+
+# -------------------------------------------------------------- status --
+cmd_status() {
+    load_env
+    echo "== Native services =="
+    for label in com.ragstack.ollama-env com.ragstack.docling com.ragstack.ingest; do
+        if launchd_label_loaded "$label"; then ok "$label loaded"; else info "$label not loaded"; fi
+    done
+    if pgrep -x "Ollama" >/dev/null 2>&1; then ok "Ollama.app running"; else warn "Ollama.app not running"; fi
+
+    echo "== Docker services =="
+    compose ps
+
+    echo "== Reachability =="
+    for pair in "Ollama:http://127.0.0.1:${OLLAMA_PORT}/api/version" \
+                "docling-serve:http://127.0.0.1:${DOCLING_PORT}/health" \
+                "Qdrant:http://127.0.0.1:${QDRANT_PORT}/readyz" \
+                "Open WebUI:http://127.0.0.1:${WEBUI_PORT}/health"; do
+        name="${pair%%:*}"; url="${pair#*:}"
+        if curl -sf "$url" >/dev/null 2>&1; then ok "$name reachable ($url)"; else warn "$name NOT reachable ($url)"; fi
+    done
+}
+
+cmd_logs() {
+    load_env
+    local svc="${1:-}"
+    case "$svc" in
+        docling) tail -n 100 -f "$LOG_DIR/docling-serve.log" ;;
+        ollama) tail -n 100 -f "$LOG_DIR/ollama-env.log" ;;
+        ingest) tail -n 100 -f "$LOG_DIR/ingest-watch.log" ;;
+        qdrant|open-webui|webui) compose logs -f "${svc/webui/open-webui}" ;;
+        "") compose logs -f ;;
+        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, qdrant, webui" ;;
+    esac
+}
+
+# ------------------------------------------------------------- models --
+cmd_models_check() {
+    load_env
+    local missing=0
+    local installed
+    installed="$(curl -sf "http://127.0.0.1:${OLLAMA_PORT}/api/tags" | python3 -c 'import json,sys; print("\n".join(m["name"] for m in json.load(sys.stdin).get("models",[])))' 2>/dev/null || true)"
+    for m in CHAT_MODEL_EVERYDAY CHAT_MODEL_HARD EMBED_MODEL VLM_MODEL; do
+        local name="${!m:-}"
+        if [[ -z "$name" ]]; then
+            warn "$m is not set in .env"
+            continue
+        fi
+        if grep -qxF "$name" <<<"$installed"; then
+            ok "$m -> $name (installed)"
+        else
+            err "$m -> $name (NOT found in 'ollama list'; run: ollama pull $name)"
+            missing=1
+        fi
+    done
+    return "$missing"
+}
+
+# ---------------------------------------------------------- webui-setup --
+owui_api() {
+    local method="$1" path="$2" body="${3:-}"
+    load_env
+    [[ -n "${OWUI_API_KEY:-}" ]] || die "OWUI_API_KEY is not set in .env. See README: create an API key in Open WebUI first."
+    if [[ -n "$body" ]]; then
+        curl -sf -X "$method" "http://127.0.0.1:${WEBUI_PORT}${path}" \
+            -H "Authorization: Bearer ${OWUI_API_KEY}" -H "Content-Type: application/json" \
+            -d "$body"
+    else
+        curl -sf -X "$method" "http://127.0.0.1:${WEBUI_PORT}${path}" \
+            -H "Authorization: Bearer ${OWUI_API_KEY}"
+    fi
+}
+
+cmd_webui_setup() {
+    load_env
+    command -v python3 >/dev/null || die "python3 is required for webui-setup"
+
+    echo "== Knowledge base =="
+    local kb_id
+    kb_id="$(owui_api GET "/api/v1/knowledge/" | python3 -c "
+import json, sys, os
+kbs = json.load(sys.stdin)
+name = os.environ['KB_NAME']
+for kb in kbs:
+    if kb.get('name') == name:
+        print(kb['id']); sys.exit(0)
+print('')
+")"
+    if [[ -z "$kb_id" ]]; then
+        kb_id="$(owui_api POST "/api/v1/knowledge/create" "{\"name\":\"${KB_NAME}\",\"description\":\"Created by ragctl webui-setup\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
+        ok "Created knowledge base '${KB_NAME}' ($kb_id)"
+    else
+        ok "Knowledge base '${KB_NAME}' already exists ($kb_id)"
+    fi
+
+    echo "== Model presets =="
+    for pair in "Everyday:${CHAT_MODEL_EVERYDAY:-}" "Hard questions:${CHAT_MODEL_HARD:-}"; do
+        local label="${pair%%:*}" base_model="${pair#*:}"
+        [[ -n "$base_model" ]] || { warn "Skipping preset '$label': model not set in .env"; continue; }
+        local model_id
+        model_id="ragstack-$(echo "$label" | tr '[:upper:] ' '[:lower:]-')"
+        owui_api POST "/api/v1/models/create" "$(python3 -c "
+import json
+print(json.dumps({
+    'id': '$model_id',
+    'name': '$label',
+    'base_model_id': '$base_model',
+    'meta': {'knowledge': [{'id': '$kb_id', 'name': '${KB_NAME}'}]},
+    'params': {},
+}))
+")" >/dev/null 2>&1 && ok "Preset '$label' -> $base_model (KB attached)" || warn "Preset '$label' may already exist (skipped)"
+    done
+
+    if [[ "${ENABLE_SIGNUP:-true}" == "true" ]]; then
+        warn "ENABLE_SIGNUP is still 'true' in .env. Once your admin account exists, set it to 'false' and run 'ragctl reload' to stop public self-registration."
+    fi
+}
+
+# ----------------------------------------------------------------- ingest --
+cmd_ingest() {
+    load_env
+    (cd "$REPO_ROOT/services/ingest" && uv run --python 3.12 ingest.py "$@")
+}
+
+# ----------------------------------------------------------------- health --
+cmd_health() {
+    load_env
+    local fail=0
+    echo "== Ollama =="
+    if curl -sf "http://127.0.0.1:${OLLAMA_PORT}/api/version" >/dev/null; then ok "reachable"; else err "unreachable"; fail=1; fi
+    cmd_models_check || fail=1
+    if [[ -n "${EMBED_MODEL:-}" ]]; then
+        if curl -sf "http://127.0.0.1:${OLLAMA_PORT}/api/embed" -d "{\"model\":\"${EMBED_MODEL}\",\"input\":\"health check\"}" | grep -q "embedding"; then
+            ok "embedding model responds"
+        else
+            err "embedding model did not return a vector"; fail=1
+        fi
+    fi
+
+    echo "== docling-serve =="
+    curl -sf "http://127.0.0.1:${DOCLING_PORT}/health" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
+
+    echo "== Qdrant =="
+    curl -sf "http://127.0.0.1:${QDRANT_PORT}/readyz" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
+
+    echo "== Open WebUI =="
+    curl -sf "http://127.0.0.1:${WEBUI_PORT}/health" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
+
+    echo "== Container -> host connectivity =="
+    if compose ps --status running 2>/dev/null | grep -q open-webui; then
+        compose exec -T open-webui curl -sf "http://host.docker.internal:${OLLAMA_PORT}/api/version" >/dev/null 2>&1 \
+            && ok "open-webui -> host Ollama" || { err "open-webui cannot reach host Ollama"; fail=1; }
+        compose exec -T open-webui curl -sf "http://host.docker.internal:${DOCLING_PORT}/health" >/dev/null 2>&1 \
+            && ok "open-webui -> host docling-serve" || { err "open-webui cannot reach host docling-serve"; fail=1; }
+    else
+        warn "open-webui container not running, skipping container->host checks"
+    fi
+
+    if (( fail )); then err "Health check found problems."; else ok "All checks passed."; fi
+    return "$fail"
+}
+
+# -------------------------------------------------------------- uninstall --
+cmd_uninstall() {
+    load_env
+    local purge=0
+    [[ "${1:-}" == "--purge-data" ]] && purge=1
+
+    compose down -v 2>/dev/null || true
+    unload_agent "com.ragstack.ollama-env"
+    unload_agent "com.ragstack.docling"
+    unload_agent "com.ragstack.ingest"
+    rm -rf "$RUNTIME_DIR"
+    for svc in docling ingest; do rm -rf "$REPO_ROOT/services/$svc/.venv"; done
+
+    if (( purge )); then
+        rm -rf "$DATA_DIR"
+        ok "Removed Docker volumes, LaunchAgents, local Python envs and data/."
+    else
+        ok "Removed Docker volumes, LaunchAgents and local Python envs. data/ was left in place — pass --purge-data to remove it too."
+    fi
+    warn "Ollama.app itself was left installed and running; this stack only tuned its env vars via launchctl setenv (cleared on next reboot, or unset manually)."
+}
+
+# -------------------------------------------------------------------- cli --
+usage() {
+    cat <<EOF
+ragctl — control the rag-stack deployment
+
+Usage: ./ragctl <command> [args]
+
+  install              Preflight checks, install deps, start everything
+  up                    Start native services + Docker containers
+  down                  Stop Docker containers + docling-serve (Ollama.app left running)
+  restart               down then up
+  reload                Re-render configs from .env and restart everything
+  status                Show what's running and reachable
+  logs [svc]             Tail logs (svc: docling, ollama, ingest, qdrant, webui)
+  models check           Verify .env model names exist in 'ollama list'
+  webui-setup             Create the knowledge base + chat presets (after admin signup)
+  ingest [--force-vlm]    Run the batch inbox -> knowledge base pipeline once
+  health                 End-to-end connectivity check
+  uninstall [--purge-data]  Tear down containers, agents and local envs
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"; shift || true
+    case "$cmd" in
+        install) cmd_install "$@" ;;
+        up) cmd_up "$@" ;;
+        down) cmd_down "$@" ;;
+        restart) cmd_restart "$@" ;;
+        reload) cmd_reload "$@" ;;
+        status) cmd_status "$@" ;;
+        logs) cmd_logs "$@" ;;
+        models)
+            case "${1:-}" in check) cmd_models_check ;; *) die "Usage: ragctl models check" ;; esac ;;
+        webui-setup) cmd_webui_setup "$@" ;;
+        ingest) cmd_ingest "$@" ;;
+        health) cmd_health "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        help|-h|--help) usage ;;
+        *) err "Unknown command: $cmd"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"

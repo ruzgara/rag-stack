@@ -1,0 +1,10 @@
+#!/bin/bash
+# Rendered by `ragctl install` from ingest-watch.sh.tmpl.
+# Fired by the com.ragstack.ingest LaunchAgent (WatchPaths on data/inbox)
+# only when INGEST_AUTORUN=true in .env. Debounces briefly since WatchPaths
+# fires once per changed file, then runs the batch pipeline once.
+
+set -euo pipefail
+sleep 5
+cd "__REPO_ROOT__/services/ingest"
+exec uv run --python 3.12 ingest.py

@@ -1,0 +1,70 @@
+name: ragstack
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - ragstack_qdrant:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.11.3
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${WEBUI_PORT:-3000}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      # -- core --
+      WEBUI_NAME: "${WEBUI_NAME:-RAG Stack}"
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY}"
+      ENABLE_SIGNUP: "${ENABLE_SIGNUP:-true}"
+      OLLAMA_BASE_URL: "http://host.docker.internal:${OLLAMA_PORT:-11434}"
+
+      # -- vector db: qdrant --
+      VECTOR_DB: "qdrant"
+      QDRANT_URI: "http://qdrant:6333"
+      ENABLE_QDRANT_MULTITENANCY_MODE: "true"
+
+      # -- content extraction: docling-serve (native, on the host) --
+      CONTENT_EXTRACTION_ENGINE: "docling"
+      DOCLING_SERVER_URL: "http://host.docker.internal:${DOCLING_PORT:-5001}"
+      DOCLING_PARAMS: >-
+        {"do_ocr": true, "ocr_engine": "ocrmac", "table_mode": "accurate",
+        "pdf_backend": "dlparse_v4"}
+
+      # -- embeddings: ollama (native, on the host) --
+      RAG_EMBEDDING_ENGINE: "ollama"
+      RAG_EMBEDDING_MODEL: "${EMBED_MODEL}"
+      RAG_OLLAMA_BASE_URL: "http://host.docker.internal:${OLLAMA_PORT:-11434}"
+
+      # -- retrieval: hybrid search + local CPU reranker --
+      ENABLE_RAG_HYBRID_SEARCH: "true"
+      RAG_RERANKING_MODEL: "${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}"
+      RAG_TOP_K: "${RAG_TOP_K:-20}"
+      RAG_TOP_K_RERANKER: "${RAG_TOP_K_RERANKER:-6}"
+      CHUNK_SIZE: "${CHUNK_SIZE:-1500}"
+      CHUNK_OVERLAP: "${CHUNK_OVERLAP:-200}"
+    volumes:
+      - ragstack_openwebui:/app/backend/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  ragstack_qdrant:
+    name: ragstack_qdrant
+  ragstack_openwebui:
+    name: ragstack_openwebui
