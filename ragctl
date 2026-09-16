@@ -347,7 +347,8 @@ cmd_webui_setup() {
     local kb_id
     kb_id="$(owui_api GET "/api/v1/knowledge/" | python3 -c "
 import json, sys, os
-kbs = json.load(sys.stdin)
+body = json.load(sys.stdin)
+kbs = body['items'] if isinstance(body, dict) else body
 name = os.environ['KB_NAME']
 for kb in kbs:
     if kb.get('name') == name:
@@ -367,16 +368,21 @@ print('')
         [[ -n "$base_model" ]] || { warn "Skipping preset '$label': model not set in .env"; continue; }
         local model_id
         model_id="ragstack-$(echo "$label" | tr '[:upper:] ' '[:lower:]-')"
-        owui_api POST "/api/v1/models/create" "$(python3 -c "
-import json
+        local body
+        body="$(RAGSTACK_MODEL_ID="$model_id" RAGSTACK_LABEL="$label" RAGSTACK_BASE_MODEL="$base_model" \
+            RAGSTACK_KB_ID="$kb_id" RAGSTACK_KB_NAME="$KB_NAME" python3 -c '
+import json, os
+e = os.environ
 print(json.dumps({
-    'id': '$model_id',
-    'name': '$label',
-    'base_model_id': '$base_model',
-    'meta': {'knowledge': [{'id': '$kb_id', 'name': '${KB_NAME}'}]},
-    'params': {},
+    "id": e["RAGSTACK_MODEL_ID"],
+    "name": e["RAGSTACK_LABEL"],
+    "base_model_id": e["RAGSTACK_BASE_MODEL"],
+    "meta": {"knowledge": [{"id": e["RAGSTACK_KB_ID"], "name": e["RAGSTACK_KB_NAME"]}]},
+    "params": {},
 }))
-")" >/dev/null 2>&1 && ok "Preset '$label' -> $base_model (KB attached)" || warn "Preset '$label' may already exist (skipped)"
+')"
+        owui_api POST "/api/v1/models/create" "$body" >/dev/null 2>&1 \
+            && ok "Preset '$label' -> $base_model (KB attached)" || warn "Preset '$label' may already exist (skipped)"
     done
 
     if [[ "${ENABLE_SIGNUP:-true}" == "true" ]]; then
