@@ -442,7 +442,10 @@ cmd_health() {
     curl -sf "http://127.0.0.1:${WEBUI_PORT}/health" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
 
     echo "== Container -> host connectivity =="
-    if compose ps --status running 2>/dev/null | grep -q open-webui; then
+    # -q prints just the container ID (one token) when running, nothing
+    # otherwise — more robust than grepping the formatted table, which is
+    # sensitive to column widths/locale and was seen to flicker false.
+    if [[ -n "$(compose ps -q open-webui 2>/dev/null)" ]]; then
         compose exec -T open-webui curl -sf "http://host.docker.internal:${OLLAMA_PORT}/api/version" >/dev/null 2>&1 \
             && ok "open-webui -> host Ollama" || { err "open-webui cannot reach host Ollama"; fail=1; }
         compose exec -T open-webui curl -sf "http://host.docker.internal:${DOCLING_PORT}/health" >/dev/null 2>&1 \
