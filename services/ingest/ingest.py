@@ -217,7 +217,9 @@ def owui_headers(cfg: Config) -> dict:
 def owui_get_or_create_kb(client: httpx.Client, cfg: Config) -> str:
     resp = client.get(f"{cfg.owui_url}/api/v1/knowledge/", headers=owui_headers(cfg))
     resp.raise_for_status()
-    for kb in resp.json():
+    body = resp.json()
+    kbs = body["items"] if isinstance(body, dict) else body  # paginated {"items": [...], "total": N}
+    for kb in kbs:
         if kb.get("name") == cfg.kb_name:
             return kb["id"]
     resp = client.post(
