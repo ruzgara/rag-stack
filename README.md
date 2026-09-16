@@ -140,13 +140,16 @@ Open WebUI sends it to docling-serve for parsing automatically.
 ```
 
 Each file goes through: OCRmyPDF (adds a text layer to scanned pages only;
-untouched if the PDF is already digital) → Docling's standard parser →
-a quality check → and, only if that check fails (or you pass
-`--force-vlm`), Docling's VLM pipeline using your configured `VLM_MODEL` as
-an OCR fallback. Results are pushed into the same knowledge base the chat
-UI uses. Originals move to `data/processed/` or `data/failed/`, and every
-run is logged to `data/manifest.jsonl` (file hash, route taken, character
-count) so re-running `ingest` never reprocesses a file twice.
+untouched if the PDF already has text — set `FORCE_OCR=true` in `.env` to
+re-OCR every page unconditionally instead, which is useful when a PDF
+already has a text layer but it's garbage from a bad prior OCR pass) →
+Docling's standard parser → a quality check → and, only if that check
+fails (or you pass `--force-vlm`), Docling's VLM pipeline using your
+configured `VLM_MODEL` as an OCR fallback. Results are pushed into the
+same knowledge base the chat UI uses. Originals move to `data/processed/`
+or `data/failed/`, and every run is logged to `data/manifest.jsonl` (file
+hash, route taken, character count) so re-running `ingest` never
+reprocesses a file twice.
 
 Set `INGEST_AUTORUN=true` in `.env` and run `./ragctl reload` to have this
 happen automatically whenever a file lands in `data/inbox/`.
@@ -214,6 +217,13 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
 - **Ingest quality gate keeps triggering the VLM fallback unnecessarily** —
   raise `MIN_CHARS_PER_PAGE` in `.env`, or check the OCR language
   (`OCR_LANG`) matches your documents.
+- **A scanned PDF's text looks plausible but is subtly wrong** (misread
+  characters, swapped words) — this can slip past the quality gate
+  entirely, since it only checks for *obviously* broken text (too short,
+  full of junk characters), not wrong-but-readable text. If the PDF
+  already carries a bad OCR layer from before it reached you, set
+  `FORCE_OCR=true` in `.env` so OCRmyPDF re-OCRs every page instead of
+  skipping pages that already "have text."
 - **Versions**: `compose.yaml` pins `qdrant/qdrant` and
   `ghcr.io/open-webui/open-webui` to specific tags, checked at the time this
   repo was written. If a pull fails because a tag was retired, check the

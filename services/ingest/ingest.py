@@ -65,6 +65,7 @@ class Config:
     vlm_model: str
     ocr_lang: str
     min_chars_per_page: int
+    force_ocr: bool = False
     force_vlm: bool = False
 
     @classmethod
@@ -86,6 +87,7 @@ class Config:
             vlm_model=env.get("VLM_MODEL", ""),
             ocr_lang=env.get("OCR_LANG", "eng"),
             min_chars_per_page=int(env.get("MIN_CHARS_PER_PAGE", "200")),
+            force_ocr=env.get("FORCE_OCR", "false").strip().lower() == "true",
             force_vlm=force_vlm,
         )
 
@@ -140,13 +142,20 @@ def pdf_page_count(path: Path) -> int:
         return 1
 
 
-def run_ocrmypdf(src: Path, dst: Path, lang: str) -> Path:
-    """Add a text layer to scanned pages only; leaves digital pages alone.
+def run_ocrmypdf(src: Path, dst: Path, lang: str, force: bool = False) -> Path:
+    """Add a text layer to scanned pages. By default (force=False) skips any
+    page that already has text, whatever its quality -- fast and safe for
+    born-digital PDFs, but leaves a bad pre-existing OCR layer untouched.
+    With force=True (FORCE_OCR=true in .env), every page is rasterized and
+    re-OCR'd unconditionally, discarding any existing text layer -- use this
+    when your inbox is scans with known-bad prior OCR baked in.
     Returns the path to use for the next step (dst on success, src if
-    ocrmypdf declines because the PDF is already fully text, exit code 6)."""
+    ocrmypdf declines because the PDF is already fully text, exit code 6 --
+    only possible in non-force mode)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
+    text_strategy = "--force-ocr" if force else "--skip-text"
     cmd = [
-        "ocrmypdf", "--skip-text", "--rotate-pages", "-l", lang,
+        "ocrmypdf", text_strategy, "--rotate-pages", "-l", lang,
         "--output-type", "pdf", str(src), str(dst),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -276,8 +285,11 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, kb_id: str) -> Re
         if suffix in PDF_SUFFIXES:
             WORK.mkdir(parents=True, exist_ok=True)
             ocr_out = WORK / f"{sha}.pdf"
-            convert_path = run_ocrmypdf(path, ocr_out, cfg.ocr_lang)
-            route_parts.append("ocr" if convert_path == ocr_out else "digital")
+            convert_path = run_ocrmypdf(path, ocr_out, cfg.ocr_lang, force=cfg.force_ocr)
+            if convert_path == ocr_out:
+                route_parts.append("force-ocr" if cfg.force_ocr else "ocr")
+            else:
+                route_parts.append("digital")
 
         route_parts.append("standard")
         md = docling_convert_standard(client, cfg, convert_path)
