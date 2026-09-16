@@ -4,6 +4,11 @@ version = "0.1.0"
 requires-python = "==3.12.*"
 dependencies = [
     "docling-serve[ui]>=1.7.0,<2",
+    # docling-serve's own extras only cover tesserocr/easyocr/rapidocr;
+    # ocrmac (Apple Vision framework OCR, used by compose.yaml's
+    # DOCLING_PARAMS and native OCR on macOS) lives behind docling-slim's
+    # own extra group.
+    "docling-slim[feat-ocr-mac]",
 ]
 
 [tool.uv]

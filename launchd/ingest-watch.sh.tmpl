@@ -5,6 +5,11 @@
 # fires once per changed file, then runs the batch pipeline once.
 
 set -euo pipefail
+
+# launchd runs this with a bare PATH — add Homebrew (ocrmypdf, tesseract,
+# ghostscript) and uv so the pipeline's subprocess calls can find them.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+
 sleep 5
 cd "__REPO_ROOT__/services/ingest"
-exec uv run --python 3.12 ingest.py
+exec "__UV_BIN__" run --python 3.12 ingest.py

@@ -110,11 +110,28 @@ cmd_preflight() {
 }
 
 # --------------------------------------------------------------- render --
+resolve_uv_bin() {
+    # launchd runs our scripts with a bare PATH, so bake in an absolute
+    # path to uv rather than relying on it being found at runtime.
+    if command -v uv >/dev/null 2>&1; then
+        command -v uv
+    elif [[ -x /opt/homebrew/bin/uv ]]; then
+        echo /opt/homebrew/bin/uv
+    elif [[ -x /usr/local/bin/uv ]]; then
+        echo /usr/local/bin/uv
+    elif [[ -x "$HOME/.local/bin/uv" ]]; then
+        echo "$HOME/.local/bin/uv"
+    else
+        die "uv not found. Run 'brew bundle --file=$REPO_ROOT/Brewfile' (or 'ragctl install') first."
+    fi
+}
+
 render_template() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"
     sed \
         -e "s#__REPO_ROOT__#${REPO_ROOT}#g" \
+        -e "s#__UV_BIN__#$(resolve_uv_bin)#g" \
         -e "s#__OLLAMA_PORT__#${OLLAMA_PORT}#g" \
         -e "s#__DOCLING_PORT__#${DOCLING_PORT}#g" \
         -e "s#__OLLAMA_CONTEXT_LENGTH__#${OLLAMA_CONTEXT_LENGTH:-32768}#g" \
@@ -314,7 +331,11 @@ cmd_models_check() {
             warn "$m is not set in .env"
             continue
         fi
-        if grep -qxF "$name" <<<"$installed"; then
+        # Ollama normalizes an untagged name to "<name>:latest" in 'ollama list',
+        # so a bare "bge-m3" in .env must also match "bge-m3:latest".
+        local name_latest="$name"
+        [[ "$name" == *:* ]] || name_latest="${name}:latest"
+        if grep -qxF "$name" <<<"$installed" || grep -qxF "$name_latest" <<<"$installed"; then
             ok "$m -> $name (installed)"
         else
             err "$m -> $name (NOT found in 'ollama list'; run: ollama pull $name)"

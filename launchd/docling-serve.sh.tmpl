@@ -5,6 +5,11 @@
 
 set -euo pipefail
 
+# launchd runs this with a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) — it
+# doesn't source shell rc files, so Homebrew/uv-installed tools aren't
+# found unless we add them explicitly.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+
 export HF_HOME="__REPO_ROOT__/data/hf-cache"
 export DOCLING_SERVE_ARTIFACTS_PATH="__REPO_ROOT__/data/docling-artifacts"
 export DOCLING_SERVE_ENABLE_UI="true"
@@ -16,4 +21,4 @@ export DOCLING_NUM_THREADS="__DOCLING_NUM_THREADS__"
 export UVICORN_WORKERS="1"   # more than 1 breaks the local task orchestrator
 
 cd "__REPO_ROOT__/services/docling"
-exec uv run --python 3.12 docling-serve run --host 127.0.0.1 --port "__DOCLING_PORT__"
+exec "__UV_BIN__" run --python 3.12 docling-serve run --host 127.0.0.1 --port "__DOCLING_PORT__"
