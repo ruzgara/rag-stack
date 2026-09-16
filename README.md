@@ -130,7 +130,12 @@ Then, in the browser:
 
 **Chat uploads** — the simplest path. In Open WebUI, attach a file directly
 to a chat, or add it to the knowledge base under Workspace → Knowledge.
-Open WebUI sends it to docling-serve for parsing automatically.
+Open WebUI sends it to docling-serve for parsing automatically, with
+`do_ocr` always on. `FORCE_OCR=true` in `.env` applies here too — it also
+makes docling's own `ocrmac` backend re-OCR every page unconditionally
+instead of trusting any existing text layer, matching the same toggle
+used by batch ingestion below. Restart with `./ragctl reload` after
+changing it.
 
 **Batch ingestion** — for OCR-heavy or bulk documents. Drop files into
 `data/inbox/` and run:

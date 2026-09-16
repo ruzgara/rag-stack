@@ -39,9 +39,13 @@ services:
       # -- content extraction: docling-serve (native, on the host) --
       CONTENT_EXTRACTION_ENGINE: "docling"
       DOCLING_SERVER_URL: "http://host.docker.internal:${DOCLING_PORT:-5001}"
+      # force_ocr reuses the same FORCE_OCR .env toggle as ingest.py's
+      # OCRmyPDF pass, so one setting controls both paths: re-OCR every
+      # page via docling's own ocrmac backend instead of trusting any
+      # existing text layer (e.g. a bad OCR pass baked into the PDF).
       DOCLING_PARAMS: >-
         {"do_ocr": true, "ocr_engine": "ocrmac", "table_mode": "accurate",
-        "pdf_backend": "dlparse_v4"}
+        "pdf_backend": "dlparse_v4", "force_ocr": ${FORCE_OCR:-false}}
 
       # -- embeddings: ollama (native, on the host) --
       RAG_EMBEDDING_ENGINE: "ollama"
