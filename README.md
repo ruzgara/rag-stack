@@ -103,18 +103,23 @@ Then, in the browser:
 
 1. Open **http://127.0.0.1:3000** and create the admin account (first
    account created becomes admin).
-2. Admin Panel → your user (top right) → Settings → Account → **API keys**
-   → create a key. Put it in `.env` as `OWUI_API_KEY`.
-3. Run:
+2. Enable API keys globally — they're off by default, and both
+   `ragctl webui-setup` and `ragctl ingest` need one:
+   **Admin Panel → Settings → Authentication** → toggle **API Keys** on →
+   **Save**.
+3. Generate your key: click your profile icon (bottom-left) → **Settings →
+   Account** → under **API keys**, click **Show**, then **Create new secret
+   key**. Copy it into `.env` as `OWUI_API_KEY`.
+4. Run:
    ```bash
    ./ragctl webui-setup
    ```
    This creates the shared knowledge base and two chat presets, **Everyday**
    and **Hard questions**, each pointed at your configured models with the
    knowledge base attached.
-4. In `.env`, set `ENABLE_SIGNUP=false` so nobody else can self-register,
+5. In `.env`, set `ENABLE_SIGNUP=false` so nobody else can self-register,
    then run `./ragctl reload`.
-5. Run:
+6. Run:
    ```bash
    ./ragctl health
    ```
@@ -202,6 +207,10 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
   one worker breaks its task tracking.
 - **A model "not found" in `ollama list`** — run `./ragctl models check`, fix
   the name in `.env`, then `./ragctl reload`.
+- **`ragctl webui-setup` or `ragctl ingest` fails with a 401, or there's no
+  "API keys" section under Settings → Account** — API keys are off by
+  default. Go to **Admin Panel → Settings → Authentication**, toggle
+  **API Keys** on, Save, then generate a key and set `OWUI_API_KEY`.
 - **Ingest quality gate keeps triggering the VLM fallback unnecessarily** —
   raise `MIN_CHARS_PER_PAGE` in `.env`, or check the OCR language
   (`OCR_LANG`) matches your documents.
