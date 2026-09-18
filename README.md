@@ -168,7 +168,19 @@ happen automatically whenever a file lands in `data/inbox/`.
 ./ragctl models check        # confirm .env model names exist in Ollama
 ./ragctl up / down / restart
 ./ragctl reload              # re-apply .env changes to running services
+./ragctl clean --yes         # wipe all knowledge base content and start
+                              # over, WITHOUT redoing browser account setup
 ```
+
+`ragctl clean --yes` deletes every file in the knowledge base (and their
+Qdrant vectors and on-disk storage, via Open WebUI's own delete API) plus
+`data/inbox`, `work`, `processed`, `failed` and `manifest.jsonl`. It
+**keeps** your admin account, `OWUI_API_KEY`, the knowledge base object
+itself, and the "Everyday"/"Hard questions" presets — so the result is
+equivalent to a fresh install right after `ragctl webui-setup`, not a full
+teardown. Model caches (`data/hf-cache`, `data/docling-artifacts`) are left
+alone since they're expensive to redownload and aren't "your data." For a
+full teardown including the account, use `ragctl uninstall` instead.
 
 **A gotcha worth knowing:** most of Open WebUI's RAG settings (embedding
 model, reranker, chunk size, hybrid search…) are "PersistentConfig" — they

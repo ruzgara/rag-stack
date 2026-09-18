@@ -474,6 +474,42 @@ cmd_health() {
     return "$fail"
 }
 
+# ------------------------------------------------------------------ clean --
+cmd_clean() {
+    load_env
+    if [[ "${1:-}" != "--yes" ]]; then
+        die "This deletes ALL knowledge base files, Qdrant vectors, and data/{inbox,work,processed,failed,manifest.jsonl}. Your Open WebUI account, OWUI_API_KEY, knowledge base, and chat presets are kept. Re-run as: ragctl clean --yes"
+    fi
+    [[ -n "${OWUI_API_KEY:-}" ]] || die "OWUI_API_KEY is not set in .env. See README: create an API key in Open WebUI first."
+
+    echo "== Open WebUI: deleting all files (DB rows + vectors + on-disk storage) =="
+    # Goes through Open WebUI's own delete logic rather than touching its
+    # DB/volume directly, so the account, API key and knowledge-base/preset
+    # config it also lives in are left completely alone.
+    if owui_api DELETE "/api/v1/files/all" >/dev/null 2>&1; then
+        ok "Files cleared"
+    else
+        warn "Could not clear files via API (maybe none existed) — continuing"
+    fi
+
+    echo "== Qdrant: dropping collections (belt-and-suspenders; Open WebUI recreates them lazily on next write) =="
+    for c in open-webui_files open-webui_knowledge; do
+        if curl -sf "http://127.0.0.1:${QDRANT_PORT}/collections/$c" >/dev/null 2>&1; then
+            curl -sf -X DELETE "http://127.0.0.1:${QDRANT_PORT}/collections/$c" >/dev/null 2>&1 \
+                && ok "Cleared Qdrant collection $c" || warn "Failed to clear Qdrant collection $c"
+        fi
+    done
+
+    echo "== Local ingest data =="
+    rm -rf "$DATA_DIR/inbox" "$DATA_DIR/work" "$DATA_DIR/processed" "$DATA_DIR/failed" "$DATA_DIR/manifest.jsonl"
+    mkdir -p "$DATA_DIR"/{inbox,work,processed,failed}
+    ok "Cleared data/inbox, work, processed, failed and manifest.jsonl"
+
+    echo
+    ok "Clean complete — equivalent to right after a fresh 'ragctl webui-setup': your admin account, API key, knowledge base and chat presets are all still there and ready to use."
+    warn "Model caches (data/hf-cache, data/docling-artifacts) were left in place on purpose — they're not your data, and re-downloading them is wasteful. Delete them by hand if you really want to."
+}
+
 # -------------------------------------------------------------- uninstall --
 cmd_uninstall() {
     load_env
@@ -514,6 +550,9 @@ Usage: ./ragctl <command> [args]
   webui-setup             Create the knowledge base + chat presets (after admin signup)
   ingest [--force-vlm]    Run the batch inbox -> knowledge base pipeline once
   health                 End-to-end connectivity check
+  clean --yes             Wipe all knowledge base files + Qdrant vectors +
+                           data/{inbox,work,processed,failed}; keeps your
+                           Open WebUI account, API key, KB and presets
   uninstall [--purge-data]  Tear down containers, agents and local envs
 EOF
 }
@@ -533,6 +572,7 @@ main() {
         webui-setup) cmd_webui_setup "$@" ;;
         ingest) cmd_ingest "$@" ;;
         health) cmd_health "$@" ;;
+        clean) cmd_clean "$@" ;;
         uninstall) cmd_uninstall "$@" ;;
         help|-h|--help) usage ;;
         *) err "Unknown command: $cmd"; usage; exit 1 ;;
