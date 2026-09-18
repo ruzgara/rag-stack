@@ -12,6 +12,10 @@ launchctl setenv OLLAMA_HOST "127.0.0.1:__OLLAMA_PORT__"
 launchctl setenv OLLAMA_CONTEXT_LENGTH "__OLLAMA_CONTEXT_LENGTH__"
 launchctl setenv OLLAMA_NUM_PARALLEL "__OLLAMA_NUM_PARALLEL__"
 launchctl setenv OLLAMA_MAX_LOADED_MODELS "__OLLAMA_MAX_LOADED_MODELS__"
+# Default (512) can be exceeded when Open WebUI embeds a large document's
+# many chunks in a burst, returning "server busy, maximum pending requests
+# exceeded" (503) and failing the whole file's processing. Raised for headroom.
+launchctl setenv OLLAMA_MAX_QUEUE "__OLLAMA_MAX_QUEUE__"
 launchctl setenv OLLAMA_KEEP_ALIVE "30m"
 launchctl setenv OLLAMA_FLASH_ATTENTION "1"
 

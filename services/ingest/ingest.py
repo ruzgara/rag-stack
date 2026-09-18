@@ -14,7 +14,7 @@ Pipeline per file in data/inbox:
   6. Move the original file to data/processed or data/failed and record
      the outcome in data/manifest.jsonl.
 
-Run with: uv run ingest.py [--kb NAME] [--force-vlm] [--file PATH]
+Run with: uv run ingest.py [--kb NAME] [--force-vlm] [--file PATH] [-v/--verbose]
 """
 
 from __future__ import annotations
@@ -49,6 +49,14 @@ SUPPORTED_SUFFIXES = PDF_SUFFIXES | IMAGE_SUFFIXES | {
 }
 
 JUNK_CHAR_RE = re.compile(r"[�\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+VERBOSE = False
+
+
+def vprint(*args, **kwargs) -> None:
+    if VERBOSE:
+        kwargs.setdefault("flush", True)  # stdout is block-buffered when piped/backgrounded
+        print(*args, **kwargs)
 
 
 def load_env() -> dict:
@@ -158,15 +166,24 @@ def run_ocrmypdf(src: Path, dst: Path, lang: str, force: bool = False) -> Path:
         "ocrmypdf", text_strategy, "--rotate-pages", "-l", lang,
         "--output-type", "pdf", str(src), str(dst),
     ]
+    vprint(f"  ocrmypdf: {' '.join(cmd)}")
+    t0 = time.monotonic()
     proc = subprocess.run(cmd, capture_output=True, text=True)
+    dt = time.monotonic() - t0
     if proc.returncode == 0:
+        vprint(f"  ocrmypdf: OCR applied in {dt:.1f}s -> {dst.name}")
+        if VERBOSE and proc.stderr.strip():
+            vprint(f"  ocrmypdf stderr (tail):\n    " + proc.stderr.strip()[-1000:].replace("\n", "\n    "))
         return dst
     if proc.returncode == 6:  # "already has text" (PriorOcrFoundError family)
+        vprint(f"  ocrmypdf: already has text, nothing to do ({dt:.1f}s)")
         return src
     raise RuntimeError(f"ocrmypdf failed ({proc.returncode}): {proc.stderr[-2000:]}")
 
 
 def docling_convert_standard(client: httpx.Client, cfg: Config, path: Path) -> str:
+    vprint(f"  docling standard: converting {path.name}")
+    t0 = time.monotonic()
     with path.open("rb") as f:
         files = {"files": (path.name, f, "application/octet-stream")}
         data = {
@@ -178,9 +195,17 @@ def docling_convert_standard(client: httpx.Client, cfg: Config, path: Path) -> s
         resp = client.post(f"{cfg.docling_url}/v1/convert/file", files=files, data=data, timeout=600)
     resp.raise_for_status()
     body = resp.json()
+    dt = time.monotonic() - t0
     if body.get("status") not in ("success", "partial_success"):
         raise RuntimeError(f"docling standard pipeline reported: {body.get('status')}")
-    return body["document"]["md_content"] or ""
+    md = body["document"]["md_content"] or ""
+    vprint(
+        f"  docling standard: {body.get('status')} in {dt:.1f}s "
+        f"(server processing_time={body.get('processing_time', '?')}s), {len(md)} chars"
+    )
+    if VERBOSE and body.get("errors"):
+        vprint(f"  docling standard: reported non-fatal errors: {body['errors']}")
+    return md
 
 
 def docling_convert_vlm(client: httpx.Client, cfg: Config, path: Path) -> str:
@@ -195,6 +220,8 @@ def docling_convert_vlm(client: httpx.Client, cfg: Config, path: Path) -> str:
         ),
         "timeout": 300,
     }
+    vprint(f"  docling vlm: converting {path.name} with model {cfg.vlm_model} (this is slow, be patient)")
+    t0 = time.monotonic()
     with path.open("rb") as f:
         files = {"files": (path.name, f, "application/octet-stream")}
         data = {
@@ -205,18 +232,28 @@ def docling_convert_vlm(client: httpx.Client, cfg: Config, path: Path) -> str:
         resp = client.post(f"{cfg.docling_url}/v1/convert/file", files=files, data=data, timeout=900)
     resp.raise_for_status()
     body = resp.json()
+    dt = time.monotonic() - t0
     if body.get("status") not in ("success", "partial_success"):
         raise RuntimeError(f"docling vlm pipeline reported: {body.get('status')}")
-    return body["document"]["md_content"] or ""
+    md = body["document"]["md_content"] or ""
+    vprint(
+        f"  docling vlm: {body.get('status')} in {dt:.1f}s "
+        f"(server processing_time={body.get('processing_time', '?')}s), {len(md)} chars"
+    )
+    return md
 
 
-def needs_vlm_fallback(md: str, pages: int, min_chars_per_page: int) -> bool:
+def quality_gate_reason(md: str, pages: int, min_chars_per_page: int) -> str | None:
+    """Returns why the VLM fallback should run, or None if the text passes."""
     if not md.strip():
-        return True
+        return "conversion produced no text at all"
     junk = len(JUNK_CHAR_RE.findall(md))
     if len(md) and junk / len(md) > 0.02:
-        return True
-    return len(md) < min_chars_per_page * max(pages, 1)
+        return f"{junk}/{len(md)} chars ({junk / len(md):.1%}) are junk/replacement characters"
+    threshold = min_chars_per_page * max(pages, 1)
+    if len(md) < threshold:
+        return f"only {len(md)} chars for {pages} page(s), below the {threshold} char threshold"
+    return None
 
 
 def owui_headers(cfg: Config) -> dict:
@@ -240,26 +277,62 @@ def owui_get_or_create_kb(client: httpx.Client, cfg: Config) -> str:
     return resp.json()["id"]
 
 
-def owui_upload_and_attach(client: httpx.Client, cfg: Config, kb_id: str, filename: str, markdown: str) -> str:
-    files = {"file": (filename, markdown.encode("utf-8"), "text/markdown")}
-    resp = client.post(f"{cfg.owui_url}/api/v1/files/", headers=owui_headers(cfg), files=files, timeout=120)
+UPLOAD_RETRY_BACKOFF_S = (5, 15, 30)  # retries on a transient "failed" processing status
+
+
+def _owui_upload_once(client: httpx.Client, cfg: Config, filename: str, markdown: str) -> str:
+    """Upload the markdown and poll until Open WebUI finishes processing it
+    (chunking + embedding). Returns the new file_id. Raises on a "failed"
+    status or timeout -- the caller decides whether to retry."""
+    resp = client.post(
+        f"{cfg.owui_url}/api/v1/files/",
+        headers=owui_headers(cfg),
+        files={"file": (filename, markdown.encode("utf-8"), "text/markdown")},
+        timeout=120,
+    )
     resp.raise_for_status()
     file_id = resp.json()["id"]
+    vprint(f"  open webui: uploaded -> file_id={file_id}, waiting for chunking/embedding")
 
     deadline = time.time() + 300
+    last_status = None
     while time.time() < deadline:
         status_resp = client.get(
             f"{cfg.owui_url}/api/v1/files/{file_id}/process/status", headers=owui_headers(cfg)
         )
         status_resp.raise_for_status()
         status = status_resp.json().get("status")
+        if status != last_status:
+            vprint(f"  open webui: status={status}")
+            last_status = status
         if status == "completed":
-            break
+            return file_id
         if status == "failed":
-            raise RuntimeError("Open WebUI failed to process the uploaded file")
+            # Open WebUI's non-streaming status endpoint doesn't expose the
+            # underlying error (that's only on the SSE variant) -- check
+            # `docker compose logs open-webui` for the real cause (a common
+            # one: "Ollama embed error (503): ... maximum pending requests
+            # exceeded" when a large document floods Ollama's embed queue).
+            raise RuntimeError(f"Open WebUI failed to process the uploaded file (file_id={file_id})")
         time.sleep(2)
-    else:
-        raise RuntimeError("Timed out waiting for Open WebUI to process the uploaded file")
+    raise RuntimeError(f"Timed out waiting for Open WebUI to process the uploaded file (file_id={file_id})")
+
+
+def owui_upload_and_attach(client: httpx.Client, cfg: Config, kb_id: str, filename: str, markdown: str) -> str:
+    file_id = None
+    last_exc: Exception | None = None
+    for attempt, backoff in enumerate((0, *UPLOAD_RETRY_BACKOFF_S), start=1):
+        if backoff:
+            vprint(f"  open webui: retrying upload in {backoff}s (attempt {attempt}/{len(UPLOAD_RETRY_BACKOFF_S) + 1})")
+            time.sleep(backoff)
+        try:
+            file_id = _owui_upload_once(client, cfg, filename, markdown)
+            break
+        except Exception as exc:  # noqa: BLE001 - processing failures are often transient (e.g. Ollama's embed queue was briefly overloaded)
+            last_exc = exc
+            vprint(f"  open webui: attempt {attempt} failed: {exc}")
+    if file_id is None:
+        raise last_exc  # type: ignore[misc]
 
     resp = client.post(
         f"{cfg.owui_url}/api/v1/knowledge/{kb_id}/file/add",
@@ -268,6 +341,7 @@ def owui_upload_and_attach(client: httpx.Client, cfg: Config, kb_id: str, filena
         timeout=120,
     )
     resp.raise_for_status()
+    vprint(f"  open webui: attached file_id={file_id} to knowledge base {kb_id}")
     return file_id
 
 
@@ -279,6 +353,7 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, kb_id: str) -> Re
         suffix = path.suffix.lower()
         pages = pdf_page_count(path) if suffix in PDF_SUFFIXES else 1
         result.pages = pages
+        vprint(f"  sha256={sha}, pages={pages}")
 
         convert_path = path
         route_parts = []
@@ -294,9 +369,13 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, kb_id: str) -> Re
         route_parts.append("standard")
         md = docling_convert_standard(client, cfg, convert_path)
 
-        if cfg.force_vlm or needs_vlm_fallback(md, pages, cfg.min_chars_per_page):
+        vlm_reason = "forced via --force-vlm" if cfg.force_vlm else quality_gate_reason(md, pages, cfg.min_chars_per_page)
+        if vlm_reason:
+            vprint(f"  quality gate: falling back to VLM ({vlm_reason})")
             route_parts.append("vlm")
             md = docling_convert_vlm(client, cfg, path)  # VLM works from the original
+        else:
+            vprint("  quality gate: passed, no VLM fallback needed")
 
         result.route = "+".join(route_parts)
         result.chars = len(md)
@@ -329,7 +408,15 @@ def main() -> int:
     parser.add_argument("--kb", dest="kb_name", default=None, help="Knowledge base name (default: KB_NAME in .env)")
     parser.add_argument("--force-vlm", action="store_true", help="Always use the VLM fallback pipeline")
     parser.add_argument("--file", dest="single_file", default=None, help="Process a single file instead of scanning data/inbox")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print per-stage detail: ocrmypdf output, docling timings, quality-gate reasoning, Open WebUI upload/processing progress")
     args = parser.parse_args()
+
+    global VERBOSE
+    VERBOSE = args.verbose
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # stdout is block-buffered when piped/backgrounded otherwise
+    except Exception:  # noqa: BLE001 - cosmetic, never worth failing the run over
+        pass
 
     env = load_env()
     cfg = Config.from_env(env, args.kb_name, args.force_vlm)
@@ -357,20 +444,23 @@ def main() -> int:
         kb_id = owui_get_or_create_kb(client, cfg)
 
         ok, bad = 0, 0
-        for path in targets:
+        total = len(targets)
+        for i, path in enumerate(targets, start=1):
             sha = sha256_of(path)
             if already_processed(sha):
-                print(f"skip (already processed): {path.name}")
+                print(f"[{i}/{total}] skip (already processed): {path.name}")
                 path.unlink(missing_ok=True)
                 continue
-            print(f"processing: {path.name}")
+            print(f"[{i}/{total}] processing: {path.name}")
+            t0 = time.monotonic()
             result = process_one(client, cfg, path, kb_id)
+            dt = time.monotonic() - t0
             if result.status == "processed":
                 ok += 1
-                print(f"  -> ok, route={result.route}, chars={result.chars}")
+                print(f"  -> ok, route={result.route}, chars={result.chars}, {dt:.1f}s total")
             else:
                 bad += 1
-                print(f"  -> FAILED: {result.error}")
+                print(f"  -> FAILED ({dt:.1f}s): {result.error}")
 
     print(f"\nDone. {ok} processed, {bad} failed. See {MANIFEST.relative_to(REPO_ROOT)} for details.")
     return 1 if bad and not ok else 0

@@ -137,6 +137,7 @@ render_template() {
         -e "s#__OLLAMA_CONTEXT_LENGTH__#${OLLAMA_CONTEXT_LENGTH:-32768}#g" \
         -e "s#__OLLAMA_NUM_PARALLEL__#${OLLAMA_NUM_PARALLEL:-4}#g" \
         -e "s#__OLLAMA_MAX_LOADED_MODELS__#${OLLAMA_MAX_LOADED_MODELS:-4}#g" \
+        -e "s#__OLLAMA_MAX_QUEUE__#${OLLAMA_MAX_QUEUE:-1024}#g" \
         -e "s#__DOCLING_NUM_THREADS__#${DOCLING_NUM_THREADS:-4}#g" \
         -e "s#__DOCLING_LOC_NUM_WORKERS__#${DOCLING_LOC_NUM_WORKERS:-2}#g" \
         "$src" > "$dst"
@@ -243,6 +244,7 @@ cmd_install() {
     echo "== Docker services =="
     compose pull
     compose up -d
+    wait_for_open_webui || true
 
     echo
     ok "Install complete."
@@ -259,6 +261,26 @@ EOF
 }
 
 # ------------------------------------------------------------- up/down --
+wait_for_open_webui() {
+    # Open WebUI takes a while to actually accept requests after (re)starting
+    # -- DB migrations, loading the reranker model, etc -- well after `docker
+    # compose up -d` itself returns. Poll /health so callers don't report a
+    # false "unreachable" against a container that's simply still booting.
+    local deadline=$((SECONDS + 90))
+    printf '  waiting for Open WebUI to finish starting'
+    while (( SECONDS < deadline )); do
+        if curl -sf "http://127.0.0.1:${WEBUI_PORT}/health" >/dev/null 2>&1; then
+            echo
+            return 0
+        fi
+        printf '.'
+        sleep 2
+    done
+    echo
+    warn "Open WebUI still not responding after 90s — check 'ragctl logs webui'."
+    return 1
+}
+
 cmd_up() {
     load_env
     render_all
@@ -268,6 +290,7 @@ cmd_up() {
         load_agent "com.ragstack.ingest"
     fi
     compose up -d
+    wait_for_open_webui || true
     ok "Stack is up."
 }
 
@@ -297,6 +320,7 @@ cmd_reload() {
         unload_agent "com.ragstack.ingest"
     fi
     compose up -d --force-recreate
+    wait_for_open_webui || true
     ok "Reloaded. Note: most Open WebUI RAG settings are PersistentConfig and only apply on a FIRST start of a fresh volume — change them in Admin -> Settings -> Documents if they don't take effect."
 }
 
