@@ -173,8 +173,9 @@ happen automatically whenever a file lands in `data/inbox/`.
 ```
 
 `ragctl clean --yes` deletes every file in the knowledge base (and their
-Qdrant vectors and on-disk storage, via Open WebUI's own delete API) plus
-`data/inbox`, `work`, `processed`, `failed` and `manifest.jsonl`. It
+Qdrant vectors and on-disk storage, via Open WebUI's own delete API), all
+chat history, plus `data/inbox`, `work`, `processed`, `failed` and
+`manifest.jsonl`. It
 **keeps** your admin account, `OWUI_API_KEY`, the knowledge base object
 itself, and the "Everyday"/"Hard questions" presets — so the result is
 equivalent to a fresh install right after `ragctl webui-setup`, not a full

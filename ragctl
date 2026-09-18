@@ -478,7 +478,7 @@ cmd_health() {
 cmd_clean() {
     load_env
     if [[ "${1:-}" != "--yes" ]]; then
-        die "This deletes ALL knowledge base files, Qdrant vectors, and data/{inbox,work,processed,failed,manifest.jsonl}. Your Open WebUI account, OWUI_API_KEY, knowledge base, and chat presets are kept. Re-run as: ragctl clean --yes"
+        die "This deletes ALL knowledge base files, chat history, Qdrant vectors, and data/{inbox,work,processed,failed,manifest.jsonl}. Your Open WebUI account, OWUI_API_KEY, knowledge base, and chat presets are kept. Re-run as: ragctl clean --yes"
     fi
     [[ -n "${OWUI_API_KEY:-}" ]] || die "OWUI_API_KEY is not set in .env. See README: create an API key in Open WebUI first."
 
@@ -490,6 +490,13 @@ cmd_clean() {
         ok "Files cleared"
     else
         warn "Could not clear files via API (maybe none existed) — continuing"
+    fi
+
+    echo "== Open WebUI: deleting chat history =="
+    if owui_api DELETE "/api/v1/chats/" >/dev/null 2>&1; then
+        ok "Chat history cleared"
+    else
+        warn "Could not clear chat history via API (maybe none existed) — continuing"
     fi
 
     echo "== Qdrant: dropping collections (belt-and-suspenders; Open WebUI recreates them lazily on next write) =="
@@ -550,9 +557,10 @@ Usage: ./ragctl <command> [args]
   webui-setup             Create the knowledge base + chat presets (after admin signup)
   ingest [--force-vlm]    Run the batch inbox -> knowledge base pipeline once
   health                 End-to-end connectivity check
-  clean --yes             Wipe all knowledge base files + Qdrant vectors +
-                           data/{inbox,work,processed,failed}; keeps your
-                           Open WebUI account, API key, KB and presets
+  clean --yes             Wipe all knowledge base files + chat history +
+                           Qdrant vectors + data/{inbox,work,processed,
+                           failed}; keeps your Open WebUI account, API
+                           key, KB and presets
   uninstall [--purge-data]  Tear down containers, agents and local envs
 EOF
 }
