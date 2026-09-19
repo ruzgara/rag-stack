@@ -46,6 +46,10 @@ compose() {
     docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/compose.yaml" "$@"
 }
 
+# The Docker services ragctl starts. Listed explicitly so that anything else
+# in compose.yaml (e.g. the retired open-webui service) is never pulled or started.
+COMPOSE_SERVICES=(qdrant)
+
 # ------------------------------------------------------------- preflight --
 check_free_disk_gb() {
     df -g "$REPO_ROOT" | awk 'NR==2 {print $4}'
@@ -213,6 +217,8 @@ cmd_install() {
     echo "== Python environments (uv sync) =="
     (cd "$REPO_ROOT/services/docling" && uv sync --python 3.12)
     (cd "$REPO_ROOT/services/ingest" && uv sync --python 3.12)
+    (cd "$REPO_ROOT/services/embed" && uv sync --python 3.12)
+    (cd "$REPO_ROOT/services/query" && uv sync --python 3.12)
 
     echo "== LaunchAgents =="
     render_all
@@ -230,9 +236,13 @@ cmd_install() {
     (cd "$REPO_ROOT/services/docling" && HF_HOME="$DATA_DIR/hf-cache" uv run --python 3.12 docling-tools models download -o "$DATA_DIR/docling-artifacts") \
         || warn "Model prefetch skipped/failed — docling-serve will download models into data/docling-artifacts on first use instead."
 
+    echo "== Prefetching the reranker model (best-effort) =="
+    (cd "$REPO_ROOT/services/query" && uv run --python 3.12 rerank.py --download) \
+        || warn "Reranker prefetch failed — it will download into data/hf-cache on the first 'ragctl search' instead."
+
     echo "== Docker services =="
-    compose pull
-    compose up -d
+    compose pull "${COMPOSE_SERVICES[@]}"
+    compose up -d "${COMPOSE_SERVICES[@]}"
 
     echo
     ok "Install complete."
@@ -253,7 +263,7 @@ cmd_up() {
     if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
         load_agent "com.ragstack.ingest"
     fi
-    compose up -d
+    compose up -d "${COMPOSE_SERVICES[@]}"
     ok "Stack is up."
 }
 
@@ -282,7 +292,7 @@ cmd_reload() {
     else
         unload_agent "com.ragstack.ingest"
     fi
-    compose up -d --force-recreate
+    compose up -d --force-recreate "${COMPOSE_SERVICES[@]}"
     ok "Reloaded."
 }
 
@@ -352,6 +362,19 @@ cmd_ingest() {
     (cd "$REPO_ROOT/services/ingest" && uv run --python 3.12 ingest.py "$@")
 }
 
+# ------------------------------------------------------------------ embed --
+cmd_embed() {
+    load_env
+    (cd "$REPO_ROOT/services/embed" && uv run --python 3.12 embed.py "$@")
+}
+
+# ----------------------------------------------------------------- search --
+cmd_search() {
+    load_env
+    [[ -n "${1:-}" ]] || die "Usage: ragctl search \"question\" [--fused] [--json] [-v]"
+    (cd "$REPO_ROOT/services/query" && uv run --python 3.12 retrieval.py "$@")
+}
+
 # ----------------------------------------------------------------- health --
 cmd_health() {
     load_env
@@ -381,13 +404,24 @@ cmd_health() {
 cmd_clean() {
     load_env
     if [[ "${1:-}" != "--yes" ]]; then
-        die "This deletes data/{inbox,work,processed,failed,manifest.jsonl}. Re-run as: ragctl clean --yes"
+        die "This deletes data/{inbox,work,processed,failed,markdown,docling,manifest.jsonl} and the Qdrant collection. Re-run as: ragctl clean --yes"
     fi
 
     echo "== Local ingest data =="
-    rm -rf "$DATA_DIR/inbox" "$DATA_DIR/work" "$DATA_DIR/processed" "$DATA_DIR/failed" "$DATA_DIR/manifest.jsonl"
+    rm -rf "$DATA_DIR/inbox" "$DATA_DIR/work" "$DATA_DIR/processed" "$DATA_DIR/failed" \
+        "$DATA_DIR/markdown" "$DATA_DIR/docling" "$DATA_DIR/manifest.jsonl"
     mkdir -p "$DATA_DIR"/{inbox,work,processed,failed}
-    ok "Cleared data/inbox, work, processed, failed and manifest.jsonl"
+    ok "Cleared data/inbox, work, processed, failed, markdown, docling and manifest.jsonl"
+
+    echo "== Qdrant =="
+    local collection="${QDRANT_COLLECTION:-ragstack_chunks}"
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "http://127.0.0.1:${QDRANT_PORT}/collections/${collection}" || true)"
+    case "$code" in
+        200) ok "Deleted collection ${collection}" ;;
+        404) info "Collection ${collection} did not exist" ;;
+        *) warn "Could not reach Qdrant to delete collection ${collection} (HTTP ${code:-none}). Start it with 'ragctl up' and re-run clean, or 'ragctl embed --recreate' will rebuild it." ;;
+    esac
 
     echo
     ok "Clean complete."
@@ -405,7 +439,7 @@ cmd_uninstall() {
     unload_agent "com.ragstack.docling"
     unload_agent "com.ragstack.ingest"
     rm -rf "$RUNTIME_DIR"
-    for svc in docling ingest; do rm -rf "$REPO_ROOT/services/$svc/.venv"; done
+    for svc in docling ingest embed query; do rm -rf "$REPO_ROOT/services/$svc/.venv"; done
 
     if (( purge )); then
         rm -rf "$DATA_DIR"
@@ -431,9 +465,17 @@ Usage: ./ragctl <command> [args]
   status                Show what's running and reachable
   logs [svc]             Tail logs (svc: docling, ollama, ingest, qdrant)
   models check           Verify .env model names exist in 'ollama list'
-  ingest [--force-vlm]    Run the batch inbox -> knowledge base pipeline once
+  ingest [--force-vlm] [--reprocess]
+                         Convert data/inbox to markdown + docling JSON once
+                         (--reprocess re-converts data/processed in place)
+  embed [--recreate] [--show-chunks [--doc SHA] [--full]]
+                         Chunk, embed and index converted docs into Qdrant
+                         (--show-chunks prints the chunking without embedding)
+  search "question" [--fused] [--json] [-v]
+                         Hybrid search + GPU reranking over the index
+                         (settings: RAG_* and RERANKER_* in .env)
   health                 End-to-end connectivity check
-  clean --yes             Wipe data/{inbox,work,processed,failed,manifest.jsonl}
+  clean --yes             Wipe ingest data, outputs and the Qdrant collection
   uninstall [--purge-data]  Tear down containers, agents and local envs
 EOF
 }
@@ -451,6 +493,8 @@ main() {
         models)
             case "${1:-}" in check) cmd_models_check ;; *) die "Usage: ragctl models check" ;; esac ;;
         ingest) cmd_ingest "$@" ;;
+        embed) cmd_embed "$@" ;;
+        search) cmd_search "$@" ;;
         health) cmd_health "$@" ;;
         clean) cmd_clean "$@" ;;
         uninstall) cmd_uninstall "$@" ;;

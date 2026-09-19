@@ -4,7 +4,10 @@ version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "httpx>=0.28,<1",
-    "pypdf>=5.1,<6",
+    # Page triage (text vs scan) and rendering for orientation detection.
+    # Same major as the docling-serve env.
+    "pypdfium2>=5.13,<6",
+    "pillow>=11,<13",  # pypdfium2 renders to PIL images for tesseract
     "python-dotenv>=1.0,<2",
 ]
 

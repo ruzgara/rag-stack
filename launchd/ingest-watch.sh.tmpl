@@ -2,14 +2,17 @@
 # Rendered by `ragctl install` from ingest-watch.sh.tmpl.
 # Fired by the com.ragstack.ingest LaunchAgent (WatchPaths on data/inbox)
 # only when INGEST_AUTORUN=true in .env. Debounces briefly since WatchPaths
-# fires once per changed file, then runs the batch pipeline once.
+# fires once per changed file, then runs the batch pipeline once and indexes
+# whatever it converted. Embed only runs if ingest exits successfully.
 
 set -euo pipefail
 
-# launchd runs this with a bare PATH — add Homebrew (ocrmypdf, tesseract,
-# ghostscript) and uv so the pipeline's subprocess calls can find them.
+# launchd runs this with a bare PATH — add Homebrew (tesseract, for page
+# orientation detection) and uv so the pipeline's subprocess calls can find them.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 
 sleep 5
 cd "__REPO_ROOT__/services/ingest"
-exec "__UV_BIN__" run --python 3.12 ingest.py
+"__UV_BIN__" run --python 3.12 ingest.py
+cd "__REPO_ROOT__/services/embed"
+exec "__UV_BIN__" run --python 3.12 embed.py
