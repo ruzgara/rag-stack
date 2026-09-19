@@ -433,6 +433,40 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
   currently matters for this stack. If a pull fails because the tag was
   retired, check Qdrant's release page and bump the tag in `compose.yaml`.
 
+## Tests
+
+Unit tests live next to each service (`services/<name>/tests/`) and run in
+that service's own environment, separately from `ragctl`:
+
+```bash
+./run-tests.sh                  # every service
+./run-tests.sh query            # one service
+./run-tests.sh query -k chat    # extra arguments go to pytest
+cd services/ingest && uv run pytest   # or directly, per service
+```
+
+Most need no running services, network, `.env` or `data/`, and take a few
+seconds. Ollama and Qdrant are faked (`httpx.MockTransport`), and the
+heading tests generate PDFs on the fly in the standard fonts (Helvetica-Bold,
+Times-Italic…), so style measurement runs on real renders. Covered: heading
+levels and cleanup, page triage, the ingest pipeline around docling, sibling
+chunk merging, embed retries, section expansion and thresholds in
+retrieval, the chat pipeline (rewrite, source budget, tool rounds,
+citations), chat history storage, and the OpenAI adapter's helpers.
+
+**The OCR route end to end** is covered by the tests marked `integration` in
+`services/ingest/tests/test_ocr_integration.py`. They convert one real
+scanned page — page 5 of the Basel III case study, turned 90°, in
+`tests/fixtures/` — through tesseract's orientation detection, ocrmac and
+docling, and check the rotation was applied, the text is readable, the RSF
+table keeps its 8×2 shape with each factor's assets in its own row (a
+sideways page merges the 15% and 50% rows, which is how "Level 2B" ends up
+with the wrong factor), the caption and section heading survive, and the
+running header and footer stay out of the text. They need docling-serve
+(`./ragctl up`), take a few seconds, and skip themselves when it isn't
+running. Run only them with `./run-tests.sh ingest -m integration`, or leave
+them out with `-m "not integration"`.
+
 ## Future potential updates
 
 - Heading levels use a style ranking of their own rather than

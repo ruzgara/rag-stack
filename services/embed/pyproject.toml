@@ -14,3 +14,12 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+# Unit tests: `uv run pytest` in this directory, or ./run-tests.sh at the
+# repo root for every service. No services, network or data/ needed.
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

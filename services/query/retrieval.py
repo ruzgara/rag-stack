@@ -368,25 +368,27 @@ class Retriever:
             prev = extra
         text = "\n\n".join(parts)
         best = max(members, key=lambda h: h.score)
+        ids = [str(c["id"]) for c in chunks]
         return Hit(
             rank=best.rank, score=best.score, fused_rank=min(h.fused_rank for h in members),
             fused_score=max(h.fused_score for h in members), point_id=str(chunks[0]["id"]),
             doc_sha=best.doc_sha, filename=best.filename, chunk_index=chunks[0]["payload"]["chunk_index"],
             pages=sorted({p for c in chunks for p in c["payload"].get("pages") or []}),
             headings=list(prefix), text=text, context_text="\n".join([*prefix, text]),
-            rerank_score=best.rerank_score, point_ids=[str(c["id"]) for c in chunks], matched=len(members),
+            rerank_score=best.rerank_score, point_ids=ids, matched=sum(h.matched for h in members),
         )
 
     def expand_sections(self, hits: list[Hit], exclude: set[str] | None = None) -> list[Hit]:
-        """Replace hits that share a heading with the whole section under the
-        deepest such heading, where it fits RAG_SECTION_MAX_TOKENS. The
-        section takes the place of its best-ranked member."""
+        """Replace results that share a heading with the whole section under
+        the deepest such heading, where it fits RAG_SECTION_MAX_TOKENS. The
+        section takes the place of its best-ranked member. Repeats until
+        nothing more can be grouped, so a section already built is absorbed
+        by an enclosing one that fits, rather than returned inside it twice."""
         exclude = exclude or set()
         out = list(hits)
         too_big: set[tuple[str, tuple[str, ...]]] = set()
         while True:
-            singles = [h for h in out if len(h.ids) == 1 and h.headings]
-            counts = Counter((h.doc_sha, tuple(h.headings[:n])) for h in singles
+            counts = Counter((h.doc_sha, tuple(h.headings[:n])) for h in out
                              for n in range(1, len(h.headings) + 1))
             # Deepest shared heading first; skip any enclosing one already too big.
             candidates = sorted((k for k, c in counts.items() if c >= 2), key=lambda k: -len(k[1]))
@@ -402,7 +404,9 @@ class Retriever:
                     # Part of it was already handed out; returning it whole would repeat text.
                     too_big.add((sha, prefix))
                     continue
-                members = [h for h in singles if h.doc_sha == sha and tuple(h.headings[:len(prefix)]) == prefix]
+                # Everything under the heading: single chunks and sections built
+                # in an earlier pass alike.
+                members = [h for h in out if h.doc_sha == sha and tuple(h.headings[:len(prefix)]) == prefix]
                 section = self._section_hit(prefix, chunks, members)
                 first = min(out.index(h) for h in members)
                 out = [h for h in out if h not in members]
