@@ -7,6 +7,10 @@ Per document recorded as processed in data/manifest.jsonl:
      ingest.py).
   2. HybridChunker: structure-aware chunks, sized with the embed model's own
      tokenizer. Each chunk is contextualized by prepending its heading path.
+     Small sibling sections under one parent heading ("Investors", "Issuers",
+     ... under "The parties to a typical bond issue") are then merged while
+     they fit in CHUNK_MAX_TOKENS, so a list-like section is retrieved whole
+     rather than one short piece at a time (CHUNK_MERGE_SIBLINGS).
   3. Embed the contextualized text via Ollama's /api/embed, one batch per
      request and one request at a time, so Ollama's queue never sees a burst.
   4. Upsert into Qdrant with a dense vector plus a BM25 sparse vector that
@@ -48,7 +52,7 @@ os.environ.setdefault("HF_HOME", str(DATA_DIR / "hf-cache"))
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 # Bump when chunking or payload logic changes, so every document is re-embedded.
-CHUNKER_VERSION = 1
+CHUNKER_VERSION = 2
 
 # Namespace for deterministic point IDs: uuid5(NS, "<sha>:<fingerprint>:<index>").
 POINT_ID_NS = uuid.UUID("5b0f5e8e-6c2a-4f0e-9d3b-2a7c1e4f8a10")
@@ -82,6 +86,7 @@ class Config:
     tokenizer: str
     max_tokens: int
     batch_size: int
+    merge_siblings: bool = True
 
     @classmethod
     def from_env(cls, env: dict) -> "Config":
@@ -99,11 +104,12 @@ class Config:
             tokenizer=env["EMBED_TOKENIZER"],
             max_tokens=int(env.get("CHUNK_MAX_TOKENS", "512")),
             batch_size=int(env.get("EMBED_BATCH_SIZE", "32")),
+            merge_siblings=(env.get("CHUNK_MERGE_SIBLINGS") or "true").strip().lower() in ("1", "true", "yes", "on"),
         )
 
     @property
     def fingerprint(self) -> str:
-        key = json.dumps([self.embed_model, self.tokenizer, self.max_tokens, CHUNKER_VERSION])
+        key = json.dumps([self.embed_model, self.tokenizer, self.max_tokens, self.merge_siblings, CHUNKER_VERSION])
         return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
@@ -283,7 +289,60 @@ def make_chunker(cfg: Config):
     return HybridChunker(tokenizer=tokenizer, merge_peers=True)
 
 
-def chunk_doc(chunker, doc: Doc) -> list[Chunk]:
+def merge_siblings(chunker, chunks: list[Chunk], max_tokens: int) -> list[Chunk]:
+    """Merge runs of consecutive chunks that sit under the same parent heading
+    while the result fits in max_tokens. A run may start with the parent's own
+    text (headings == parent) followed by its subsections (parent + [x]).
+    The merged chunk's heading path is the parent; each subsection keeps its
+    heading as a line in the text."""
+    def body(c: Chunk, parent: list[str], prev: Chunk | None) -> str:
+        if len(c.headings) == len(parent) or (prev is not None and prev.headings == c.headings):
+            return c.text
+        return f"{c.headings[-1]}\n{c.text}"
+
+    def context(parent: list[str], text: str) -> str:
+        return "\n".join([*parent, text])
+
+    out: list[Chunk] = []
+    i = 0
+    while i < len(chunks):
+        first = chunks[i]
+        group, parent = [first], None
+        j = i + 1
+        while j < len(chunks):
+            nxt = chunks[j]
+            if parent is None:
+                # The run's parent: the first chunk itself (intro text followed
+                # by its subsections), or the first chunk's parent (siblings).
+                if nxt.headings[:-1] == first.headings and first.headings:
+                    cand = first.headings
+                elif len(first.headings) >= 2 and nxt.headings[:-1] == first.headings[:-1]:
+                    cand = first.headings[:-1]
+                else:
+                    break
+            else:
+                cand = parent
+                if nxt.headings[:-1] != cand:
+                    break
+            texts = [body(c, cand, p) for p, c in zip([None, *group, nxt], [*group, nxt])]
+            if chunker.tokenizer.count_tokens(text=context(cand, "\n\n".join(texts))) > max_tokens:
+                break
+            group.append(nxt)
+            parent = cand
+            j += 1
+        if len(group) == 1:
+            out.append(first)
+        else:
+            text = "\n\n".join(body(c, parent, p) for p, c in zip([None, *group], group))
+            out.append(Chunk(index=0, text=text, context_text=context(parent, text), headings=list(parent),
+                             pages=sorted({p for c in group for p in c.pages})))
+        i = j if len(group) > 1 else i + 1
+    for n, c in enumerate(out):
+        c.index = n
+    return out
+
+
+def chunk_doc(chunker, doc: Doc, merge: bool = True, max_tokens: int = 0) -> list[Chunk]:
     from docling_core.types.doc import DoclingDocument
 
     dl_doc = DoclingDocument.model_validate_json(doc.docling_json.read_text(encoding="utf-8"))
@@ -303,6 +362,8 @@ def chunk_doc(chunker, doc: Doc) -> list[Chunk]:
             headings=list(raw.meta.headings or []),
             pages=pages,
         ))
+    if merge and max_tokens:
+        chunks = merge_siblings(chunker, chunks, max_tokens)
     return chunks
 
 
@@ -310,7 +371,7 @@ def chunk_doc(chunker, doc: Doc) -> list[Chunk]:
 
 def embed_doc(client: httpx.Client, cfg: Config, chunker, doc: Doc, fp: str) -> int:
     t0 = time.monotonic()
-    chunks = chunk_doc(chunker, doc)
+    chunks = chunk_doc(chunker, doc, cfg.merge_siblings, cfg.max_tokens)
     if not chunks:
         raise RuntimeError("chunker produced no chunks")
     vprint(f"  chunker: {len(chunks)} chunks in {time.monotonic() - t0:.1f}s")
@@ -358,7 +419,7 @@ def show_chunks(cfg: Config, docs: list[Doc], full: bool) -> None:
     size stats. Runs the real chunker offline; needs neither Ollama nor Qdrant."""
     chunker = make_chunker(cfg)
     for doc in docs:
-        chunks = chunk_doc(chunker, doc)
+        chunks = chunk_doc(chunker, doc, cfg.merge_siblings, cfg.max_tokens)
         tokens = [chunker.tokenizer.count_tokens(text=c.context_text) for c in chunks]
         print(f"\n{'=' * 80}\n{doc.filename}\nsha256={doc.sha256}  chunks={len(chunks)}\n{'=' * 80}")
         for c, n in zip(chunks, tokens):

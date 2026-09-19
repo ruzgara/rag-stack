@@ -6,7 +6,7 @@ Hybrid search ranks chunks by vector similarity and keyword overlap, each
 scored without looking at the question and chunk together. A cross-encoder
 reads the question and one chunk as a pair and scores how well the chunk
 answers it -- slower, so it only re-scores the RAG_TOP_K fused candidates
-and keeps the best RAG_TOP_K_RERANKER.
+and keeps those scoring at least RAG_RERANK_MIN_SCORE.
 
 Runs on the GPU where available (Apple Silicon: PyTorch's MPS backend, in
 float16), otherwise CPU. Settings, from .env:

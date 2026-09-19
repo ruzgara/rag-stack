@@ -13,17 +13,26 @@ Pipeline per file in data/inbox (up to DOCLING_LOC_NUM_WORKERS files at once):
      every page with ocrmac (Apple Vision). Images go straight to ocrmac.
   4. Quality gate: too little text or too many junk characters -> VLM
      fallback (docling-serve vlm pipeline with the configured Ollama model).
-  5. Write the result to data/markdown/<sha>.md (human-readable) and
+  5. PDFs: heading levels (headings.py). docling marks every heading level 1;
+     levels are rebuilt from bookmarks, numbering or measured heading styles,
+     so chunks get their full heading path. Mislabelled running headers,
+     captions and split headings are cleaned up. The markdown is re-exported
+     from the corrected document.
+  6. Write the result to data/markdown/<sha>.md (human-readable) and
      data/docling/<sha>.json (DoclingDocument, input for embed.py).
-  6. Move the original file to data/processed or data/failed and record
+  7. Move the original file to data/processed or data/failed and record
      the outcome in data/manifest.jsonl.
 
-Run with: uv run ingest.py [--force-vlm] [--file PATH] [--reprocess] [-v/--verbose]
+--fix-headings reruns only step 5 on documents already processed, from their
+stored docling JSON: no OCR, a few seconds per document.
+
+Run with: uv run ingest.py [--force-vlm] [--file PATH] [--reprocess] [--fix-headings] [-v/--verbose]
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -42,6 +51,8 @@ import httpx
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 from dotenv import dotenv_values
+
+import headings
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data"
@@ -104,6 +115,7 @@ class Config:
     ocr_lang: list[str]
     min_chars_per_page: int
     workers: int
+    heading_levels: bool = True
     force_vlm: bool = False
     reprocess: bool = False
 
@@ -118,6 +130,7 @@ class Config:
             # docling-serve runs this many conversions in parallel; matching it
             # keeps both slots busy without queueing work behind them.
             workers=max(1, int(env.get("DOCLING_LOC_NUM_WORKERS", "2"))),
+            heading_levels=(env.get("INGEST_HEADING_LEVELS") or "true").strip().lower() in ("1", "true", "yes", "on"),
             force_vlm=force_vlm,
             reprocess=reprocess,
         )
@@ -357,6 +370,24 @@ def quality_gate_reason(md: str, pages: int, min_chars_per_page: int) -> str | N
     return None
 
 
+def fix_heading_levels(path: Path, md: str, doc_json: dict, announce: bool = False) -> tuple[str, dict, str | None]:
+    """Heading levels for a converted PDF (see headings.py). Returns the
+    re-exported markdown, the corrected JSON and the evidence used; on any
+    failure, the input unchanged, since flat headings still chunk fine."""
+    try:
+        fixed = copy.deepcopy(doc_json)
+        report = headings.assign_levels(path, fixed, PDFIUM_LOCK)
+        (log if announce else vprint)(f"  {headings.describe(report)}")
+        if report["source"] == "none":
+            return md, doc_json, None
+        from docling_core.types.doc import DoclingDocument
+
+        return DoclingDocument.model_validate(fixed).export_to_markdown(), fixed, report["source"]
+    except Exception as exc:  # noqa: BLE001 - optional step; keep docling's output
+        log(f"  heading levels skipped: {type(exc).__name__}: {exc}")
+        return md, doc_json, None
+
+
 def write_outputs(sha: str, markdown: str, doc_json: dict) -> tuple[Path, Path]:
     """Outputs are keyed by the source file's sha256, not its name, so two
     different files that share a stem can't overwrite each other."""
@@ -421,6 +452,11 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, sha: str, osd_wor
         else:
             vprint("  quality gate: passed")
 
+        if suffix in PDF_SUFFIXES and cfg.heading_levels and doc_json:
+            md, doc_json, source = fix_heading_levels(convert_path, md, doc_json)
+            if source:
+                route_parts.append(f"levels:{source}")
+
         result.route = "+".join(route_parts)
         result.chars = len(md)
 
@@ -466,12 +502,55 @@ def run_file(cfg: Config, path: Path, sha: str, tag: str, osd_workers: int) -> R
     return result
 
 
+def fix_headings_only(cfg: Config) -> int:
+    """--fix-headings: redo heading levels for every processed PDF from its
+    stored docling JSON, without converting again."""
+    latest: dict[str, dict] = {}
+    if MANIFEST.exists():
+        for line in MANIFEST.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("status") == "processed" and rec.get("docling_json"):
+                latest[rec["sha256"]] = rec
+    docs = [r for r in latest.values() if Path(r["filename"]).suffix.lower() in PDF_SUFFIXES]
+    if not docs:
+        print("No processed PDFs with docling JSON.")
+        return 0
+    failed = 0
+    for i, rec in enumerate(docs, start=1):
+        sha, name = rec["sha256"], rec["filename"]
+        # docling's boxes refer to the file it converted: the rotated copy
+        # in data/work when pages were rotated, else the original.
+        work = WORK / f"{sha}.pdf"
+        pdf = work if "rotated" in (rec.get("route") or "") and work.exists() else PROCESSED / name
+        json_path = REPO_ROOT / rec["docling_json"]
+        if not pdf.exists() or not json_path.exists():
+            print(f"[{i}/{len(docs)}] skip (source PDF or JSON missing): {name}")
+            failed += 1
+            continue
+        doc_json = json.loads(json_path.read_text(encoding="utf-8"))
+        md_path = REPO_ROOT / (rec.get("markdown_path") or f"data/markdown/{sha}.md")
+        md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+        _log_ctx.prefix = f"[{i}/{len(docs)}] "
+        log(name)
+        md, doc_json, source = fix_heading_levels(pdf, md, doc_json, announce=True)
+        if source:
+            write_outputs(sha, md, doc_json)
+        else:
+            failed += 1
+    print(f"\nDone. {len(docs) - failed} updated, {failed} unchanged. Run `./ragctl embed` to re-index them.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--force-vlm", action="store_true", help="Always use the VLM fallback pipeline")
     parser.add_argument("--file", dest="single_file", default=None, help="Process a single file instead of scanning data/inbox")
     parser.add_argument("--reprocess", action="store_true", help="Re-convert originals in data/processed (ignores the already-processed check)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Print per-stage detail: page triage, rotation, docling timings, quality-gate reasoning")
+    parser.add_argument("--fix-headings", action="store_true", help="Only redo heading levels for already processed PDFs, from their stored docling JSON (no OCR)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print per-stage detail: page triage, rotation, docling timings, quality-gate reasoning, heading levels")
     args = parser.parse_args()
 
     global VERBOSE
@@ -486,6 +565,9 @@ def main() -> int:
 
     for d in (INBOX, WORK, PROCESSED, FAILED, MARKDOWN, DOCLING_JSON):
         d.mkdir(parents=True, exist_ok=True)
+
+    if args.fix_headings:
+        return fix_headings_only(cfg)
 
     if args.single_file:
         targets = [Path(args.single_file)]

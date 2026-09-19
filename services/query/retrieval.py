@@ -7,7 +7,16 @@ Retrieval over the rag-stack index: hybrid search, then reranking.
    dense vectors and BM25 (sparse vectors Qdrant computes itself) -- and
    fuses their rankings into RAG_TOP_K candidates.
 2. Reranking (rerank.py): a cross-encoder on the GPU re-scores those
-   candidates against the question and keeps the best RAG_TOP_K_RERANKER.
+   candidates against the question; those scoring at least
+   RAG_RERANK_MIN_SCORE are kept, best first.
+3. Section expansion: when two or more kept chunks share a heading (say
+   "Investors" and "Lead manager", both under "The parties to a typical bond
+   issue"), the whole section under it is fetched and returned as one
+   result, in document order -- as long as it fits RAG_SECTION_MAX_TOKENS.
+   The deepest shared heading wins, so a chapter is never pulled in when a
+   subsection will do. Matching stays at chunk level, where it's precise;
+   what's returned is the complete section.
+4. At most RAG_TOP_K_RERANKER results are returned (a section counts as one).
 
 Every tuning knob is read from .env:
 
@@ -19,8 +28,10 @@ Every tuning knob is read from .env:
   RAG_DENSE_WEIGHT      RRF weight of the dense ranking
   RAG_BM25_WEIGHT       RRF weight of the BM25 ranking
   RAG_RERANK            true | false -- false returns the top fused results instead
-  RAG_TOP_K_RERANKER    results returned in the end
+  RAG_TOP_K_RERANKER    at most this many results returned
   RAG_RERANK_MIN_SCORE  drop reranked chunks scoring below this (0..1; 0 = keep all)
+  RAG_EXPAND_SECTIONS   true | false -- return whole sections (step 3)
+  RAG_SECTION_MAX_TOKENS  largest section returned whole, in (estimated) tokens
   RERANKER_*            model and device, see rerank.py
 
 Import `Retriever` from here in other services and call retrieve(); search()
@@ -37,7 +48,8 @@ import os
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import httpx
@@ -52,6 +64,14 @@ FUSIONS = ("rrf", "dbsf")
 # connection errors/timeouts usually mean the model is still loading.
 EMBED_RETRY_BACKOFF_S = (2, 5, 10)
 RETRYABLE_STATUS = {429, 502, 503, 504}
+
+# Chunks fetched per section lookup; a section with more is too big anyway.
+SECTION_FETCH_LIMIT = 64
+
+
+def estimate_tokens(text: str) -> int:
+    # Rough (≈4 characters per token for English); only used for budgets.
+    return len(text) // 4 + 1
 
 
 def load_env() -> dict:
@@ -98,6 +118,8 @@ class SearchConfig:
     rerank: bool
     top_k_reranker: int
     rerank_min_score: float
+    expand_sections: bool = True
+    section_max_tokens: int = 2000
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "SearchConfig":
@@ -120,8 +142,10 @@ class SearchConfig:
             dense_weight=_float(env, "RAG_DENSE_WEIGHT", "1.0"),
             bm25_weight=_float(env, "RAG_BM25_WEIGHT", "1.0"),
             rerank=_bool(env, "RAG_RERANK", "true"),
-            top_k_reranker=_int(env, "RAG_TOP_K_RERANKER", "6"),
-            rerank_min_score=_float(env, "RAG_RERANK_MIN_SCORE", "0"),
+            top_k_reranker=_int(env, "RAG_TOP_K_RERANKER", "10"),
+            rerank_min_score=_float(env, "RAG_RERANK_MIN_SCORE", "0.1"),
+            expand_sections=_bool(env, "RAG_EXPAND_SECTIONS", "true"),
+            section_max_tokens=_int(env, "RAG_SECTION_MAX_TOKENS", "2000"),
         )
         if cfg.mode not in SEARCH_MODES:
             raise ValueError(f"RAG_SEARCH_MODE must be one of {', '.join(SEARCH_MODES)}, got {cfg.mode!r}")
@@ -150,6 +174,14 @@ class Hit:
     text: str          # the chunk as it appears in the document
     context_text: str  # heading path + text: what was embedded and BM25-indexed
     rerank_score: float | None = None
+    # A whole section (step 3) stands for several chunks: all their point ids,
+    # in document order, and how many of them the search actually matched.
+    point_ids: list[str] = field(default_factory=list)
+    matched: int = 1
+
+    @property
+    def ids(self) -> list[str]:
+        return self.point_ids or [self.point_id]
 
 
 class Retriever:
@@ -276,25 +308,108 @@ class Retriever:
         return self._reranker
 
     def retrieve(self, question: str, limit: int | None = None, exclude: set[str] | None = None) -> list[Hit]:
-        """The final chunks for a question: hybrid search, reranked when
-        RAG_RERANK=true, cut to `limit` (default RAG_TOP_K_RERANKER).
-        Chunks whose point_id is in `exclude` are skipped, so asking again
-        with the same question returns the next-best unseen chunks."""
+        """The final results for a question: hybrid search, reranked and
+        thresholded when RAG_RERANK=true, grouped into whole sections when
+        RAG_EXPAND_SECTIONS=true, then at most `limit` (default
+        RAG_TOP_K_RERANKER), best first. Chunks whose point_id is in
+        `exclude` are skipped, so asking again with the same question
+        returns the next-best unseen ones."""
         limit = limit or self.cfg.top_k_reranker
-        hits = [h for h in self.search(question) if not exclude or h.point_id not in exclude]
-        if not self.cfg.rerank or not hits:
-            return hits[:limit]
-        # Score the text as it was indexed (heading path + chunk), so the
-        # reranker sees the same context the retrievers did.
-        scores = self.reranker.score(question, [h.context_text for h in hits])
-        for h, s in zip(hits, scores):
-            h.rerank_score = s
-            h.score = s
-        hits.sort(key=lambda h: h.rerank_score, reverse=True)
-        kept = [h for h in hits if h.rerank_score >= self.cfg.rerank_min_score][:limit]
+        exclude = exclude or set()
+        hits = [h for h in self.search(question) if h.point_id not in exclude]
+        if self.cfg.rerank and hits:
+            # Score the text as it was indexed (heading path + chunk), so the
+            # reranker sees the same context the retrievers did.
+            scores = self.reranker.score(question, [h.context_text for h in hits])
+            for h, s in zip(hits, scores):
+                h.rerank_score = s
+                h.score = s
+            hits.sort(key=lambda h: h.rerank_score, reverse=True)
+            hits = [h for h in hits if h.rerank_score >= self.cfg.rerank_min_score]
+        if self.cfg.expand_sections:
+            hits = self.expand_sections(hits, exclude)
+        kept = hits[:limit]
         for rank, h in enumerate(kept, start=1):
             h.rank = rank
         return kept
+
+    # ------------------------------------------------------------- sections --
+
+    def _section_chunks(self, doc_sha: str, prefix: tuple[str, ...]) -> list[dict] | None:
+        """Every chunk of a document whose heading path starts with prefix,
+        in document order; None if there are too many to be worth fetching."""
+        body = {
+            "filter": {"must": [
+                {"key": "doc_sha", "match": {"value": doc_sha}},
+                # Narrows the scan; the full prefix is checked below.
+                {"key": "headings", "match": {"value": prefix[-1]}},
+            ]},
+            "limit": SECTION_FETCH_LIMIT + 1,
+            "with_payload": ["chunk_index", "headings", "pages", "text"],
+        }
+        points = self._qdrant("POST", f"/collections/{self.cfg.collection}/points/scroll", body)["points"]
+        if len(points) > SECTION_FETCH_LIMIT:
+            return None
+        chunks = [p for p in points if tuple((p["payload"].get("headings") or [])[:len(prefix)]) == prefix]
+        return sorted(chunks, key=lambda p: p["payload"]["chunk_index"])
+
+    def _section_hit(self, prefix: tuple[str, ...], chunks: list[dict], members: list[Hit]) -> Hit:
+        """One Hit for a whole section: its chunks in order, each subsection's
+        heading kept as a line where it starts."""
+        parts, prev = [], ()
+        for c in chunks:
+            extra = tuple(c["payload"].get("headings") or [])[len(prefix):]
+            # Headings that begin here: the part of this chunk's path below the
+            # section that differs from the previous chunk's.
+            same = 0
+            while same < min(len(extra), len(prev)) and extra[same] == prev[same]:
+                same += 1
+            parts.append("\n".join([*extra[same:], c["payload"]["text"].strip()]))
+            prev = extra
+        text = "\n\n".join(parts)
+        best = max(members, key=lambda h: h.score)
+        return Hit(
+            rank=best.rank, score=best.score, fused_rank=min(h.fused_rank for h in members),
+            fused_score=max(h.fused_score for h in members), point_id=str(chunks[0]["id"]),
+            doc_sha=best.doc_sha, filename=best.filename, chunk_index=chunks[0]["payload"]["chunk_index"],
+            pages=sorted({p for c in chunks for p in c["payload"].get("pages") or []}),
+            headings=list(prefix), text=text, context_text="\n".join([*prefix, text]),
+            rerank_score=best.rerank_score, point_ids=[str(c["id"]) for c in chunks], matched=len(members),
+        )
+
+    def expand_sections(self, hits: list[Hit], exclude: set[str] | None = None) -> list[Hit]:
+        """Replace hits that share a heading with the whole section under the
+        deepest such heading, where it fits RAG_SECTION_MAX_TOKENS. The
+        section takes the place of its best-ranked member."""
+        exclude = exclude or set()
+        out = list(hits)
+        too_big: set[tuple[str, tuple[str, ...]]] = set()
+        while True:
+            singles = [h for h in out if len(h.ids) == 1 and h.headings]
+            counts = Counter((h.doc_sha, tuple(h.headings[:n])) for h in singles
+                             for n in range(1, len(h.headings) + 1))
+            # Deepest shared heading first; skip any enclosing one already too big.
+            candidates = sorted((k for k, c in counts.items() if c >= 2), key=lambda k: -len(k[1]))
+            candidates = [(sha, p) for sha, p in candidates
+                          if not any(sha == s2 and p2[:len(p)] == p for s2, p2 in too_big)]
+            for sha, prefix in candidates:
+                chunks = self._section_chunks(sha, prefix)
+                text_tokens = sum(estimate_tokens(c["payload"]["text"]) for c in chunks or [])
+                if not chunks or text_tokens > self.cfg.section_max_tokens:
+                    too_big.add((sha, prefix))
+                    continue
+                if any(str(c["id"]) in exclude for c in chunks):
+                    # Part of it was already handed out; returning it whole would repeat text.
+                    too_big.add((sha, prefix))
+                    continue
+                members = [h for h in singles if h.doc_sha == sha and tuple(h.headings[:len(prefix)]) == prefix]
+                section = self._section_hit(prefix, chunks, members)
+                first = min(out.index(h) for h in members)
+                out = [h for h in out if h not in members]
+                out.insert(first, section)
+                break
+            else:
+                return out
 
 
 # ---------------------------------------------------------------------- CLI --
@@ -354,7 +469,8 @@ def main() -> int:
         print(f"{len(hits)} results in {dt * 1000:.0f} ms for: {args.question}")
         for h in hits:
             pages = ",".join(map(str, h.pages)) or "?"
-            print(f"\n[{h.rank}] score={h.score:.4f}  {h.filename}  (pages {pages})")
+            section = f"  section: {len(h.ids)} chunks, {h.matched} matched" if len(h.ids) > 1 else ""
+            print(f"\n[{h.rank}] score={h.score:.4f}  {h.filename}  (pages {pages}){section}")
             if args.verbose and h.rerank_score is not None:
                 print(f"    rerank {h.rerank_score:.3f}, was #{h.fused_rank} after fusion (fused score {h.fused_score:.4f})")
             if sub_ranks:

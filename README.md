@@ -27,7 +27,8 @@ the embedding/indexing pipeline.
 ```
    ingest/ (native): data/inbox → page triage → born-digital: docling
           (embedded text) | scanned: rotation fix → docling + ocrmac
-          → quality check → [VLM fallback] → data/docling/<sha>.json
+          → quality check → [VLM fallback] → heading levels
+          → data/docling/<sha>.json
                     │                        + data/markdown/<sha>.md
                     ▼
    docling-serve (native, on-device GPU) ── VLM fallback ──► Ollama.app
@@ -124,7 +125,7 @@ and run:
 ```
 
 `ingest` also accepts `--force-vlm`, `--file PATH` to process a single
-file, `--reprocess` (below) and `-v`/`--verbose`.
+file, `--reprocess` and `--fix-headings` (below) and `-v`/`--verbose`.
 
 There's nothing to configure per file. Each PDF is first triaged page by
 page (instant, nothing is rendered):
@@ -145,7 +146,31 @@ A document is OCR'd as a whole if any of its pages needs it. Images are
 OCR'd with ocrmac too; other formats (docx, html…) are converted directly.
 Then comes a quality check and, only if that fails (or you pass
 `--force-vlm`), Docling's VLM pipeline using your configured `VLM_MODEL`
-as a last resort. Up to `DOCLING_LOC_NUM_WORKERS` files (default 2) are
+as a last resort.
+
+**Heading levels.** Docling gives every PDF heading level 1, so on its own
+a chunk's heading path is just its nearest heading, and a heading with no
+text of its own ("The parties to a typical bond issue", followed straight
+away by "Investors") never reaches the index. For PDFs, ingest rebuilds the
+levels from the best evidence available (`services/ingest/headings.py`):
+
+1. **Bookmarks** (the PDF outline), when they match the headings.
+2. **Numbering** ("7", "7.3", "7.3.1"), when most headings are numbered.
+3. **Style**, measured from the rendered page: letter height, stroke width
+   (bold) and slant (italic), plus ALL CAPS. This works on scans, which
+   carry no font information. Styles rank "Chapter N" > very large > caps
+   > bold > upright > italic.
+
+It also cleans up what docling mislabels as headings: running page headers
+and logos repeated in the page margin are dropped, figure/table captions
+and sentence-length "headings" become text, and headings split over two
+lines ("Chapter 4" + "Determination of a" + "Discount Rate") are joined. If
+the styles don't form a few clear groups, the document keeps flat levels.
+It costs a few seconds per book, no model calls; `-v` prints what it
+decided, and `INGEST_HEADING_LEVELS=false` turns it off. Known limit:
+headings docling doesn't detect at all can't be recovered.
+
+Up to `DOCLING_LOC_NUM_WORKERS` files (default 2) are
 converted at once — ocrmac gets ~1.65× more throughput with two in
 parallel, so large batches cost little more than born-digital ones would
 suggest. Docling's output is written
@@ -160,6 +185,10 @@ without moving the originals. Use it after a pipeline change, or for
 documents processed before the JSON output existed — `embed` lists any it
 had to skip. Then run `./ragctl embed` to re-index them.
 
+`ingest --fix-headings` redoes only the heading levels for every processed
+PDF, from its stored JSON: no OCR, seconds per document. Follow it with
+`./ragctl embed`, which re-indexes the documents whose JSON changed.
+
 **Embedding** (`./ragctl embed`) takes every processed document from the
 manifest and:
 1. Chunks its DoclingDocument JSON with Docling's `HybridChunker`, which
@@ -168,6 +197,10 @@ manifest and:
 2. Prepends each chunk's heading path, so a chunk under "Mitigation" in a
    risk chapter isn't indistinguishable from one in a currency chapter.
    The raw text, headings and page numbers are stored alongside.
+   Short sibling sections under one parent (a run of one-paragraph
+   subsections, say) are merged into shared chunks while they fit in
+   `CHUNK_MAX_TOKENS`, so a list-like section comes back in a few chunks
+   instead of many small ones (`CHUNK_MERGE_SIBLINGS`).
 3. Embeds in batches of `EMBED_BATCH_SIZE`, one request per batch and one
    batch at a time — so Ollama's request queue never sees a burst — with
    retries on 503s and timeouts.
@@ -176,7 +209,7 @@ manifest and:
 
 It's idempotent: Qdrant is the record of what's embedded, and a document is
 skipped when all its chunks are there under the current settings. Changing
-`CHUNK_MAX_TOKENS` or `EMBED_TOKENIZER` re-embeds everything on the next
+`CHUNK_MAX_TOKENS`, `CHUNK_MERGE_SIBLINGS` or `EMBED_TOKENIZER` re-embeds everything on the next
 run. The vector size is read from the model, never configured; switching
 `EMBED_MODEL` makes `embed` stop and ask for `./ragctl embed --recreate`,
 so vectors from two models never mix in one index.
@@ -197,8 +230,10 @@ and fuses their rankings. Every setting lives in `.env`:
 | `RAG_RRF_K` | `60` | RRF: score = Σ weight / (k + rank); larger k flattens rank differences |
 | `RAG_DENSE_WEIGHT`, `RAG_BM25_WEIGHT` | `1.0` | RRF weight of each retriever |
 | `RAG_RERANK` | `true` | rerank the fused candidates; `false` returns the top fused results |
-| `RAG_TOP_K_RERANKER` | `6` | chunks returned in the end |
-| `RAG_RERANK_MIN_SCORE` | `0` | drop reranked chunks scoring below this (0–1); 0 keeps all |
+| `RAG_RERANK_MIN_SCORE` | `0.1` | drop reranked chunks scoring below this (0–1); 0 keeps all |
+| `RAG_TOP_K_RERANKER` | `10` | at most this many results (a whole section counts as one) |
+| `RAG_EXPAND_SECTIONS` | `true` | return whole sections when several of their chunks match (below) |
+| `RAG_SECTION_MAX_TOKENS` | `2000` | largest section returned whole |
 | `RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | HuggingFace cross-encoder |
 | `RERANKER_DEVICE` | `auto` | `auto` (Apple GPU via MPS if available, else CUDA, else CPU), or force one |
 | `RERANKER_BATCH_SIZE`, `RERANKER_MAX_LENGTH` | `16`, `1024` | pairs per forward pass; token limit per question+chunk pair |
@@ -206,14 +241,29 @@ and fuses their rankings. Every setting lives in `.env`:
 **Reranking** (`services/query/rerank.py`): hybrid search scores the question
 and each chunk separately, so a cross-encoder then reads each question/chunk
 *pair* and scores how well the chunk answers it. It only re-scores the
-`RAG_TOP_K` fused candidates, keeping `RAG_TOP_K_RERANKER`. It runs on the
+`RAG_TOP_K` fused candidates, keeping those scoring at least
+`RAG_RERANK_MIN_SCORE`. It runs on the
 Mac's GPU through PyTorch's MPS backend in float16. Measured here: ~1.2 s
 to rerank 20 chunks on the GPU against ~2.8 s on the CPU, with float16
 giving the same order as float32. The model (~2.3 GB) is downloaded into
 `data/hf-cache` by `ragctl install`, or on first use; loading it takes ~1 s,
 so a one-off `ragctl search` takes a few seconds while a long-running
 service pays that once. Scores are 0–1 and comparable across questions,
-which is what makes `RAG_RERANK_MIN_SCORE` usable.
+which is what makes `RAG_RERANK_MIN_SCORE` usable. Measured on this
+library: off-topic questions ("how do I bake sourdough bread?") and the
+tails of real ones score ≤ 0.08, while useful passages score ≥ 0.1 even for
+vague questions, hence the default of 0.1. How many passages clear it
+depends on the question: 1 for "what is a mini-perm loan?", 18 of 20 for
+"what are the risks of a concession agreement?".
+
+**Whole sections.** Search matches individual chunks, but a list-like
+section ("The parties to a typical bond issue": investors, issuers, lead
+manager, trustee… each a short subsection) is spread over several of
+them. When two or more relevant chunks share a heading, retrieval fetches
+every chunk under the deepest such heading and returns the section as one
+result, in document order with its subheadings — if it fits in
+`RAG_SECTION_MAX_TOKENS`, so a whole chapter is never pulled in. Chunks
+already handed out in the conversation turn aren't repeated.
 
 `-v` prints the settings, the device the reranker landed on, and for each
 hit its rerank score, where it was after fusion, and its rank in the dense
@@ -247,8 +297,12 @@ anyone who can reach it can read every conversation. Setting
    "translate that" are answered without one) and, for a follow-up, turns it
    into a standalone search query ("and for Level 1?" → "RSF factor for
    Level 1 assets").
-2. **Automatic search** — `CHAT_INITIAL_SOURCES` passages (hybrid search +
-   reranking), numbered [1]..[n].
+2. **Automatic search** — hybrid search + reranking; every passage above
+   `RAG_RERANK_MIN_SCORE` (whole sections where several of their chunks
+   match), best first, until `CHAT_AUTO_SOURCE_TOKENS` is used. A narrow
+   question gets one or two passages, a broad one many, and an off-topic
+   one none. `CHAT_INITIAL_SOURCES` only caps the count. Numbered
+   [1]..[n].
 3. **Answer** — streamed from the preset's chat model, citing passages as
    [n]. If the preset has tools on, the model may call a `search_documents`
    tool for more passages (up to `CHAT_MAX_TOOL_ROUNDS`, within
@@ -381,4 +435,8 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
 
 ## Future potential updates
 
-- Explore docling-hierarcical-pdf to fix heading detection
+- Heading levels use a style ranking of their own rather than
+  docling-hierarchical-pdf: its size-based clustering scrambled scanned
+  books (pixel height is a noisy stand-in for font size, and it has no
+  notion of ALL CAPS), and it needs docling's in-process result, which
+  docling-serve doesn't return.

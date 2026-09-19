@@ -6,8 +6,12 @@ One turn:
      all ("hello", "thanks", "make that shorter" don't) and, with earlier
      history, turns it into a standalone search query ("and for Level 1?" ->
      "RSF factor for Level 1 assets").
-  2. Auto-search: retrieve() returns CHAT_INITIAL_SOURCES passages, numbered
-     [1]..[n].
+  2. Auto-search: retrieve() returns the passages the reranker scores
+     relevant (RAG_RERANK_MIN_SCORE), whole sections where several chunks of
+     one section match; they're taken best first until
+     CHAT_AUTO_SOURCE_TOKENS is used, and numbered [1]..[n]. How many that is
+     depends on the question -- one passage for a narrow one, many for a broad
+     one -- rather than a fixed count (CHAT_INITIAL_SOURCES only caps it).
   3. Answer: the chat model streams its answer from Ollama. If the preset has
      tools on, it may call search_documents for more passages -- at most
      CHAT_MAX_TOOL_ROUNDS times, within CHAT_MAX_SOURCE_TOKENS. Passages
@@ -29,7 +33,7 @@ from typing import Iterator
 
 import httpx
 
-from retrieval import Hit, Retriever, _bool, _float, _int, load_env
+from retrieval import Hit, Retriever, _bool, _float, _int, estimate_tokens, load_env
 
 PROMPTS = Path(__file__).parent / "prompts"
 PRESETS = ("everyday", "hard")
@@ -59,11 +63,6 @@ class ChatError(Exception):
     pass
 
 
-def estimate_tokens(text: str) -> int:
-    # Rough (≈4 characters per token for English); only used for budgets.
-    return len(text) // 4 + 1
-
-
 @dataclass(frozen=True)
 class Preset:
     name: str
@@ -81,6 +80,7 @@ class ChatConfig:
     history_max_tokens: int
     rewrite: bool
     initial_sources: int
+    auto_source_tokens: int
     tool_results: int
     max_tool_rounds: int
     max_source_tokens: int
@@ -112,8 +112,9 @@ class ChatConfig:
             temperature=_float(env, "CHAT_TEMPERATURE", "0.3"),
             history_max_tokens=_int(env, "CHAT_HISTORY_MAX_TOKENS", "8000"),
             rewrite=_bool(env, "CHAT_REWRITE", "true"),
-            initial_sources=_int(env, "CHAT_INITIAL_SOURCES", "4"),
-            tool_results=_int(env, "CHAT_TOOL_RESULTS", "4"),
+            initial_sources=_int(env, "CHAT_INITIAL_SOURCES", "10"),
+            auto_source_tokens=_int(env, "CHAT_AUTO_SOURCE_TOKENS", "3500"),
+            tool_results=_int(env, "CHAT_TOOL_RESULTS", "6"),
             max_tool_rounds=rounds,
             max_source_tokens=_int(env, "CHAT_MAX_SOURCE_TOKENS", "6000"),
         )
@@ -278,17 +279,22 @@ class ChatService:
         return search, query or question
 
     def _search(self, query: str, limit: int, seen: set[str], sources: list[Source], found_by: str,
-                budget: list[int]) -> list[Source]:
-        """New sources for a query, numbered after the existing ones, within
-        the remaining source-token budget (budget[0], mutated)."""
+                budget: list[int], max_tokens: int | None = None) -> list[Source]:
+        """New sources for a query, best first, numbered after the existing
+        ones: every relevant result that fits this search's token allowance
+        (max_tokens) and the turn's remaining budget (budget[0], mutated).
+        A result too big for what's left is skipped in favour of smaller,
+        less relevant ones. `limit` only caps the count."""
         new = []
+        allowance = min(budget[0], max_tokens) if max_tokens else budget[0]
         for hit in self.retriever.retrieve(query, limit=limit, exclude=seen):
             src = Source.from_hit(len(sources) + 1, hit, found_by, query)
             cost = estimate_tokens(src.for_prompt())
-            if budget[0] - cost < 0 and sources:  # always allow at least one source
-                break
+            if cost > allowance and (new or sources):  # always allow at least one source
+                continue
+            allowance -= cost
             budget[0] -= cost
-            seen.add(hit.point_id)
+            seen.update(hit.ids)
             sources.append(src)
             new.append(src)
         return new
@@ -317,7 +323,8 @@ class ChatService:
         if do_search:
             yield {"type": "searching", "query": query, "found_by": "auto"}
             t0 = time.monotonic()
-            new = self._search(query, self.cfg.initial_sources, seen, result.sources, "auto", budget)
+            new = self._search(query, self.cfg.initial_sources, seen, result.sources, "auto", budget,
+                               self.cfg.auto_source_tokens)
             result.stats["search_s"] = round(time.monotonic() - t0, 2)
             result.search_queries.append(query)
             yield {"type": "sources", "sources": [asdict(s) for s in new]}
@@ -337,7 +344,9 @@ class ChatService:
         elif result.sources:
             context = "Sources:\n\n" + "\n\n".join(s.for_prompt() for s in result.sources)
         else:
-            context = "Sources: none. The document search found no relevant passages for this question."
+            context = ("Sources: none — the document search found no relevant passages for this question. "
+                       "Tell the user briefly that the documents don't cover it; don't answer from general "
+                       "knowledge unless you say so, and don't suggest searches to the user.")
         user_turn = f"{context}\n\n---\n\nQuestion: {question}"
         if tools_on and not do_search:
             user_turn += ("\n\n(If answering this does need information from the documents after all, "
@@ -410,6 +419,7 @@ class ChatService:
             completion_tokens=eval_tokens,
             first_token_s=round(t_first_token - t_start, 2) if t_first_token else None,
             total_s=round(time.monotonic() - t_start, 2),
+            source_tokens=self.cfg.max_source_tokens - budget[0],
         )
         yield {"type": "done", "result": result}
 

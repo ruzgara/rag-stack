@@ -9,6 +9,10 @@ dependencies = [
     "pypdfium2>=5.13,<6",
     "pillow>=11,<13",  # pypdfium2 renders to PIL images for tesseract
     "python-dotenv>=1.0,<2",
+    # Heading levels (headings.py): style measurement on rendered pages, and
+    # re-exporting the markdown from the corrected DoclingDocument.
+    "numpy>=2,<3",
+    "docling-core>=2.97,<3",
 ]
 
 [tool.uv]
