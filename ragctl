@@ -1,10 +1,10 @@
 #!/bin/bash
 # ragctl — single entry point for the rag-stack deployment.
 #
-# Manages: Ollama.app tuning (native), docling-serve (native), Qdrant +
-# Open WebUI (Docker), and the batch ingestion pipeline. Everything it
-# installs lives inside this repo, in Docker volumes prefixed
-# "ragstack_", or in LaunchAgents labelled "com.ragstack.*".
+# Manages: Ollama.app tuning (native), docling-serve (native), Qdrant
+# (Docker), and the batch ingestion pipeline. Everything it installs
+# lives inside this repo, in Docker volumes prefixed "ragstack_", or in
+# LaunchAgents labelled "com.ragstack.*".
 #
 # Run `./ragctl help` for the command list.
 
@@ -38,9 +38,7 @@ load_env() {
     set +a
     OLLAMA_PORT="${OLLAMA_PORT:-11434}"
     DOCLING_PORT="${DOCLING_PORT:-5001}"
-    WEBUI_PORT="${WEBUI_PORT:-3000}"
     QDRANT_PORT="${QDRANT_PORT:-6333}"
-    BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
     MIN_FREE_GB="${MIN_FREE_GB:-41}"
 }
 
@@ -100,7 +98,7 @@ cmd_preflight() {
         ok "Ollama is reachable"
     fi
 
-    for p in "$WEBUI_PORT" "$DOCLING_PORT" "$QDRANT_PORT"; do
+    for p in "$DOCLING_PORT" "$QDRANT_PORT"; do
         if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
             warn "Port $p is already in use — check it's not a leftover ragstack process (ragctl status)."
         fi
@@ -207,15 +205,6 @@ cmd_install() {
         [[ -n "${!m:-}" ]] || die "$m is empty in .env. Set it (and run 'ollama pull <name>') before installing."
     done
 
-    if [[ -z "${WEBUI_SECRET_KEY:-}" ]]; then
-        local secret
-        secret="$(openssl rand -hex 32)"
-        sed -i.bak "s#^WEBUI_SECRET_KEY=.*#WEBUI_SECRET_KEY=${secret}#" "$ENV_FILE"
-        rm -f "$ENV_FILE.bak"
-        load_env
-        ok "Generated WEBUI_SECRET_KEY"
-    fi
-
     mkdir -p "$DATA_DIR"/{inbox,work,processed,failed,logs,docling-artifacts,hf-cache}
 
     echo "== System dependencies (brew bundle) =="
@@ -244,43 +233,18 @@ cmd_install() {
     echo "== Docker services =="
     compose pull
     compose up -d
-    wait_for_open_webui || true
 
     echo
     ok "Install complete."
     cat <<EOF
 
 Next steps:
-  1. Open http://${BIND_ADDR}:${WEBUI_PORT} and create the admin account.
-  2. In Open WebUI: Admin Panel -> Settings -> Users, then your user ->
-     Settings -> Account -> API keys, create a key, and set OWUI_API_KEY
-     in .env to it.
-  3. Run: ./ragctl webui-setup
-  4. Run: ./ragctl health
+  1. Run: ./ragctl health
+  2. Drop files in data/inbox and run: ./ragctl ingest
 EOF
 }
 
 # ------------------------------------------------------------- up/down --
-wait_for_open_webui() {
-    # Open WebUI takes a while to actually accept requests after (re)starting
-    # -- DB migrations, loading the reranker model, etc -- well after `docker
-    # compose up -d` itself returns. Poll /health so callers don't report a
-    # false "unreachable" against a container that's simply still booting.
-    local deadline=$((SECONDS + 90))
-    printf '  waiting for Open WebUI to finish starting'
-    while (( SECONDS < deadline )); do
-        if curl -sf "http://127.0.0.1:${WEBUI_PORT}/health" >/dev/null 2>&1; then
-            echo
-            return 0
-        fi
-        printf '.'
-        sleep 2
-    done
-    echo
-    warn "Open WebUI still not responding after 90s — check 'ragctl logs webui'."
-    return 1
-}
-
 cmd_up() {
     load_env
     render_all
@@ -290,7 +254,6 @@ cmd_up() {
         load_agent "com.ragstack.ingest"
     fi
     compose up -d
-    wait_for_open_webui || true
     ok "Stack is up."
 }
 
@@ -320,8 +283,7 @@ cmd_reload() {
         unload_agent "com.ragstack.ingest"
     fi
     compose up -d --force-recreate
-    wait_for_open_webui || true
-    ok "Reloaded. Note: most Open WebUI RAG settings are PersistentConfig and only apply on a FIRST start of a fresh volume — change them in Admin -> Settings -> Documents if they don't take effect."
+    ok "Reloaded."
 }
 
 # -------------------------------------------------------------- status --
@@ -339,8 +301,7 @@ cmd_status() {
     echo "== Reachability =="
     for pair in "Ollama:http://127.0.0.1:${OLLAMA_PORT}/api/version" \
                 "docling-serve:http://127.0.0.1:${DOCLING_PORT}/health" \
-                "Qdrant:http://127.0.0.1:${QDRANT_PORT}/readyz" \
-                "Open WebUI:http://127.0.0.1:${WEBUI_PORT}/health"; do
+                "Qdrant:http://127.0.0.1:${QDRANT_PORT}/readyz"; do
         name="${pair%%:*}"; url="${pair#*:}"
         if curl -sf "$url" >/dev/null 2>&1; then ok "$name reachable ($url)"; else warn "$name NOT reachable ($url)"; fi
     done
@@ -353,9 +314,9 @@ cmd_logs() {
         docling) tail -n 100 -f "$LOG_DIR/docling-serve.log" ;;
         ollama) tail -n 100 -f "$LOG_DIR/ollama-env.log" ;;
         ingest) tail -n 100 -f "$LOG_DIR/ingest-watch.log" ;;
-        qdrant|open-webui|webui) compose logs -f "${svc/webui/open-webui}" ;;
+        qdrant) compose logs -f "$svc" ;;
         "") compose logs -f ;;
-        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, qdrant, webui" ;;
+        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, qdrant" ;;
     esac
 }
 
@@ -385,72 +346,6 @@ cmd_models_check() {
     return "$missing"
 }
 
-# ---------------------------------------------------------- webui-setup --
-owui_api() {
-    local method="$1" path="$2" body="${3:-}"
-    load_env
-    [[ -n "${OWUI_API_KEY:-}" ]] || die "OWUI_API_KEY is not set in .env. See README: create an API key in Open WebUI first."
-    if [[ -n "$body" ]]; then
-        curl -sf -X "$method" "http://127.0.0.1:${WEBUI_PORT}${path}" \
-            -H "Authorization: Bearer ${OWUI_API_KEY}" -H "Content-Type: application/json" \
-            -d "$body"
-    else
-        curl -sf -X "$method" "http://127.0.0.1:${WEBUI_PORT}${path}" \
-            -H "Authorization: Bearer ${OWUI_API_KEY}"
-    fi
-}
-
-cmd_webui_setup() {
-    load_env
-    command -v python3 >/dev/null || die "python3 is required for webui-setup"
-
-    echo "== Knowledge base =="
-    local kb_id
-    kb_id="$(owui_api GET "/api/v1/knowledge/" | python3 -c "
-import json, sys, os
-body = json.load(sys.stdin)
-kbs = body['items'] if isinstance(body, dict) else body
-name = os.environ['KB_NAME']
-for kb in kbs:
-    if kb.get('name') == name:
-        print(kb['id']); sys.exit(0)
-print('')
-")"
-    if [[ -z "$kb_id" ]]; then
-        kb_id="$(owui_api POST "/api/v1/knowledge/create" "{\"name\":\"${KB_NAME}\",\"description\":\"Created by ragctl webui-setup\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
-        ok "Created knowledge base '${KB_NAME}' ($kb_id)"
-    else
-        ok "Knowledge base '${KB_NAME}' already exists ($kb_id)"
-    fi
-
-    echo "== Model presets =="
-    for pair in "Everyday:${CHAT_MODEL_EVERYDAY:-}" "Hard questions:${CHAT_MODEL_HARD:-}"; do
-        local label="${pair%%:*}" base_model="${pair#*:}"
-        [[ -n "$base_model" ]] || { warn "Skipping preset '$label': model not set in .env"; continue; }
-        local model_id
-        model_id="ragstack-$(echo "$label" | tr '[:upper:] ' '[:lower:]-')"
-        local body
-        body="$(RAGSTACK_MODEL_ID="$model_id" RAGSTACK_LABEL="$label" RAGSTACK_BASE_MODEL="$base_model" \
-            RAGSTACK_KB_ID="$kb_id" RAGSTACK_KB_NAME="$KB_NAME" python3 -c '
-import json, os
-e = os.environ
-print(json.dumps({
-    "id": e["RAGSTACK_MODEL_ID"],
-    "name": e["RAGSTACK_LABEL"],
-    "base_model_id": e["RAGSTACK_BASE_MODEL"],
-    "meta": {"knowledge": [{"id": e["RAGSTACK_KB_ID"], "name": e["RAGSTACK_KB_NAME"]}]},
-    "params": {},
-}))
-')"
-        owui_api POST "/api/v1/models/create" "$body" >/dev/null 2>&1 \
-            && ok "Preset '$label' -> $base_model (KB attached)" || warn "Preset '$label' may already exist (skipped)"
-    done
-
-    if [[ "${ENABLE_SIGNUP:-true}" == "true" ]]; then
-        warn "ENABLE_SIGNUP is still 'true' in .env. Once your admin account exists, set it to 'false' and run 'ragctl reload' to stop public self-registration."
-    fi
-}
-
 # ----------------------------------------------------------------- ingest --
 cmd_ingest() {
     load_env
@@ -478,22 +373,6 @@ cmd_health() {
     echo "== Qdrant =="
     curl -sf "http://127.0.0.1:${QDRANT_PORT}/readyz" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
 
-    echo "== Open WebUI =="
-    curl -sf "http://127.0.0.1:${WEBUI_PORT}/health" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
-
-    echo "== Container -> host connectivity =="
-    # -q prints just the container ID (one token) when running, nothing
-    # otherwise — more robust than grepping the formatted table, which is
-    # sensitive to column widths/locale and was seen to flicker false.
-    if [[ -n "$(compose ps -q open-webui 2>/dev/null)" ]]; then
-        compose exec -T open-webui curl -sf "http://host.docker.internal:${OLLAMA_PORT}/api/version" >/dev/null 2>&1 \
-            && ok "open-webui -> host Ollama" || { err "open-webui cannot reach host Ollama"; fail=1; }
-        compose exec -T open-webui curl -sf "http://host.docker.internal:${DOCLING_PORT}/health" >/dev/null 2>&1 \
-            && ok "open-webui -> host docling-serve" || { err "open-webui cannot reach host docling-serve"; fail=1; }
-    else
-        warn "open-webui container not running, skipping container->host checks"
-    fi
-
     if (( fail )); then err "Health check found problems."; else ok "All checks passed."; fi
     return "$fail"
 }
@@ -502,34 +381,8 @@ cmd_health() {
 cmd_clean() {
     load_env
     if [[ "${1:-}" != "--yes" ]]; then
-        die "This deletes ALL knowledge base files, chat history, Qdrant vectors, and data/{inbox,work,processed,failed,manifest.jsonl}. Your Open WebUI account, OWUI_API_KEY, knowledge base, and chat presets are kept. Re-run as: ragctl clean --yes"
+        die "This deletes data/{inbox,work,processed,failed,manifest.jsonl}. Re-run as: ragctl clean --yes"
     fi
-    [[ -n "${OWUI_API_KEY:-}" ]] || die "OWUI_API_KEY is not set in .env. See README: create an API key in Open WebUI first."
-
-    echo "== Open WebUI: deleting all files (DB rows + vectors + on-disk storage) =="
-    # Goes through Open WebUI's own delete logic rather than touching its
-    # DB/volume directly, so the account, API key and knowledge-base/preset
-    # config it also lives in are left completely alone.
-    if owui_api DELETE "/api/v1/files/all" >/dev/null 2>&1; then
-        ok "Files cleared"
-    else
-        warn "Could not clear files via API (maybe none existed) — continuing"
-    fi
-
-    echo "== Open WebUI: deleting chat history =="
-    if owui_api DELETE "/api/v1/chats/" >/dev/null 2>&1; then
-        ok "Chat history cleared"
-    else
-        warn "Could not clear chat history via API (maybe none existed) — continuing"
-    fi
-
-    echo "== Qdrant: dropping collections (belt-and-suspenders; Open WebUI recreates them lazily on next write) =="
-    for c in open-webui_files open-webui_knowledge; do
-        if curl -sf "http://127.0.0.1:${QDRANT_PORT}/collections/$c" >/dev/null 2>&1; then
-            curl -sf -X DELETE "http://127.0.0.1:${QDRANT_PORT}/collections/$c" >/dev/null 2>&1 \
-                && ok "Cleared Qdrant collection $c" || warn "Failed to clear Qdrant collection $c"
-        fi
-    done
 
     echo "== Local ingest data =="
     rm -rf "$DATA_DIR/inbox" "$DATA_DIR/work" "$DATA_DIR/processed" "$DATA_DIR/failed" "$DATA_DIR/manifest.jsonl"
@@ -537,7 +390,7 @@ cmd_clean() {
     ok "Cleared data/inbox, work, processed, failed and manifest.jsonl"
 
     echo
-    ok "Clean complete — equivalent to right after a fresh 'ragctl webui-setup': your admin account, API key, knowledge base and chat presets are all still there and ready to use."
+    ok "Clean complete."
     warn "Model caches (data/hf-cache, data/docling-artifacts) were left in place on purpose — they're not your data, and re-downloading them is wasteful. Delete them by hand if you really want to."
 }
 
@@ -576,15 +429,11 @@ Usage: ./ragctl <command> [args]
   restart               down then up
   reload                Re-render configs from .env and restart everything
   status                Show what's running and reachable
-  logs [svc]             Tail logs (svc: docling, ollama, ingest, qdrant, webui)
+  logs [svc]             Tail logs (svc: docling, ollama, ingest, qdrant)
   models check           Verify .env model names exist in 'ollama list'
-  webui-setup             Create the knowledge base + chat presets (after admin signup)
   ingest [--force-vlm]    Run the batch inbox -> knowledge base pipeline once
   health                 End-to-end connectivity check
-  clean --yes             Wipe all knowledge base files + chat history +
-                           Qdrant vectors + data/{inbox,work,processed,
-                           failed}; keeps your Open WebUI account, API
-                           key, KB and presets
+  clean --yes             Wipe data/{inbox,work,processed,failed,manifest.jsonl}
   uninstall [--purge-data]  Tear down containers, agents and local envs
 EOF
 }
@@ -601,7 +450,6 @@ main() {
         logs) cmd_logs "$@" ;;
         models)
             case "${1:-}" in check) cmd_models_check ;; *) die "Usage: ragctl models check" ;; esac ;;
-        webui-setup) cmd_webui_setup "$@" ;;
         ingest) cmd_ingest "$@" ;;
         health) cmd_health "$@" ;;
         clean) cmd_clean "$@" ;;

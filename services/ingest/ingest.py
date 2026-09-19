@@ -9,12 +9,11 @@ Pipeline per file in data/inbox:
   3. Quality gate: too little text or too many junk characters -> fallback.
   4. VLM fallback: docling-serve vlm pipeline, calling the configured
      Ollama vision model as an OpenAI-compatible endpoint.
-  5. Upload the resulting markdown to Open WebUI and attach it to the
-     configured knowledge base.
+  5. Write the resulting markdown to data/markdown.
   6. Move the original file to data/processed or data/failed and record
      the outcome in data/manifest.jsonl.
 
-Run with: uv run ingest.py [--kb NAME] [--force-vlm] [--file PATH] [-v/--verbose]
+Run with: uv run ingest.py [--force-vlm] [--file PATH] [-v/--verbose]
 """
 
 from __future__ import annotations
@@ -40,6 +39,7 @@ INBOX = DATA_DIR / "inbox"
 WORK = DATA_DIR / "work"
 PROCESSED = DATA_DIR / "processed"
 FAILED = DATA_DIR / "failed"
+MARKDOWN = DATA_DIR / "markdown"
 MANIFEST = DATA_DIR / "manifest.jsonl"
 
 PDF_SUFFIXES = {".pdf"}
@@ -67,9 +67,6 @@ def load_env() -> dict:
 @dataclass
 class Config:
     docling_url: str
-    owui_url: str
-    owui_api_key: str
-    kb_name: str
     vlm_model: str
     ocr_lang: str
     min_chars_per_page: int
@@ -77,21 +74,10 @@ class Config:
     force_vlm: bool = False
 
     @classmethod
-    def from_env(cls, env: dict, kb_override: str | None, force_vlm: bool) -> "Config":
-        missing = [k for k in ("OWUI_API_KEY",) if not env.get(k)]
-        if missing:
-            sys.exit(
-                f"Missing required .env values: {', '.join(missing)}. "
-                "Create an API key in Open WebUI (Admin -> your user -> Settings "
-                "-> Account -> API keys) and set OWUI_API_KEY, then re-run."
-            )
+    def from_env(cls, env: dict, force_vlm: bool) -> "Config":
         docling_port = env.get("DOCLING_PORT", "5001")
-        webui_port = env.get("WEBUI_PORT", "3000")
         return cls(
             docling_url=f"http://127.0.0.1:{docling_port}",
-            owui_url=f"http://127.0.0.1:{webui_port}",
-            owui_api_key=env["OWUI_API_KEY"],
-            kb_name=kb_override or env.get("KB_NAME", "Knowledge Base"),
             vlm_model=env.get("VLM_MODEL", ""),
             ocr_lang=env.get("OCR_LANG", "eng"),
             min_chars_per_page=int(env.get("MIN_CHARS_PER_PAGE", "200")),
@@ -109,7 +95,7 @@ class Result:
     chars: int = 0
     status: str = "failed"
     error: str | None = None
-    kb_file_id: str | None = None
+    markdown_path: str | None = None
     timestamp: float = field(default_factory=time.time)
 
 
@@ -256,96 +242,15 @@ def quality_gate_reason(md: str, pages: int, min_chars_per_page: int) -> str | N
     return None
 
 
-def owui_headers(cfg: Config) -> dict:
-    return {"Authorization": f"Bearer {cfg.owui_api_key}"}
+def write_markdown(filename: str, markdown: str) -> Path:
+    MARKDOWN.mkdir(parents=True, exist_ok=True)
+    out_path = MARKDOWN / filename
+    out_path.write_text(markdown, encoding="utf-8")
+    vprint(f"  markdown: wrote {len(markdown)} chars -> {out_path}")
+    return out_path
 
 
-def owui_get_or_create_kb(client: httpx.Client, cfg: Config) -> str:
-    resp = client.get(f"{cfg.owui_url}/api/v1/knowledge/", headers=owui_headers(cfg))
-    resp.raise_for_status()
-    body = resp.json()
-    kbs = body["items"] if isinstance(body, dict) else body  # paginated {"items": [...], "total": N}
-    for kb in kbs:
-        if kb.get("name") == cfg.kb_name:
-            return kb["id"]
-    resp = client.post(
-        f"{cfg.owui_url}/api/v1/knowledge/create",
-        headers=owui_headers(cfg),
-        json={"name": cfg.kb_name, "description": "Created by rag-stack ingest.py"},
-    )
-    resp.raise_for_status()
-    return resp.json()["id"]
-
-
-UPLOAD_RETRY_BACKOFF_S = (5, 15, 30)  # retries on a transient "failed" processing status
-
-
-def _owui_upload_once(client: httpx.Client, cfg: Config, filename: str, markdown: str) -> str:
-    """Upload the markdown and poll until Open WebUI finishes processing it
-    (chunking + embedding). Returns the new file_id. Raises on a "failed"
-    status or timeout -- the caller decides whether to retry."""
-    resp = client.post(
-        f"{cfg.owui_url}/api/v1/files/",
-        headers=owui_headers(cfg),
-        files={"file": (filename, markdown.encode("utf-8"), "text/markdown")},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    file_id = resp.json()["id"]
-    vprint(f"  open webui: uploaded -> file_id={file_id}, waiting for chunking/embedding")
-
-    deadline = time.time() + 300
-    last_status = None
-    while time.time() < deadline:
-        status_resp = client.get(
-            f"{cfg.owui_url}/api/v1/files/{file_id}/process/status", headers=owui_headers(cfg)
-        )
-        status_resp.raise_for_status()
-        status = status_resp.json().get("status")
-        if status != last_status:
-            vprint(f"  open webui: status={status}")
-            last_status = status
-        if status == "completed":
-            return file_id
-        if status == "failed":
-            # Open WebUI's non-streaming status endpoint doesn't expose the
-            # underlying error (that's only on the SSE variant) -- check
-            # `docker compose logs open-webui` for the real cause (a common
-            # one: "Ollama embed error (503): ... maximum pending requests
-            # exceeded" when a large document floods Ollama's embed queue).
-            raise RuntimeError(f"Open WebUI failed to process the uploaded file (file_id={file_id})")
-        time.sleep(2)
-    raise RuntimeError(f"Timed out waiting for Open WebUI to process the uploaded file (file_id={file_id})")
-
-
-def owui_upload_and_attach(client: httpx.Client, cfg: Config, kb_id: str, filename: str, markdown: str) -> str:
-    file_id = None
-    last_exc: Exception | None = None
-    for attempt, backoff in enumerate((0, *UPLOAD_RETRY_BACKOFF_S), start=1):
-        if backoff:
-            vprint(f"  open webui: retrying upload in {backoff}s (attempt {attempt}/{len(UPLOAD_RETRY_BACKOFF_S) + 1})")
-            time.sleep(backoff)
-        try:
-            file_id = _owui_upload_once(client, cfg, filename, markdown)
-            break
-        except Exception as exc:  # noqa: BLE001 - processing failures are often transient (e.g. Ollama's embed queue was briefly overloaded)
-            last_exc = exc
-            vprint(f"  open webui: attempt {attempt} failed: {exc}")
-    if file_id is None:
-        raise last_exc  # type: ignore[misc]
-
-    resp = client.post(
-        f"{cfg.owui_url}/api/v1/knowledge/{kb_id}/file/add",
-        headers=owui_headers(cfg),
-        json={"file_id": file_id},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    vprint(f"  open webui: attached file_id={file_id} to knowledge base {kb_id}")
-    return file_id
-
-
-def process_one(client: httpx.Client, cfg: Config, path: Path, kb_id: str) -> Result:
+def process_one(client: httpx.Client, cfg: Config, path: Path) -> Result:
     sha = sha256_of(path)
     result = Result(filename=path.name, sha256=sha)
 
@@ -384,8 +289,8 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, kb_id: str) -> Re
             raise RuntimeError("conversion produced no text even after VLM fallback")
 
         md_filename = f"{path.stem}.md"
-        file_id = owui_upload_and_attach(client, cfg, kb_id, md_filename, md)
-        result.kb_file_id = file_id
+        out_path = write_markdown(md_filename, md)
+        result.markdown_path = str(out_path.relative_to(REPO_ROOT))
         result.status = "processed"
 
     except Exception as exc:  # noqa: BLE001 - report and continue with the next file
@@ -405,10 +310,9 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, kb_id: str) -> Re
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kb", dest="kb_name", default=None, help="Knowledge base name (default: KB_NAME in .env)")
     parser.add_argument("--force-vlm", action="store_true", help="Always use the VLM fallback pipeline")
     parser.add_argument("--file", dest="single_file", default=None, help="Process a single file instead of scanning data/inbox")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Print per-stage detail: ocrmypdf output, docling timings, quality-gate reasoning, Open WebUI upload/processing progress")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print per-stage detail: ocrmypdf output, docling timings, quality-gate reasoning")
     args = parser.parse_args()
 
     global VERBOSE
@@ -419,9 +323,9 @@ def main() -> int:
         pass
 
     env = load_env()
-    cfg = Config.from_env(env, args.kb_name, args.force_vlm)
+    cfg = Config.from_env(env, args.force_vlm)
 
-    for d in (INBOX, WORK, PROCESSED, FAILED):
+    for d in (INBOX, WORK, PROCESSED, FAILED, MARKDOWN):
         d.mkdir(parents=True, exist_ok=True)
 
     if args.single_file:
@@ -434,14 +338,12 @@ def main() -> int:
         return 0
 
     with httpx.Client() as client:
-        # Fail fast if the two local services aren't reachable.
-        for name, url in (("docling-serve", f"{cfg.docling_url}/health"), ("Open WebUI", f"{cfg.owui_url}/health")):
+        # Fail fast if the local service isn't reachable.
+        for name, url in (("docling-serve", f"{cfg.docling_url}/health"),):
             try:
                 client.get(url, timeout=10).raise_for_status()
             except Exception as exc:
                 sys.exit(f"{name} is not reachable at {url} ({exc}). Run `./ragctl status` first.")
-
-        kb_id = owui_get_or_create_kb(client, cfg)
 
         ok, bad = 0, 0
         total = len(targets)
@@ -453,7 +355,7 @@ def main() -> int:
                 continue
             print(f"[{i}/{total}] processing: {path.name}")
             t0 = time.monotonic()
-            result = process_one(client, cfg, path, kb_id)
+            result = process_one(client, cfg, path)
             dt = time.monotonic() - t0
             if result.status == "processed":
                 ok += 1

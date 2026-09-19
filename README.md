@@ -1,48 +1,62 @@
 # rag-stack
 
-A self-contained, local RAG (retrieval-augmented generation) system for macOS
-on Apple Silicon. One repo, one command (`./ragctl`), configured as if it
+A self-contained, local document-ingestion pipeline for macOS on Apple
+Silicon, meant to grow into a full local RAG (retrieval-augmented
+generation) system. One repo, one command (`./ragctl`), configured as if it
 were running on a bigger machine — it's meant to be installed as-is on a
 more powerful Mac later, not migrated.
 
-**You provide the models.** Everything else — chat UI, vector DB, document
-parsing, OCR, embeddings, reranking — is wired up and pinned to specific
-versions.
+## Status
+
+**v2 is mid-migration.** Open WebUI has been removed — it previously
+provided chunking, embedding at ingest time, Qdrant writes, hybrid search,
+reranking, retrieval and the chat UI itself. All of that is gone with it.
+Today this repo is **ingestion only**: documents go in, OCR and parsing
+happen, and clean markdown comes out on disk. There is currently **no
+chat interface, no query-time retrieval, no reranking, and nothing writes
+to Qdrant**. The retrieval/chat layer is being rebuilt with custom
+components that don't exist yet — not "coming soon" with a defined plan,
+just genuinely not there.
+
+**You provide the models.** What's currently wired up and pinned to
+specific versions: OCR, document parsing, and the Ollama-backed VLM OCR
+fallback.
 
 ## Architecture
 
 ```
-            ┌──────────── Docker Desktop ────────────────────────┐
-Browser ──► │ Open WebUI :3000 ──► Qdrant :6333 (vector DB)       │
-            │   └ reranker bge-reranker-v2-m3 (CPU, in-container) │
-            └───────┬──────────────────────┬─────────────────────┘
-          host.docker.internal:11434  host.docker.internal:5001
-                    ▼                      ▼
-   Ollama.app (native, MLX)     docling-serve (native, on-device GPU)
-   chat models / embeddings ◄────── VLM OCR fallback pipeline
-                    ▲
-   ingest/ (native): data/inbox → OCRmyPDF → docling → quality
-          check → [VLM fallback if needed] → Open WebUI knowledge base
+   ingest/ (native): data/inbox → OCRmyPDF → docling-serve → quality
+          check → [VLM fallback if needed] → data/markdown/*.md
+                    │                              ▲
+                    ▼                              │
+   docling-serve (native, on-device GPU) ───────────┘
+                    │
+                    ▼
+   Ollama.app (native, MLX) — VLM OCR fallback model
+
+            ┌──────────── Docker Desktop ────────────────────┐
+            │ Qdrant :6333 (vector DB) — unused for now,      │
+            │ reserved for the future retrieval layer         │
+            └──────────────────────────────────────────────────┘
 ```
 
 | Layer | Choice | Runs where |
 |---|---|---|
 | Model server | Ollama | native macOS, MLX/Metal |
-| Chat models | you provide (everyday + hard-questions tiers) | Ollama |
-| Embeddings | you provide (e.g. bge-m3) | Ollama |
 | VLM OCR fallback | you provide (e.g. Qwen-VL) | Ollama |
 | OCR preprocessing | OCRmyPDF | native macOS batch job |
 | Document parsing / VLM pipeline | Docling (docling-serve) | native macOS |
-| Vector DB | Qdrant | Docker |
-| Reranker | bge-reranker-v2-m3 | inside the Open WebUI container, CPU |
-| Chat UI / RAG orchestration | Open WebUI | Docker |
+| Vector DB | Qdrant | Docker (present, currently unused) |
+| Chat UI / retrieval / reranking | not yet built | — |
 
 Ollama and Docling run **natively** (not in Docker) so they can use Apple's
-MLX/Metal acceleration. Qdrant and Open WebUI run in Docker for easy,
-reproducible packaging. Everything the stack installs lives inside this
-repo, in Docker volumes prefixed `ragstack_`, or in LaunchAgents labelled
-`com.ragstack.*` — nothing is scattered across the system, so it's easy to
-audit or remove.
+MLX/Metal acceleration. Qdrant runs in Docker for easy, reproducible
+packaging (`compose.yaml` still lists the old `open-webui` service and
+`ragstack_openwebui` volume too — that cleanup hasn't been done yet, so
+don't be surprised if `ragctl up` still starts an Open WebUI container for
+now). Everything the stack installs lives inside this repo, in Docker
+volumes prefixed `ragstack_`, or in LaunchAgents labelled `com.ragstack.*`
+— nothing is scattered across the system, so it's easy to audit or remove.
 
 ## Requirements
 
@@ -52,31 +66,8 @@ audit or remove.
   with at least 8GB of RAM allocated (Settings → Resources). On a bigger
   machine, raise this — 16GB is a good target on a Mac Studio.
 - [Ollama.app](https://ollama.com/download), running.
-- Your chat, embedding and VLM models already pulled with `ollama pull`.
-
-## Disk space — free this BEFORE running `./ragctl install`
-
-**`ragctl` never deletes, prunes or frees anything for you.** It only checks
-free space and refuses to install if there isn't enough. You free the space
-yourself, however you prefer, then run the installer.
-
-| Item | Approx. size |
-|---|---|
-| Homebrew deps (tesseract, ghostscript, qpdf, pngquant, leptonica…) | 0.6 GB (+0.7 GB with `tesseract-lang` for non-English OCR) |
-| Open WebUI image | ~6 GB |
-| Qdrant image | ~0.3 GB |
-| Reranker `bge-reranker-v2-m3` (downloaded by Open WebUI on first use) | ~2.3 GB |
-| docling-serve Python env (torch, transformers, opencv, Gradio UI) + its own Python 3.12 | ~3.5 GB |
-| Docling layout/table/formula/picture models | ~1.5 GB |
-| Ingest tool's Python env | ~0.2 GB |
-| uv's download cache (not cleared automatically) | ~2 GB |
-| **Stack install subtotal** | **~16 GB** |
-| Working room: uploads, Qdrant index, Open WebUI DB, ingest work dir | reserve ~5 GB |
-| macOS headroom (swap, snapshots, updates) — keep clear at all times | ~20 GB |
-| **Total free space needed before install** | **≈ 41 GB, plus the size of any Ollama models you still need to pull** |
-
-`./ragctl install` checks this automatically (`MIN_FREE_GB` in `.env`,
-default 41) and stops with a clear message if you're short.
+- Your VLM model already pulled with `ollama pull` (used as the OCR
+  fallback — see below).
 
 ## Install
 
@@ -86,8 +77,11 @@ cp .env.example .env
 ```
 
 Edit `.env`:
-- `CHAT_MODEL_EVERYDAY`, `CHAT_MODEL_HARD`, `EMBED_MODEL`, `VLM_MODEL` —
-  exact names as they appear in `ollama list`.
+- `VLM_MODEL` — exact name as it appears in `ollama list`. This is the only
+  model the current ingestion pipeline actually calls, for the VLM OCR
+  fallback. `CHAT_MODEL_EVERYDAY`, `CHAT_MODEL_HARD` and `EMBED_MODEL` are
+  still in `.env.example` but nothing consumes them yet — they're held for
+  the future chat/retrieval components.
 - Leave everything else at its default unless you know you want to change it.
 
 ```bash
@@ -97,52 +91,27 @@ Edit `.env`:
 This checks prerequisites and disk space, installs Homebrew + Python
 dependencies (all inside this repo), sets Ollama tuning via `launchctl`,
 installs LaunchAgents for docling-serve (and, optionally, auto-ingestion),
-and starts Qdrant + Open WebUI.
+and starts Qdrant.
 
-Then, in the browser:
+Then run:
 
-1. Open **http://127.0.0.1:3000** and create the admin account (first
-   account created becomes admin).
-2. Enable API keys globally — they're off by default, and both
-   `ragctl webui-setup` and `ragctl ingest` need one:
-   **Admin Panel → Settings → Authentication** → toggle **API Keys** on →
-   **Save**.
-3. Generate your key: click your profile icon (bottom-left) → **Settings →
-   Account** → under **API keys**, click **Show**, then **Create new secret
-   key**. Copy it into `.env` as `OWUI_API_KEY`.
-4. Run:
-   ```bash
-   ./ragctl webui-setup
-   ```
-   This creates the shared knowledge base and two chat presets, **Everyday**
-   and **Hard questions**, each pointed at your configured models with the
-   knowledge base attached.
-5. In `.env`, set `ENABLE_SIGNUP=false` so nobody else can self-register,
-   then run `./ragctl reload`.
-6. Run:
-   ```bash
-   ./ragctl health
-   ```
-   to confirm every service is reachable and the container can reach the
-   host services.
+```bash
+./ragctl health
+```
+
+to confirm every service is reachable.
 
 ## Using it
 
-**Chat uploads** — the simplest path. In Open WebUI, attach a file directly
-to a chat, or add it to the knowledge base under Workspace → Knowledge.
-Open WebUI sends it to docling-serve for parsing automatically, with
-`do_ocr` always on. `FORCE_OCR=true` in `.env` applies here too — it also
-makes docling's own `ocrmac` backend re-OCR every page unconditionally
-instead of trusting any existing text layer, matching the same toggle
-used by batch ingestion below. Restart with `./ragctl reload` after
-changing it.
-
-**Batch ingestion** — for OCR-heavy or bulk documents. Drop files into
+**Batch ingestion** is currently the only path in. Drop files into
 `data/inbox/` and run:
 
 ```bash
 ./ragctl ingest
 ```
+
+(equivalent to `uv run services/ingest/ingest.py`, which also accepts
+`--force-vlm`, `--file PATH` to process a single file, and `-v`/`--verbose`.)
 
 Each file goes through: OCRmyPDF (adds a text layer to scanned pages only;
 untouched if the PDF already has text — set `FORCE_OCR=true` in `.env` to
@@ -150,45 +119,39 @@ re-OCR every page unconditionally instead, which is useful when a PDF
 already has a text layer but it's garbage from a bad prior OCR pass) →
 Docling's standard parser → a quality check → and, only if that check
 fails (or you pass `--force-vlm`), Docling's VLM pipeline using your
-configured `VLM_MODEL` as an OCR fallback. Results are pushed into the
-same knowledge base the chat UI uses. Originals move to `data/processed/`
-or `data/failed/`, and every run is logged to `data/manifest.jsonl` (file
-hash, route taken, character count) so re-running `ingest` never
-reprocesses a file twice.
+configured `VLM_MODEL` as an OCR fallback. The result is written to
+`data/markdown/<stem>.md`. Originals move to `data/processed/` or
+`data/failed/`, and every run is logged to `data/manifest.jsonl` (file
+hash, route taken, character count, markdown path) so re-running `ingest`
+never reprocesses a file twice.
 
 Set `INGEST_AUTORUN=true` in `.env` and run `./ragctl reload` to have this
 happen automatically whenever a file lands in `data/inbox/`.
+
+Nothing currently reads `data/markdown/` back out — there's no chat or
+search layer yet. See [Status](#status).
 
 ## Operating
 
 ```bash
 ./ragctl status              # what's running and reachable
-./ragctl health              # deeper end-to-end connectivity check
-./ragctl logs [docling|ollama|ingest|qdrant|webui]
-./ragctl models check        # confirm .env model names exist in Ollama
+./ragctl health               # checks Ollama (+ model checks + an embedding
+                               # smoke test), docling-serve, and Qdrant
+./ragctl logs [docling|ollama|ingest|qdrant]
+./ragctl models check         # confirm .env model names exist in Ollama
 ./ragctl up / down / restart
-./ragctl reload              # re-apply .env changes to running services
-./ragctl clean --yes         # wipe all knowledge base content and start
-                              # over, WITHOUT redoing browser account setup
+./ragctl reload               # re-apply .env changes to running services
+./ragctl clean --yes          # wipe inbox/work/processed/failed + manifest
+./ragctl preflight            # check prerequisites and disk space
 ```
 
-`ragctl clean --yes` deletes every file in the knowledge base (and their
-Qdrant vectors and on-disk storage, via Open WebUI's own delete API), all
-chat history, plus `data/inbox`, `work`, `processed`, `failed` and
-`manifest.jsonl`. It
-**keeps** your admin account, `OWUI_API_KEY`, the knowledge base object
-itself, and the "Everyday"/"Hard questions" presets — so the result is
-equivalent to a fresh install right after `ragctl webui-setup`, not a full
-teardown. Model caches (`data/hf-cache`, `data/docling-artifacts`) are left
-alone since they're expensive to redownload and aren't "your data." For a
-full teardown including the account, use `ragctl uninstall` instead.
-
-**A gotcha worth knowing:** most of Open WebUI's RAG settings (embedding
-model, reranker, chunk size, hybrid search…) are "PersistentConfig" — they
-only take effect on the very first start against a fresh database. After
-that, they live in Open WebUI's own settings and env changes are ignored.
-To change them later, use **Admin Panel → Settings → Documents** in the
-browser, or wipe the `ragstack_openwebui` volume and reinstall.
+`ragctl clean --yes` wipes `data/inbox`, `work`, `processed`, `failed` and
+`manifest.jsonl` — it resets the ingestion pipeline to a clean slate.
+It does **not** currently clear `data/markdown/` (a known gap — the
+converted output is left behind even though the manifest that tracked it
+is wiped). Model caches (`data/hf-cache`, `data/docling-artifacts`) are
+left alone since they're expensive to redownload and aren't "your data."
+For a full teardown, use `ragctl uninstall` instead.
 
 ## Moving to a bigger machine (e.g. Mac Studio)
 
@@ -204,7 +167,8 @@ Raise `OLLAMA_MAX_LOADED_MODELS`, `OLLAMA_CONTEXT_LENGTH`,
 `OLLAMA_NUM_PARALLEL`, `DOCLING_NUM_THREADS`, `DOCLING_LOC_NUM_WORKERS` in
 `.env` to match the new hardware, and raise Docker Desktop's memory limit
 (Settings → Resources) to something like 16GB. Set `BIND_ADDR=0.0.0.0` if
-other machines on the network should reach Open WebUI.
+other machines on the network should reach Qdrant (and, once it exists,
+the future chat/retrieval service).
 
 ## Uninstall
 
@@ -219,19 +183,11 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
 
 ## Troubleshooting
 
-- **`./ragctl health` shows "open-webui cannot reach host Ollama/docling-serve"**
-  — Docker Desktop's `host.docker.internal` isn't resolving. Restart Docker
-  Desktop; confirm `compose.yaml`'s `extra_hosts: host-gateway` entry is
-  present (it is, by default).
 - **docling-serve won't start** — check `./ragctl logs docling`.
   `UVICORN_WORKERS` must stay at `1` (set by the LaunchAgent) — more than
   one worker breaks its task tracking.
 - **A model "not found" in `ollama list`** — run `./ragctl models check`, fix
   the name in `.env`, then `./ragctl reload`.
-- **`ragctl webui-setup` or `ragctl ingest` fails with a 401, or there's no
-  "API keys" section under Settings → Account** — API keys are off by
-  default. Go to **Admin Panel → Settings → Authentication**, toggle
-  **API Keys** on, Save, then generate a key and set `OWUI_API_KEY`.
 - **Ingest quality gate keeps triggering the VLM fallback unnecessarily** —
   raise `MIN_CHARS_PER_PAGE` in `.env`, or check the OCR language
   (`OCR_LANG`) matches your documents.
@@ -242,7 +198,7 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
   already carries a bad OCR layer from before it reached you, set
   `FORCE_OCR=true` in `.env` so OCRmyPDF re-OCRs every page instead of
   skipping pages that already "have text."
-- **Versions**: `compose.yaml` pins `qdrant/qdrant` and
-  `ghcr.io/open-webui/open-webui` to specific tags, checked at the time this
-  repo was written. If a pull fails because a tag was retired, check the
-  projects' release pages and bump the tag in `compose.yaml`.
+- **Versions**: `compose.yaml` pins `qdrant/qdrant` to a specific tag,
+  checked at the time this repo was written — that's the only image that
+  currently matters for this stack. If a pull fails because the tag was
+  retired, check Qdrant's release page and bump the tag in `compose.yaml`.
