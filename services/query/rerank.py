@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,12 +108,15 @@ class Reranker:
         self.model.to(self.device).eval()
         self.load_seconds = time.monotonic() - t0
         self._torch = torch
+        # One forward pass on the GPU at a time: concurrent requests would
+        # only contend for it and multiply peak memory.
+        self._lock = threading.Lock()
 
     def score(self, question: str, passages: list[str]) -> list[float]:
         """Relevance of each passage to the question, 0..1 (sigmoid of the logit)."""
         torch = self._torch
         scores: list[float] = []
-        with torch.inference_mode():
+        with self._lock, torch.inference_mode():
             for start in range(0, len(passages), self.cfg.batch_size):
                 batch = passages[start:start + self.cfg.batch_size]
                 inputs = self.tokenizer(

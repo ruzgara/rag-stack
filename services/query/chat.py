@@ -1,0 +1,427 @@
+"""
+The chat pipeline behind both APIs (native and OpenAI-compatible).
+
+One turn:
+  1. Rewrite: the chat model decides whether the message needs a search at
+     all ("hello", "thanks", "make that shorter" don't) and, with earlier
+     history, turns it into a standalone search query ("and for Level 1?" ->
+     "RSF factor for Level 1 assets").
+  2. Auto-search: retrieve() returns CHAT_INITIAL_SOURCES passages, numbered
+     [1]..[n].
+  3. Answer: the chat model streams its answer from Ollama. If the preset has
+     tools on, it may call search_documents for more passages -- at most
+     CHAT_MAX_TOOL_ROUNDS times, within CHAT_MAX_SOURCE_TOKENS. Passages
+     already given are never returned again, and numbering continues, so
+     earlier citations stay valid.
+  4. Citations: [n] references in the answer are resolved to their sources.
+
+run_turn() yields events as they happen; the caller streams and stores them.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Iterator
+
+import httpx
+
+from retrieval import Hit, Retriever, _bool, _float, _int, load_env
+
+PROMPTS = Path(__file__).parent / "prompts"
+PRESETS = ("everyday", "hard")
+
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_documents",
+        "description": (
+            "Search the document library for more passages. Returns passages not already provided, "
+            "numbered for citation. Repeating an earlier query returns further passages for it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "What to search for, as a focused query"}},
+            "required": ["query"],
+        },
+    },
+}
+
+# [2], [1, 3], [1; 3], and ranges [1-4] / [1–4]
+_CITE_ITEM = r"\d+(?:\s*[-–]\s*\d+)?"
+CITATION_RE = re.compile(rf"\[({_CITE_ITEM}(?:\s*[,;]\s*{_CITE_ITEM})*)\]")
+
+
+class ChatError(Exception):
+    pass
+
+
+def estimate_tokens(text: str) -> int:
+    # Rough (≈4 characters per token for English); only used for budgets.
+    return len(text) // 4 + 1
+
+
+@dataclass(frozen=True)
+class Preset:
+    name: str
+    model: str
+    tools: bool
+    think: bool
+
+
+@dataclass(frozen=True)
+class ChatConfig:
+    ollama_url: str
+    presets: dict[str, Preset]
+    default_preset: str
+    temperature: float
+    history_max_tokens: int
+    rewrite: bool
+    initial_sources: int
+    tool_results: int
+    max_tool_rounds: int
+    max_source_tokens: int
+
+    @classmethod
+    def from_env(cls, env: dict | None = None) -> "ChatConfig":
+        env = load_env() if env is None else env
+        presets = {}
+        for name in PRESETS:
+            model = env.get(f"CHAT_MODEL_{name.upper()}")
+            if not model:
+                raise ValueError(f"CHAT_MODEL_{name.upper()} is not set in .env")
+            presets[name] = Preset(
+                name=name,
+                model=model,
+                tools=_bool(env, f"CHAT_TOOLS_{name.upper()}", "true"),
+                think=_bool(env, f"CHAT_THINK_{name.upper()}", "false"),
+            )
+        default = (env.get("CHAT_DEFAULT_PRESET") or "everyday").strip().lower()
+        if default not in presets:
+            raise ValueError(f"CHAT_DEFAULT_PRESET must be one of {', '.join(PRESETS)}, got {default!r}")
+        rounds = int(env.get("CHAT_MAX_TOOL_ROUNDS") or 2)
+        if rounds < 0:
+            raise ValueError(f"CHAT_MAX_TOOL_ROUNDS must be >= 0, got {rounds}")
+        return cls(
+            ollama_url=f"http://127.0.0.1:{env.get('OLLAMA_PORT', '11434')}",
+            presets=presets,
+            default_preset=default,
+            temperature=_float(env, "CHAT_TEMPERATURE", "0.3"),
+            history_max_tokens=_int(env, "CHAT_HISTORY_MAX_TOKENS", "8000"),
+            rewrite=_bool(env, "CHAT_REWRITE", "true"),
+            initial_sources=_int(env, "CHAT_INITIAL_SOURCES", "4"),
+            tool_results=_int(env, "CHAT_TOOL_RESULTS", "4"),
+            max_tool_rounds=rounds,
+            max_source_tokens=_int(env, "CHAT_MAX_SOURCE_TOKENS", "6000"),
+        )
+
+    def preset(self, name: str | None) -> Preset:
+        name = (name or self.default_preset).strip().lower()
+        if name not in self.presets:
+            raise ChatError(f"unknown preset {name!r}; available: {', '.join(self.presets)}")
+        return self.presets[name]
+
+
+@dataclass
+class Source:
+    number: int
+    found_by: str  # auto | tool
+    query: str
+    point_id: str
+    doc_sha: str
+    filename: str
+    chunk_index: int
+    pages: list[int]
+    headings: list[str]
+    text: str
+    rerank_score: float | None
+
+    @classmethod
+    def from_hit(cls, number: int, hit: Hit, found_by: str, query: str) -> "Source":
+        return cls(number=number, found_by=found_by, query=query, point_id=hit.point_id, doc_sha=hit.doc_sha,
+                   filename=hit.filename, chunk_index=hit.chunk_index, pages=hit.pages, headings=hit.headings,
+                   text=hit.text, rerank_score=hit.rerank_score)
+
+    def label(self) -> str:
+        pages = ""
+        if self.pages:
+            first, last = self.pages[0], self.pages[-1]
+            pages = f", p. {first}" if first == last else f", pp. {first}-{last}"
+        return f"{self.filename}{pages}"
+
+    def for_prompt(self) -> str:
+        section = f" — {' > '.join(self.headings)}" if self.headings else ""
+        return f"[{self.number}] {self.label()}{section}\n{self.text.strip()}"
+
+
+@dataclass
+class TurnResult:
+    answer: str = ""
+    model: str = ""
+    preset: str = ""
+    search_queries: list[str] = field(default_factory=list)
+    sources: list[Source] = field(default_factory=list)
+    cited: list[int] = field(default_factory=list)
+    invalid_citations: list[int] = field(default_factory=list)
+    stats: dict = field(default_factory=dict)
+
+
+def resolve_citations(answer: str, sources: list[Source]) -> tuple[list[int], list[int]]:
+    """Numbers the answer cites, split into ones that exist and ones that don't."""
+    known = {s.number for s in sources}
+    seen: list[int] = []
+    for m in CITATION_RE.finditer(answer):
+        for item in re.split(r"\s*[,;]\s*", m.group(1)):
+            bounds = [int(x) for x in re.split(r"\s*[-–]\s*", item)]
+            lo, hi = bounds[0], bounds[-1]
+            for n in range(lo, min(hi, lo + 50) + 1):  # cap absurd ranges
+                if n not in seen:
+                    seen.append(n)
+    return [n for n in seen if n in known], [n for n in seen if n not in known]
+
+
+def trim_history(history: list[dict], max_tokens: int) -> list[dict]:
+    """Most recent turns that fit the budget, never starting on an answer."""
+    kept, used = [], 0
+    for msg in reversed(history):
+        cost = estimate_tokens(msg["content"])
+        if used + cost > max_tokens:
+            break
+        kept.append(msg)
+        used += cost
+    kept.reverse()
+    while kept and kept[0]["role"] != "user":
+        kept.pop(0)
+    return kept
+
+
+class ChatService:
+    def __init__(self, retriever: Retriever, cfg: ChatConfig | None = None, client: httpx.Client | None = None):
+        self.cfg = cfg or ChatConfig.from_env()
+        self.retriever = retriever
+        self.client = client or httpx.Client()
+        self._tool_support: dict[str, bool] = {}
+
+    # --------------------------------------------------------------- ollama --
+
+    def _chat(self, model: str, messages: list[dict], *, think: bool = False, fmt: dict | None = None,
+              temperature: float | None = None) -> dict:
+        body = {"model": model, "messages": messages, "stream": False, "think": think, "keep_alive": "30m",
+                "options": {"temperature": self.cfg.temperature if temperature is None else temperature}}
+        if fmt:
+            body["format"] = fmt
+        resp = self.client.post(f"{self.cfg.ollama_url}/api/chat", json=body, timeout=httpx.Timeout(300, connect=10))
+        if resp.is_error:
+            raise ChatError(f"ollama chat failed ({resp.status_code}): {resp.text[:500]}")
+        return resp.json()
+
+    def _chat_stream(self, model: str, messages: list[dict], *, think: bool, tools: list | None) -> Iterator[dict]:
+        body = {"model": model, "messages": messages, "stream": True, "think": think, "keep_alive": "30m",
+                "options": {"temperature": self.cfg.temperature}}
+        if tools:
+            body["tools"] = tools
+        with self.client.stream("POST", f"{self.cfg.ollama_url}/api/chat", json=body,
+                                timeout=httpx.Timeout(300, connect=10)) as resp:
+            if resp.is_error:
+                resp.read()
+                raise ChatError(f"ollama chat failed ({resp.status_code}): {resp.text[:500]}")
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                if chunk.get("error"):
+                    raise ChatError(f"ollama: {chunk['error']}")
+                yield chunk
+
+    def supports_tools(self, model: str) -> bool:
+        """Ollama reports each model's capabilities; a model without tool
+        support gets the auto-search only instead of a failed request."""
+        if model not in self._tool_support:
+            try:
+                resp = self.client.post(f"{self.cfg.ollama_url}/api/show", json={"model": model}, timeout=30)
+                resp.raise_for_status()
+                self._tool_support[model] = "tools" in (resp.json().get("capabilities") or [])
+            except httpx.HTTPError:
+                return False  # don't cache a transient failure
+        return self._tool_support[model]
+
+    # ------------------------------------------------------------ pipeline --
+
+    def rewrite_query(self, preset: Preset, history: list[dict], question: str) -> tuple[bool, str]:
+        """Whether the message needs a document search, and the standalone
+        search query. Falls back to searching the message as-is."""
+        recent = history[-6:]
+        transcript = ("\n".join(f"{m['role'].upper()}: {m['content'][:1500]}" for m in recent)
+                      or "(none — this is the first message)")
+        prompt = (
+            "You prepare the user's latest message for a document search.\n\n"
+            "1. search: false only if the message can be answered from the conversation alone without new "
+            "information from the documents — greetings, thanks, small talk, or requests to reformat, shorten, "
+            "translate or explain the previous answer. Otherwise true. When unsure, true.\n"
+            "2. query: the latest message rewritten as a standalone search query. Resolve references to earlier "
+            "messages (\"it\", \"that\", \"and for X?\") using the conversation. Keep names, numbers and "
+            "technical terms exactly. Keep the language of the latest message. If it is already standalone, "
+            "return it unchanged.\n\n"
+            f"Conversation:\n{transcript}\n\nLatest message: {question}"
+        )
+        schema = {"type": "object", "properties": {"search": {"type": "boolean"}, "query": {"type": "string"}},
+                  "required": ["search", "query"]}
+        try:
+            resp = self._chat(preset.model, [{"role": "user", "content": prompt}], temperature=0, fmt=schema)
+            out = json.loads(resp["message"]["content"])
+            search, query = out.get("search") is not False, str(out.get("query") or "").strip()
+        except (ChatError, httpx.HTTPError, json.JSONDecodeError, KeyError, AttributeError):
+            search, query = True, ""
+        return search, query or question
+
+    def _search(self, query: str, limit: int, seen: set[str], sources: list[Source], found_by: str,
+                budget: list[int]) -> list[Source]:
+        """New sources for a query, numbered after the existing ones, within
+        the remaining source-token budget (budget[0], mutated)."""
+        new = []
+        for hit in self.retriever.retrieve(query, limit=limit, exclude=seen):
+            src = Source.from_hit(len(sources) + 1, hit, found_by, query)
+            cost = estimate_tokens(src.for_prompt())
+            if budget[0] - cost < 0 and sources:  # always allow at least one source
+                break
+            budget[0] -= cost
+            seen.add(hit.point_id)
+            sources.append(src)
+            new.append(src)
+        return new
+
+    def run_turn(self, question: str, history: list[dict], preset_name: str | None = None,
+                 extra_system: str | None = None) -> Iterator[dict]:
+        """Yields events: rewrite, searching, sources, thinking, token, done.
+        The done event carries the TurnResult."""
+        preset = self.cfg.preset(preset_name)
+        result = TurnResult(model=preset.model, preset=preset.name)
+        t_start = time.monotonic()
+        history = trim_history(history, self.cfg.history_max_tokens)
+
+        # 1. Decide whether the message needs a search at all, and rewrite a
+        #    follow-up into a standalone search query.
+        query, do_search = question, True
+        if self.cfg.rewrite:
+            t0 = time.monotonic()
+            do_search, query = self.rewrite_query(preset, history, question)
+            result.stats["rewrite_s"] = round(time.monotonic() - t0, 2)
+            yield {"type": "rewrite", "query": query, "search": do_search}
+
+        # 2. Auto-search.
+        seen: set[str] = set()
+        budget = [self.cfg.max_source_tokens]
+        if do_search:
+            yield {"type": "searching", "query": query, "found_by": "auto"}
+            t0 = time.monotonic()
+            new = self._search(query, self.cfg.initial_sources, seen, result.sources, "auto", budget)
+            result.stats["search_s"] = round(time.monotonic() - t0, 2)
+            result.search_queries.append(query)
+            yield {"type": "sources", "sources": [asdict(s) for s in new]}
+        result.stats["auto_search"] = do_search
+
+        # 3. Answer, with optional tool rounds.
+        system = (PROMPTS / "system.md").read_text(encoding="utf-8")
+        tools_on = preset.tools and self.cfg.max_tool_rounds > 0 and self.supports_tools(preset.model)
+        if tools_on:
+            system += "\n" + (PROMPTS / "tools.md").read_text(encoding="utf-8")
+        if extra_system:
+            system += f"\n\nAdditional instructions:\n{extra_system}"
+        if not do_search:
+            context = ("Sources: none — no document search was run, because this message doesn't need the "
+                       "documents. Reply to it directly and briefly; don't add citations, and don't mention "
+                       "sources or documents unless asked.")
+        elif result.sources:
+            context = "Sources:\n\n" + "\n\n".join(s.for_prompt() for s in result.sources)
+        else:
+            context = "Sources: none. The document search found no relevant passages for this question."
+        user_turn = f"{context}\n\n---\n\nQuestion: {question}"
+        if tools_on and not do_search:
+            user_turn += ("\n\n(If answering this does need information from the documents after all, "
+                          "call search_documents.)")
+        elif tools_on:
+            # Small models weigh the end of the prompt most; the system
+            # prompt's tool guidance alone gets ignored in favour of refusing.
+            user_turn += ("\n\n(If the sources above don't cover every part of the question, "
+                          "call search_documents for the missing part before answering.)")
+        messages = [{"role": "system", "content": system}, *history,
+                    # Sources ride with the question rather than in the system
+                    # prompt, so the system + history prefix stays identical
+                    # between turns and Ollama can reuse its cache for it.
+                    {"role": "user", "content": user_turn}]
+
+        rounds = 0
+        prompt_tokens = eval_tokens = 0
+        t_first_token = None
+        parts: list[str] = []
+        while True:
+            offer_tools = tools_on and rounds < self.cfg.max_tool_rounds and budget[0] > 0
+            content, tool_calls = "", []
+            for chunk in self._chat_stream(preset.model, messages, think=preset.think,
+                                           tools=[SEARCH_TOOL] if offer_tools else None):
+                msg = chunk.get("message") or {}
+                if msg.get("thinking"):
+                    yield {"type": "thinking", "text": msg["thinking"]}
+                if msg.get("content"):
+                    if t_first_token is None:
+                        t_first_token = time.monotonic()
+                    content += msg["content"]
+                    yield {"type": "token", "text": msg["content"]}
+                tool_calls.extend(msg.get("tool_calls") or [])
+                if chunk.get("done"):
+                    prompt_tokens += chunk.get("prompt_eval_count", 0)
+                    eval_tokens += chunk.get("eval_count", 0)
+            if content:
+                parts.append(content)
+            if not (tool_calls and offer_tools):
+                break
+
+            rounds += 1
+            messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+            for call in tool_calls:
+                fn = call.get("function") or {}
+                args = fn.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                tool_query = str(args.get("query") or "").strip()
+                if fn.get("name") != SEARCH_TOOL["function"]["name"] or not tool_query:
+                    reply = "Error: call search_documents with a non-empty 'query'."
+                else:
+                    yield {"type": "searching", "query": tool_query, "found_by": "tool"}
+                    new = self._search(tool_query, self.cfg.tool_results, seen, result.sources, "tool", budget)
+                    result.search_queries.append(tool_query)
+                    yield {"type": "sources", "sources": [asdict(s) for s in new]}
+                    reply = ("\n\n".join(s.for_prompt() for s in new) if new
+                             else "No further relevant passages found for this query.")
+                messages.append({"role": "tool", "tool_name": fn.get("name", ""), "content": reply})
+
+        # 4. Resolve citations.
+        result.answer = "\n\n".join(p.strip() for p in parts if p.strip())
+        result.cited, result.invalid_citations = resolve_citations(result.answer, result.sources)
+        result.stats.update(
+            tool_rounds=rounds,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=eval_tokens,
+            first_token_s=round(t_first_token - t_start, 2) if t_first_token else None,
+            total_s=round(time.monotonic() - t_start, 2),
+        )
+        yield {"type": "done", "result": result}
+
+    def generate_title(self, preset_name: str | None, question: str, answer: str) -> str | None:
+        preset = self.cfg.preset(preset_name)
+        prompt = ("Write a short title (at most 6 words, no quotes, no final period) for a conversation that "
+                  f"starts with this exchange. Use the language of the question.\n\nQuestion: {question}\n\n"
+                  f"Answer: {answer[:1500]}")
+        try:
+            resp = self._chat(preset.model, [{"role": "user", "content": prompt}], temperature=0,
+                              fmt={"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]})
+            title = json.loads(resp["message"]["content"]).get("title", "").strip().strip('"').rstrip(".")
+        except (ChatError, httpx.HTTPError, json.JSONDecodeError, KeyError):
+            return None
+        return title[:120] or None

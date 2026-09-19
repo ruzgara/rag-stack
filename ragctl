@@ -39,6 +39,7 @@ load_env() {
     OLLAMA_PORT="${OLLAMA_PORT:-11434}"
     DOCLING_PORT="${DOCLING_PORT:-5001}"
     QDRANT_PORT="${QDRANT_PORT:-6333}"
+    QUERY_PORT="${QUERY_PORT:-8088}"
     MIN_FREE_GB="${MIN_FREE_GB:-41}"
 }
 
@@ -102,7 +103,7 @@ cmd_preflight() {
         ok "Ollama is reachable"
     fi
 
-    for p in "$DOCLING_PORT" "$QDRANT_PORT"; do
+    for p in "$DOCLING_PORT" "$QDRANT_PORT" "$QUERY_PORT"; do
         if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
             warn "Port $p is already in use — check it's not a leftover ragstack process (ragctl status)."
         fi
@@ -136,6 +137,7 @@ render_template() {
         -e "s#__UV_BIN__#$(resolve_uv_bin)#g" \
         -e "s#__OLLAMA_PORT__#${OLLAMA_PORT}#g" \
         -e "s#__DOCLING_PORT__#${DOCLING_PORT}#g" \
+        -e "s#__QUERY_PORT__#${QUERY_PORT}#g" \
         -e "s#__OLLAMA_CONTEXT_LENGTH__#${OLLAMA_CONTEXT_LENGTH:-32768}#g" \
         -e "s#__OLLAMA_NUM_PARALLEL__#${OLLAMA_NUM_PARALLEL:-4}#g" \
         -e "s#__OLLAMA_MAX_LOADED_MODELS__#${OLLAMA_MAX_LOADED_MODELS:-4}#g" \
@@ -150,11 +152,13 @@ render_all() {
     render_template "$REPO_ROOT/launchd/ollama-env.sh.tmpl" "$LAUNCHD_RENDERED/ollama-env.sh"
     render_template "$REPO_ROOT/launchd/docling-serve.sh.tmpl" "$LAUNCHD_RENDERED/docling-serve.sh"
     render_template "$REPO_ROOT/launchd/ingest-watch.sh.tmpl" "$LAUNCHD_RENDERED/ingest-watch.sh"
+    render_template "$REPO_ROOT/launchd/query-api.sh.tmpl" "$LAUNCHD_RENDERED/query-api.sh"
     chmod +x "$LAUNCHD_RENDERED"/*.sh
 
     render_template "$REPO_ROOT/launchd/com.ragstack.ollama-env.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.ollama-env.plist"
     render_template "$REPO_ROOT/launchd/com.ragstack.docling.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.docling.plist"
     render_template "$REPO_ROOT/launchd/com.ragstack.ingest.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.ingest.plist"
+    render_template "$REPO_ROOT/launchd/com.ragstack.query.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.query.plist"
 }
 
 launchd_label_loaded() {
@@ -244,13 +248,18 @@ cmd_install() {
     compose pull "${COMPOSE_SERVICES[@]}"
     compose up -d "${COMPOSE_SERVICES[@]}"
 
+    echo "== Query service =="
+    load_agent "com.ragstack.query"
+    ok "Query service loaded (http://127.0.0.1:${QUERY_PORT})"
+
     echo
     ok "Install complete."
     cat <<EOF
 
 Next steps:
   1. Run: ./ragctl health
-  2. Drop files in data/inbox and run: ./ragctl ingest
+  2. Drop files in data/inbox and run: ./ragctl ingest && ./ragctl embed
+  3. Chat API: http://127.0.0.1:${QUERY_PORT}/api (OpenAI-compatible: /v1, docs: /docs)
 EOF
 }
 
@@ -264,15 +273,17 @@ cmd_up() {
         load_agent "com.ragstack.ingest"
     fi
     compose up -d "${COMPOSE_SERVICES[@]}"
-    ok "Stack is up."
+    load_agent "com.ragstack.query"
+    ok "Stack is up. Query API: http://127.0.0.1:${QUERY_PORT}"
 }
 
 cmd_down() {
     load_env
     compose down
+    unload_agent "com.ragstack.query"
     unload_agent "com.ragstack.docling"
     unload_agent "com.ragstack.ingest"
-    ok "Docker services stopped and docling-serve unloaded. Ollama.app is left running (it's a shared, native app)."
+    ok "Docker services stopped; docling-serve and the query service unloaded. Ollama.app is left running (it's a shared, native app)."
 }
 
 cmd_restart() {
@@ -293,6 +304,7 @@ cmd_reload() {
         unload_agent "com.ragstack.ingest"
     fi
     compose up -d --force-recreate "${COMPOSE_SERVICES[@]}"
+    load_agent "com.ragstack.query"
     ok "Reloaded."
 }
 
@@ -300,7 +312,7 @@ cmd_reload() {
 cmd_status() {
     load_env
     echo "== Native services =="
-    for label in com.ragstack.ollama-env com.ragstack.docling com.ragstack.ingest; do
+    for label in com.ragstack.ollama-env com.ragstack.docling com.ragstack.ingest com.ragstack.query; do
         if launchd_label_loaded "$label"; then ok "$label loaded"; else info "$label not loaded"; fi
     done
     if pgrep -x "Ollama" >/dev/null 2>&1; then ok "Ollama.app running"; else warn "Ollama.app not running"; fi
@@ -311,7 +323,8 @@ cmd_status() {
     echo "== Reachability =="
     for pair in "Ollama:http://127.0.0.1:${OLLAMA_PORT}/api/version" \
                 "docling-serve:http://127.0.0.1:${DOCLING_PORT}/health" \
-                "Qdrant:http://127.0.0.1:${QDRANT_PORT}/readyz"; do
+                "Qdrant:http://127.0.0.1:${QDRANT_PORT}/readyz" \
+                "query API:http://127.0.0.1:${QUERY_PORT}/api/health"; do
         name="${pair%%:*}"; url="${pair#*:}"
         if curl -sf "$url" >/dev/null 2>&1; then ok "$name reachable ($url)"; else warn "$name NOT reachable ($url)"; fi
     done
@@ -324,9 +337,10 @@ cmd_logs() {
         docling) tail -n 100 -f "$LOG_DIR/docling-serve.log" ;;
         ollama) tail -n 100 -f "$LOG_DIR/ollama-env.log" ;;
         ingest) tail -n 100 -f "$LOG_DIR/ingest-watch.log" ;;
+        query) tail -n 100 -f "$LOG_DIR/query-api.log" ;;
         qdrant) compose logs -f "$svc" ;;
         "") compose logs -f ;;
-        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, qdrant" ;;
+        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, query, qdrant" ;;
     esac
 }
 
@@ -396,6 +410,19 @@ cmd_health() {
     echo "== Qdrant =="
     curl -sf "http://127.0.0.1:${QDRANT_PORT}/readyz" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
 
+    echo "== Query service =="
+    local qh
+    if qh="$(curl -s --max-time 10 "http://127.0.0.1:${QUERY_PORT}/api/health")" && [[ -n "$qh" ]]; then
+        # Its own checks: Ollama, the Qdrant collection, the database, the reranker device.
+        if python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print(("  ok  " if v["ok"] else "  FAIL ") + k + ": " + ", ".join(f"{a}={b}" for a, b in v.items() if a != "ok")) for k, v in d.items() if isinstance(v, dict)]; sys.exit(0 if d["ok"] else 1)' "$qh"; then
+            ok "healthy"
+        else
+            err "reports problems (above)"; fail=1
+        fi
+    else
+        err "unreachable on port ${QUERY_PORT} (ragctl logs query)"; fail=1
+    fi
+
     if (( fail )); then err "Health check found problems."; else ok "All checks passed."; fi
     return "$fail"
 }
@@ -404,7 +431,7 @@ cmd_health() {
 cmd_clean() {
     load_env
     if [[ "${1:-}" != "--yes" ]]; then
-        die "This deletes data/{inbox,work,processed,failed,markdown,docling,manifest.jsonl} and the Qdrant collection. Re-run as: ragctl clean --yes"
+        die "This deletes data/{inbox,work,processed,failed,markdown,docling,manifest.jsonl}, the Qdrant collection and all chat history. Re-run as: ragctl clean --yes"
     fi
 
     echo "== Local ingest data =="
@@ -423,6 +450,16 @@ cmd_clean() {
         *) warn "Could not reach Qdrant to delete collection ${collection} (HTTP ${code:-none}). Start it with 'ragctl up' and re-run clean, or 'ragctl embed --recreate' will rebuild it." ;;
     esac
 
+    echo "== Chat history =="
+    if [[ -f "$DATA_DIR/chat.db" ]]; then
+        # Delete rows rather than the file: a running query service keeps
+        # using it, and would otherwise recreate it without its tables.
+        sqlite3 "$DATA_DIR/chat.db" "PRAGMA foreign_keys=ON; DELETE FROM conversations;" \
+            && ok "Deleted all conversations" || warn "Could not clear data/chat.db"
+    else
+        info "No chat history yet"
+    fi
+
     echo
     ok "Clean complete."
     warn "Model caches (data/hf-cache, data/docling-artifacts) were left in place on purpose — they're not your data, and re-downloading them is wasteful. Delete them by hand if you really want to."
@@ -438,6 +475,7 @@ cmd_uninstall() {
     unload_agent "com.ragstack.ollama-env"
     unload_agent "com.ragstack.docling"
     unload_agent "com.ragstack.ingest"
+    unload_agent "com.ragstack.query"
     rm -rf "$RUNTIME_DIR"
     for svc in docling ingest embed query; do rm -rf "$REPO_ROOT/services/$svc/.venv"; done
 
@@ -458,12 +496,12 @@ ragctl — control the rag-stack deployment
 Usage: ./ragctl <command> [args]
 
   install              Preflight checks, install deps, start everything
-  up                    Start native services + Docker containers
+  up                    Start native services (incl. the query API) + Docker containers
   down                  Stop Docker containers + docling-serve (Ollama.app left running)
   restart               down then up
   reload                Re-render configs from .env and restart everything
   status                Show what's running and reachable
-  logs [svc]             Tail logs (svc: docling, ollama, ingest, qdrant)
+  logs [svc]             Tail logs (svc: docling, ollama, ingest, query, qdrant)
   models check           Verify .env model names exist in 'ollama list'
   ingest [--force-vlm] [--reprocess]
                          Convert data/inbox to markdown + docling JSON once
@@ -475,7 +513,7 @@ Usage: ./ragctl <command> [args]
                          Hybrid search + GPU reranking over the index
                          (settings: RAG_* and RERANKER_* in .env)
   health                 End-to-end connectivity check
-  clean --yes             Wipe ingest data, outputs and the Qdrant collection
+  clean --yes             Wipe ingest data, outputs, the Qdrant collection and chat history
   uninstall [--purge-data]  Tear down containers, agents and local envs
 EOF
 }

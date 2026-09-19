@@ -13,9 +13,10 @@ provided chunking, embedding, Qdrant writes, hybrid search, reranking,
 retrieval and the chat UI itself. The **indexing half** has been rebuilt:
 documents are OCR'd and parsed, chunked along Docling's document structure,
 embedded with Ollama and written to Qdrant with both dense and BM25 vectors,
-and **retrieval** over them works: hybrid search plus GPU reranking
-(`./ragctl search`). There is still **no chat interface and no answer
-generation** — those components don't exist yet.
+**retrieval** over them works (hybrid search plus GPU reranking), and a
+**query service** answers questions from them with citations over an HTTP
+API, storing chat history — natively and OpenAI-compatibly. There is still
+**no chat UI** and no user accounts; the API is what a UI will talk to.
 
 **You provide the models.** What's wired up and pinned to specific
 versions: OCR, document parsing, the Ollama-backed VLM OCR fallback, and
@@ -40,6 +41,11 @@ the embedding/indexing pipeline.
             │   dense (Ollama embeddings) + bm25 (sparse,     │
             │   computed by Qdrant) → hybrid search via RRF   │
             └──────────────────────────────────────────────────┘
+                    ▲
+   query/ (native, :8088): HTTP API (native + OpenAI-compatible)
+          question → [rewrite] → hybrid search → rerank (Apple GPU)
+          → chat model via Ollama (+ optional search tool rounds)
+          → streamed answer with [n] citations; history in data/chat.db
 ```
 
 | Layer | Choice | Runs where |
@@ -51,7 +57,10 @@ the embedding/indexing pipeline.
 | Chunking | Docling HybridChunker (docling-core) | native macOS batch job |
 | Embeddings | you provide (e.g. bge-m3) | Ollama |
 | Vector DB + BM25 | Qdrant (dense + server-side BM25 sparse) | Docker |
-| Chat UI / query service / reranking | not yet built | — |
+| Reranker | bge-reranker-v2-m3 (cross-encoder) | native macOS, Apple GPU (MPS) |
+| Query service (chat + search API, history in SQLite) | FastAPI, `services/query` | native macOS, LaunchAgent |
+| Chat models | you provide (Everyday / Hard presets) | Ollama |
+| Chat UI, user accounts | not yet built | — |
 
 Ollama and Docling run **natively** (not in Docker) so they can use Apple's
 MLX/Metal acceleration. Qdrant runs in Docker for easy, reproducible
@@ -223,23 +232,97 @@ it to `less` for big documents.
 Set `INGEST_AUTORUN=true` in `.env` and run `./ragctl reload` to have
 ingest and embed run automatically whenever a file lands in `data/inbox/`.
 
+## Chatting: the query service
+
+`ragctl up` starts the query service (`services/query/api.py`) on
+`http://127.0.0.1:$QUERY_PORT` (default 8088). Interactive API docs are at
+`/docs`. It always binds to 127.0.0.1 — there are no user accounts yet, so
+anyone who can reach it can read every conversation. Setting
+`QUERY_API_KEY` makes every endpoint but `/api/health` require
+`Authorization: Bearer <key>`.
+
+**Each answer:**
+1. **Rewrite** — one call to the chat model decides whether the message
+   needs a search at all ("hello", "thanks", "make that shorter" or
+   "translate that" are answered without one) and, for a follow-up, turns it
+   into a standalone search query ("and for Level 1?" → "RSF factor for
+   Level 1 assets").
+2. **Automatic search** — `CHAT_INITIAL_SOURCES` passages (hybrid search +
+   reranking), numbered [1]..[n].
+3. **Answer** — streamed from the preset's chat model, citing passages as
+   [n]. If the preset has tools on, the model may call a `search_documents`
+   tool for more passages (up to `CHAT_MAX_TOOL_ROUNDS`, within
+   `CHAT_MAX_SOURCE_TOKENS`). Passages it already has are never returned
+   again, and numbering continues, so earlier citations stay valid.
+4. **Citations** are resolved to their passages; numbers that don't exist
+   are reported as `invalid_citations`.
+
+The instructions the model gets are in `services/query/prompts/` —
+`system.md` always, `tools.md` when tools are on. Edit them freely; they're
+read on every question.
+
+**Presets.** `everyday` and `hard` map to `CHAT_MODEL_EVERYDAY` /
+`CHAT_MODEL_HARD`, each with its own `CHAT_TOOLS_*` and `CHAT_THINK_*`. By
+default Hard has thinking on: measured with qwen3.5:9b, the model only
+calls the search tool reliably when thinking (4 of 4 runs, against 1 of 12
+without), at the cost of 5–10 s of reasoning and an extra model pass —
+a question needing one extra search took ~35 s to its first word. Everyday
+answers in a few seconds but rarely searches beyond the automatic search.
+
+**Native API** (`/api`, for a UI):
+
+| Endpoint | |
+|---|---|
+| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?}`), list |
+| `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset, delete |
+| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error` |
+| `POST /api/search` | `{query, limit?, fused?}` → ranked chunks |
+| `GET /api/documents` | processed documents, files waiting in the inbox, upload-ingest status |
+| `POST /api/upload` | multipart `files` → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
+| `GET /api/health` | Ollama, the Qdrant collection, the database, reranker device, presets |
+
+History is stored in `data/chat.db` (SQLite): the UI sends only the new
+message, and the service loads earlier turns, sending the model the most
+recent ones within `CHAT_HISTORY_MAX_TOKENS`. Each answer stores a copy of
+the passages it was given, so its citations still resolve after documents
+are re-ingested. An answer keeps generating and is stored even if the
+client disconnects; reopening the conversation shows it. Every row carries
+a `user_id` (`local` for now), ready for accounts.
+
+**OpenAI-compatible API** (`/v1`): `GET /v1/models` lists `everyday` and
+`hard`; `POST /v1/chat/completions` runs the same pipeline, streamed or
+not, so any OpenAI client works:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8088/v1", api_key="unused")  # or QUERY_API_KEY
+client.chat.completions.create(model="everyday", messages=[{"role": "user", "content": "What is a mini-perm loan?"}])
+```
+
+The protocol is stateless (clients send the whole conversation) and has no
+field for citations, so nothing is stored and the cited passages are
+appended to the answer as a "Sources" list. A client's system prompt is
+added to the service's, not substituted for it; client-supplied `tools`
+are rejected.
+
 ## Operating
 
 ```bash
 ./ragctl status              # what's running and reachable
 ./ragctl health               # checks Ollama (+ model checks + an embedding
-                               # smoke test), docling-serve, and Qdrant
-./ragctl logs [docling|ollama|ingest|qdrant]
+                               # smoke test), docling-serve, Qdrant and the query service
+./ragctl logs [docling|ollama|ingest|query|qdrant]
 ./ragctl models check         # confirm .env model names exist in Ollama
 ./ragctl search "question"    # hybrid search + reranking (-v, --fused, --json)
 ./ragctl up / down / restart
 ./ragctl reload               # re-apply .env changes to running services
-./ragctl clean --yes          # wipe ingest data, outputs and the index
+./ragctl clean --yes          # wipe ingest data, outputs, the index and chat history
 ```
 
 `ragctl clean --yes` wipes `data/inbox`, `work`, `processed`, `failed`,
-`markdown`, `docling` and `manifest.jsonl`, and deletes the Qdrant
-collection — it resets the pipeline to a clean slate. Model caches (`data/hf-cache`, `data/docling-artifacts`) are
+`markdown`, `docling` and `manifest.jsonl`, deletes the Qdrant collection
+and all conversations in `data/chat.db` — it resets everything to a clean
+slate. Model caches (`data/hf-cache`, `data/docling-artifacts`) are
 left alone since they're expensive to redownload and aren't "your data."
 For a full teardown, use `ragctl uninstall` instead.
 

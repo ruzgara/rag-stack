@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -158,6 +159,7 @@ class Retriever:
         self._owns_client = client is None
         self._checked = False
         self._reranker = None
+        self._reranker_lock = threading.Lock()
 
     def close(self) -> None:
         if self._owns_client:
@@ -266,18 +268,22 @@ class Retriever:
     def reranker(self):
         """Loaded on first use: importing torch and moving the model to the
         GPU takes a few seconds, which search-only callers shouldn't pay."""
-        if self._reranker is None:
-            from rerank import Reranker, RerankConfig
+        with self._reranker_lock:  # concurrent first requests must not load it twice
+            if self._reranker is None:
+                from rerank import Reranker, RerankConfig
 
-            self._reranker = Reranker(RerankConfig.from_env())
+                self._reranker = Reranker(RerankConfig.from_env())
         return self._reranker
 
-    def retrieve(self, question: str) -> list[Hit]:
+    def retrieve(self, question: str, limit: int | None = None, exclude: set[str] | None = None) -> list[Hit]:
         """The final chunks for a question: hybrid search, reranked when
-        RAG_RERANK=true, cut to RAG_TOP_K_RERANKER."""
-        hits = self.search(question)
+        RAG_RERANK=true, cut to `limit` (default RAG_TOP_K_RERANKER).
+        Chunks whose point_id is in `exclude` are skipped, so asking again
+        with the same question returns the next-best unseen chunks."""
+        limit = limit or self.cfg.top_k_reranker
+        hits = [h for h in self.search(question) if not exclude or h.point_id not in exclude]
         if not self.cfg.rerank or not hits:
-            return hits[: self.cfg.top_k_reranker]
+            return hits[:limit]
         # Score the text as it was indexed (heading path + chunk), so the
         # reranker sees the same context the retrievers did.
         scores = self.reranker.score(question, [h.context_text for h in hits])
@@ -285,7 +291,7 @@ class Retriever:
             h.rerank_score = s
             h.score = s
         hits.sort(key=lambda h: h.rerank_score, reverse=True)
-        kept = [h for h in hits if h.rerank_score >= self.cfg.rerank_min_score][: self.cfg.top_k_reranker]
+        kept = [h for h in hits if h.rerank_score >= self.cfg.rerank_min_score][:limit]
         for rank, h in enumerate(kept, start=1):
             h.rank = rank
         return kept

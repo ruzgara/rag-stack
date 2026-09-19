@@ -1,0 +1,18 @@
+#!/bin/bash
+# Rendered by `ragctl install` from query-api.sh.tmpl.
+# Runs the query service (chat + search API, services/query/api.py) natively,
+# so its reranker can use the Apple GPU. Kept alive by the com.ragstack.query
+# LaunchAgent.
+
+set -euo pipefail
+
+# launchd runs this with a bare PATH — add Homebrew and uv, and ragctl's
+# dependencies for the upload-triggered ingest runs.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+export HF_HOME="__REPO_ROOT__/data/hf-cache"
+
+cd "__REPO_ROOT__/services/query"
+# Always 127.0.0.1, whatever BIND_ADDR says: there are no user accounts yet,
+# so anyone who can reach this service can read every conversation. One
+# worker: the reranker lives in process memory on the GPU.
+exec "__UV_BIN__" run --python 3.12 uvicorn api:app --host 127.0.0.1 --port "__QUERY_PORT__" --workers 1
