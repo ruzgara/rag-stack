@@ -231,6 +231,13 @@ cmd_install() {
     load_agent "com.ragstack.query"
     ok "Query service loaded (http://127.0.0.1:${QUERY_PORT})"
 
+    # ui/dist is committed to git, so a normal clone already has it and
+    # install never needs Node. This only fires for a clone where it was
+    # somehow stripped, or a checkout of a commit that predates the UI.
+    if [[ ! -f "$REPO_ROOT/ui/dist/index.html" ]]; then
+        warn "ui/dist is missing — the web UI will show a placeholder. It is normally committed; rebuild with './ragctl ui build' (needs Node)."
+    fi
+
     echo
     ok "Install complete."
     cat <<EOF
@@ -238,7 +245,7 @@ cmd_install() {
 Next steps:
   1. Run: ./ragctl health
   2. Drop files in data/inbox and run: ./ragctl ingest && ./ragctl embed
-  3. Chat API: http://127.0.0.1:${QUERY_PORT}/api (OpenAI-compatible: /v1, docs: /docs)
+  3. Open http://127.0.0.1:${QUERY_PORT} (admin: /admin, API docs: /docs)
 EOF
 }
 
@@ -253,7 +260,7 @@ cmd_up() {
     fi
     compose up -d "${COMPOSE_SERVICES[@]}"
     load_agent "com.ragstack.query"
-    ok "Stack is up. Query API: http://127.0.0.1:${QUERY_PORT}"
+    ok "Stack is up. Open http://127.0.0.1:${QUERY_PORT} (admin: /admin, API docs: /docs)"
 }
 
 cmd_down() {
@@ -391,6 +398,61 @@ cmd_search() {
     (cd "$REPO_ROOT/services/query" && uv run --python 3.12 retrieval.py "$@")
 }
 
+# --------------------------------------------------------------------- ui --
+# The web UI (ui/, Svelte + Vite + TS). ui/dist is committed to git, so
+# installing and running the stack never needs Node or pnpm -- only
+# changing the UI does. Unlike resolve_uv_bin, nothing here ever runs under
+# launchd, so there is no bare-PATH problem to work around: this always runs
+# in a contributor's own interactive shell, where nvm/fnm/volta has already
+# put the right pnpm on PATH. A hardcoded fallback path list would risk
+# picking the wrong one.
+UI_DIR="$REPO_ROOT/ui"
+
+resolve_pnpm_bin() {
+    command -v pnpm 2>/dev/null \
+        || die "pnpm not found. ui/dist is committed, so you only need Node/pnpm to *change* the UI. Install pnpm (https://pnpm.io/installation, or 'brew install pnpm') and re-run."
+}
+
+cmd_ui() {
+    local action="${1:-build}"; shift || true
+    [[ -d "$UI_DIR" ]] || die "ui/ not found at $UI_DIR"
+    local pnpm; pnpm="$(resolve_pnpm_bin)"
+
+    case "$action" in
+        install)
+            echo "== UI dependencies =="
+            (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            ok "Installed ui/node_modules"
+            ;;
+        dev)
+            load_env
+            echo "== UI dev server =="
+            info "Proxies /api, /v1 and /admin to http://127.0.0.1:${QUERY_PORT} -- keep './ragctl up' running alongside this."
+            info "Sign in again at http://localhost:5173 -- it is a different cookie host from 127.0.0.1, so a 127.0.0.1 session doesn't carry over."
+            [[ -d "$UI_DIR/node_modules" ]] || (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            (cd "$UI_DIR" && "$pnpm" run dev -- "$@")
+            ;;
+        build)
+            echo "== UI build =="
+            [[ -d "$UI_DIR/node_modules" ]] || (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            (cd "$UI_DIR" && "$pnpm" run build)
+            ok "Built ui/dist."
+            warn "ui/dist is committed -- 'git add ui/dist' and commit, or the running service keeps serving the old build."
+            ;;
+        check)
+            [[ -d "$UI_DIR/node_modules" ]] || (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            (cd "$UI_DIR" && "$pnpm" run check)
+            ;;
+        test)
+            [[ -d "$UI_DIR/node_modules" ]] || (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            (cd "$UI_DIR" && "$pnpm" run test -- --run "$@")
+            ;;
+        *)
+            die "Usage: ragctl ui <install|dev|build|check|test>"
+            ;;
+    esac
+}
+
 # ----------------------------------------------------------------- health --
 cmd_health() {
     load_env
@@ -484,6 +546,7 @@ cmd_uninstall() {
     unload_agent "com.ragstack.query"
     rm -rf "$RUNTIME_DIR"
     for svc in docling ingest embed query; do rm -rf "$REPO_ROOT/services/$svc/.venv"; done
+    rm -rf "$REPO_ROOT/ui/node_modules" "$REPO_ROOT/ui/.vite" # ui/dist itself is committed -- left in place
 
     if (( purge )); then
         rm -rf "$DATA_DIR"
@@ -523,6 +586,10 @@ Usage: ./ragctl <command> [args]
   search "question" [--fused] [--json] [-v]
                          Hybrid search + GPU reranking over the index
                          (settings: RAG_* and RERANKER_* in .env)
+  ui <install|dev|build|check|test>
+                         The web UI (ui/, Svelte + Vite). dist/ is committed,
+                         so installing and running the stack never needs
+                         Node — only changing the UI does.
   health                 End-to-end connectivity check
   clean --yes             Wipe ingest data, outputs, the Qdrant collection and chat history
   uninstall [--purge-data]  Tear down containers, agents and local envs
@@ -545,6 +612,7 @@ main() {
         embed) cmd_embed "$@" ;;
         user) cmd_user "$@" ;;
         search) cmd_search "$@" ;;
+        ui) cmd_ui "$@" ;;
         health) cmd_health "$@" ;;
         clean) cmd_clean "$@" ;;
         uninstall) cmd_uninstall "$@" ;;

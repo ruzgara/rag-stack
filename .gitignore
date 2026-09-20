@@ -12,3 +12,8 @@ services/*/.venv/
 # uv / python
 __pycache__/
 *.pyc
+
+# Contributor-only UI toolchain. ui/dist is NOT ignored — it is what the
+# query service serves, so it is committed and installing never needs Node.
+ui/node_modules/
+ui/.vite/

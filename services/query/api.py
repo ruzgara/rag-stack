@@ -33,7 +33,8 @@ import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from chat import ChatConfig, ChatError, ChatService
@@ -1019,6 +1020,11 @@ def health() -> JSONResponse:
     checks["load"] = {"ok": True, **state.gate.stats()}
     checks["presets"] = {"ok": True, **{name: {"model": p.model, "tools": p.tools, "think": p.think}
                                         for name, p in state.chat.cfg.presets.items()}}
+    # /api/health is the only unauthenticated endpoint, and auth_mode is
+    # otherwise only on /api/auth/me -- which 401s exactly when a signed-out
+    # UI needs to know whether to show a sign-in form at all (proxy mode has
+    # none). The mode is not a secret.
+    checks["auth"] = {"ok": True, "mode": state.auth.mode}
     ok = all(c["ok"] for c in checks.values())
     return JSONResponse({"ok": ok, **checks}, status_code=200 if ok else 503)
 
@@ -1032,13 +1038,71 @@ def admin_ui() -> FileResponse:
     return FileResponse(Path(__file__).parent / "static" / "admin.html")
 
 
-@app.get("/ui", include_in_schema=False)
-def test_ui() -> FileResponse:
-    """Temporary test UI (static/test-ui.html) for trying the API in a browser.
-    Same origin as the API, so no CORS setup is needed. Remove with the real UI."""
-    return FileResponse(Path(__file__).parent / "static" / "test-ui.html")
-
-
 from openai_compat import router as openai_router  # noqa: E402
 
 app.include_router(openai_router)
+
+
+# -------------------------------------------------------------------- ui --
+# The Svelte app (ui/, built to ui/dist, committed to git) served at /.
+# Registered last on purpose: routes match in declaration order, so every
+# /api, /v1 and /admin route above already wins over the catch-all here.
+# /docs, /redoc and /openapi.json are registered inside FastAPI.__init__ and
+# so precede everything regardless of where this block sits. REPO_ROOT, not
+# Path(__file__).parent -- the service's cwd is services/query
+# (launchd/query-api.sh.tmpl), not the repo root.
+
+UI_DIST = REPO_ROOT / "ui" / "dist"
+_ANY_METHOD = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+
+@app.api_route("/api/{rest:path}", methods=_ANY_METHOD, include_in_schema=False)
+def api_not_found(rest: str) -> JSONResponse:
+    """An unknown /api path is a JSON 404, the same shape as every other
+    error. Without this the SPA catch-all below would answer a stray GET
+    with index.html, and a stray POST with a 405 (the path matches a real
+    route, the method doesn't) -- both worse than a 404 for an API caller."""
+    return JSONResponse({"detail": f"no such endpoint: /api/{rest}"}, status_code=404)
+
+
+@app.api_route("/v1/{rest:path}", methods=_ANY_METHOD, include_in_schema=False)
+def v1_not_found(rest: str) -> JSONResponse:
+    """Same for the OpenAI-compatible surface: a client pointed at the wrong
+    /v1 path gets JSON back, never HTML."""
+    return JSONResponse({"detail": f"no such endpoint: /v1/{rest}"}, status_code=404)
+
+
+if (UI_DIST / "index.html").is_file():
+    # check_dir=False: a build with no /assets directory (shouldn't happen,
+    # but shouldn't crash the service either) must not raise at import time,
+    # which StaticFiles(directory=...) otherwise does if the path is missing.
+    app.mount("/assets", StaticFiles(directory=UI_DIST / "assets", check_dir=False), name="ui-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def ui_app(full_path: str) -> FileResponse:
+        """The single-page app. A real file in ui/dist is served as itself
+        (favicon, manifest); anything else is index.html, so the client
+        router owns paths like /c/<id> and /settings. html=True on
+        StaticFiles is deliberately not used here instead -- it serves
+        index.html for *directory* paths and 404s unknown files, which is
+        not the same thing as an SPA fallback."""
+        candidate = (UI_DIST / full_path).resolve()
+        if full_path and candidate.is_file() and candidate.is_relative_to(UI_DIST.resolve()):
+            return FileResponse(candidate)
+        return FileResponse(UI_DIST / "index.html")
+
+else:
+    @app.get("/", include_in_schema=False)
+    def ui_missing() -> HTMLResponse:
+        """A fresh clone before the UI was ever built. ui/dist is committed,
+        so this normally never shows -- but a missing directory must not
+        stop the API itself from serving."""
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>rag-stack</title>"
+            "<body style='font:14px/1.5 system-ui,sans-serif;margin:40px;max-width:60ch'>"
+            "<h1 style='font-size:16px'>The web UI isn't built</h1>"
+            "<p><code>ui/dist</code> is missing. Build it with "
+            "<code>./ragctl ui build</code> (needs Node), or use the "
+            "<a href='/admin'>admin console</a> and the <a href='/docs'>API docs</a>.</p>",
+            status_code=503,
+        )

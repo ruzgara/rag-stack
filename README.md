@@ -16,11 +16,12 @@ embedded with Ollama and written to Qdrant with both dense and BM25 vectors,
 **retrieval** over them works (hybrid search plus GPU reranking), and a
 **query service** answers questions from them with citations over an HTTP
 API, storing chat history — natively and OpenAI-compatibly. It has
-**accounts**: users with passwords, groups, and permissions as grants, all
-managed from `ragctl user` until an admin page exists. Several sessions can
-use it at once, with turns queueing for the GPU. There is still **no chat
-UI** — the API is what one will talk to — and documents are still one shared
-corpus, not yet filtered per library.
+**accounts**: users with passwords, groups, and permissions as grants,
+manageable from `ragctl user` or the admin console at `/admin`. Several
+sessions can use it at once, with turns queueing for the GPU. There is now
+a **chat UI** (`ui/`, Svelte + Vite, served at `/`): sign-in, conversations,
+streaming markdown answers with citations beside the sources they cite, and
+per-library filtering.
 
 **You provide the models.** What's wired up and pinned to specific
 versions: OCR, document parsing, the Ollama-backed VLM OCR fallback, and
@@ -68,7 +69,7 @@ the embedding/indexing pipeline.
 | Query service (chat + search API, history in SQLite) | FastAPI, `services/query` | native macOS, LaunchAgent |
 | Chat models | you provide (Everyday / Hard presets) | Ollama |
 | Accounts | email + password (argon2id via `pwdlib`), signed session cookies, grant-based permissions | `services/query`, same SQLite file |
-| Chat UI | not yet built | — |
+| Chat UI | Svelte 5 + Vite + TS, `ui/`, built to a committed `ui/dist` | static files served by the query service at `/` |
 
 Ollama and Docling run **natively** (not in Docker) so they can use Apple's
 MLX/Metal acceleration. Qdrant runs in Docker for easy, reproducible
@@ -87,6 +88,9 @@ volumes prefixed `ragstack_`, or in LaunchAgents labelled `com.ragstack.*`
   machine, raise this — 16GB is a good target on a Mac Studio.
 - [Ollama.app](https://ollama.com/download), running.
 - Your VLM and embedding models already pulled with `ollama pull`.
+- Node.js + [pnpm](https://pnpm.io/installation) — **only if you're changing
+  the web UI.** `ui/dist` is committed to git, so a normal install and
+  `./ragctl up` never need Node; `./ragctl ui build` does.
 
 ## Install
 
@@ -129,6 +133,9 @@ refused, because that echoes the password and stores whatever the pipe
 delivered. To script it, `--password-stdin` reads one line deliberately. If
 you already had conversations from before accounts existed, this first admin
 adopts them.
+
+Then open **http://127.0.0.1:8088** and sign in — that's the chat UI. The
+admin console is at `/admin`, the API docs at `/docs`.
 
 ## Using it
 
@@ -382,7 +389,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `POST /api/auth/login` · `POST /api/auth/logout` | `{email, password}` → sets the session cookie; clear it |
 | `GET /api/auth/me` | the caller, their groups and their effective permissions — what a UI renders itself from |
 | `POST /api/auth/password` | `{current_password, new_password}`, which signs your other sessions out |
-| `/api/admin/users` · `/api/admin/groups` · `/api/admin/grants` | users, groups, memberships and grants (needs `users.manage`); what the admin page will call |
+| `/api/admin/users` · `/api/admin/groups` · `/api/admin/grants` | users, groups, memberships and grants (needs `users.manage`); what the admin console calls |
 | `/api/admin/libraries` · `/api/admin/documents` | create/list/delete libraries, list every indexed document, and `PUT`/`DELETE .../libraries/{id}/documents/{sha}` to assign one (needs `libraries.manage`) |
 | `GET /api/health` | Ollama, the Qdrant collection, the database, reranker device, presets, current load |
 
@@ -421,6 +428,7 @@ are rejected.
 ./ragctl models check         # confirm .env model names exist in Ollama
 ./ragctl search "question"    # hybrid search + reranking (-v, --fused, --json)
 ./ragctl user list            # accounts, groups and permissions (see below)
+./ragctl ui <install|dev|build|check|test>  # the web UI -- needs Node only for this
 ./ragctl up / down / restart
 ./ragctl reload               # re-apply .env changes to running services
 ./ragctl clean --yes          # wipe everything: ingest data, the index, chat history, accounts
@@ -651,9 +659,9 @@ The backend assumes more than one session at a time:
   Postgres becomes necessary when a second process writes — in practice, the
   day you run uvicorn with more than one worker.
 
-What's deliberately *not* here yet: an admin UI and TLS. Bind to the LAN only
-behind a TLS terminator, and set `QUERY_HTTPS_ONLY=true` so the session cookie
-never crosses plain http.
+What's deliberately *not* here yet: TLS. Bind to the LAN only behind a TLS
+terminator, and set `QUERY_HTTPS_ONLY=true` so the session cookie never
+crosses plain http.
 
 ## Tests
 
@@ -661,11 +669,18 @@ Unit tests live next to each service (`services/<name>/tests/`) and run in
 that service's own environment, separately from `ragctl`:
 
 ```bash
-./run-tests.sh                  # every service
+./run-tests.sh                  # every Python service
 ./run-tests.sh query            # one service
 ./run-tests.sh query -k chat    # extra arguments go to pytest
+./run-tests.sh ui               # the web UI's Vitest suite (needs Node)
 cd services/ingest && uv run pytest   # or directly, per service
 ```
+
+The UI's tests (`ui/src/tests/`) cover the SSE frame parser (chunked at
+several byte sizes, to catch boundary bugs), the streaming-markdown fence
+tracker, citation parsing and linkification, conversation-to-turn pairing,
+and the permissions-map shapes -- all pure TypeScript, no browser needed.
+`./ragctl ui check` runs `svelte-check`.
 
 Most need no running services, network, `.env` or `data/`, and take a few
 seconds. Ollama and Qdrant are faked (`httpx.MockTransport`), and the
@@ -703,10 +718,6 @@ them out with `-m "not integration"`.
 
 **Next, roughly in order:**
 
-- **The UI** (`ui/`, Svelte + Vite, built to static files this service
-  serves at `/`), replacing `static/test-ui.html`: sign-in, conversations,
-  citations beside the answer, library management, and an admin page for the
-  `/api/admin/*` endpoints.
 - **TLS and a LAN binding**, so a team can reach it: Caddy or
   `tailscale serve` in front, `QUERY_HTTPS_ONLY=true`, and optionally
   `QUERY_AUTH_MODE=proxy` to hand sign-in to an identity provider instead of
