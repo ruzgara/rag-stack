@@ -40,7 +40,6 @@ load_env() {
     DOCLING_PORT="${DOCLING_PORT:-5001}"
     QDRANT_PORT="${QDRANT_PORT:-6333}"
     QUERY_PORT="${QUERY_PORT:-8088}"
-    MIN_FREE_GB="${MIN_FREE_GB:-41}"
 }
 
 compose() {
@@ -52,25 +51,11 @@ compose() {
 COMPOSE_SERVICES=(qdrant)
 
 # ------------------------------------------------------------- preflight --
-check_free_disk_gb() {
-    df -g "$REPO_ROOT" | awk 'NR==2 {print $4}'
-}
-
 cmd_preflight() {
     local fail=0
 
     [[ "$(uname -s)" == "Darwin" ]] || { err "This stack targets macOS."; fail=1; }
     [[ "$(uname -m)" == "arm64" ]] || warn "Not running on arm64 — MLX/Metal acceleration assumptions won't hold."
-
-    local free_gb
-    free_gb="$(check_free_disk_gb)"
-    if (( free_gb < MIN_FREE_GB )); then
-        err "Only ${free_gb}GB free on disk; need at least ${MIN_FREE_GB}GB (see README for the breakdown)."
-        err "Free up $((MIN_FREE_GB - free_gb))GB more, then re-run. ragctl will not delete anything for you."
-        fail=1
-    else
-        ok "Disk space: ${free_gb}GB free (need ${MIN_FREE_GB}GB)"
-    fi
 
     if ! command -v brew >/dev/null; then
         err "Homebrew is required: https://brew.sh"
@@ -87,12 +72,6 @@ cmd_preflight() {
         err "Docker is not running. Start Docker Desktop (or install it: https://www.docker.com/products/docker-desktop/), then re-run."
         fail=1
     else
-        local mem_bytes
-        mem_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
-        local mem_gb=$(( mem_bytes / 1073741824 ))
-        if (( mem_gb > 0 && mem_gb < 6 )); then
-            warn "Docker Desktop has only ${mem_gb}GB of RAM allocated. Recommend >=8GB in Docker Desktop -> Settings -> Resources."
-        fi
         ok "Docker is running"
     fi
 

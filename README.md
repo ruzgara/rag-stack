@@ -106,7 +106,7 @@ Edit `.env`:
 ./ragctl install
 ```
 
-This checks prerequisites and disk space, installs Homebrew + Python
+This checks prerequisites, installs Homebrew + Python
 dependencies (all inside this repo), sets Ollama tuning via `launchctl`,
 installs LaunchAgents for docling-serve (and, optionally, auto-ingestion),
 and starts Qdrant.
