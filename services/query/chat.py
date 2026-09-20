@@ -301,7 +301,7 @@ class ChatService:
         return search, query or question
 
     def _search(self, query: str, limit: int, seen: set[str], sources: list[Source], found_by: str,
-                budget: list[int], max_tokens: int | None = None) -> list[Source]:
+                budget: list[int], max_tokens: int | None = None, doc_shas: set[str] | None = None) -> list[Source]:
         """New sources for a query, best first, numbered after the existing
         ones: every relevant result that fits this search's token allowance
         (max_tokens) and the turn's remaining budget (budget[0], mutated).
@@ -309,7 +309,7 @@ class ChatService:
         less relevant ones. `limit` only caps the count."""
         new = []
         allowance = min(budget[0], max_tokens) if max_tokens else budget[0]
-        for hit in self.retriever.retrieve(query, limit=limit, exclude=seen):
+        for hit in self.retriever.retrieve(query, limit=limit, exclude=seen, doc_shas=doc_shas):
             src = Source.from_hit(len(sources) + 1, hit, found_by, query)
             cost = estimate_tokens(src.for_prompt())
             if cost > allowance and (new or sources):  # always allow at least one source
@@ -322,9 +322,11 @@ class ChatService:
         return new
 
     def run_turn(self, question: str, history: list[dict], preset_name: str | None = None,
-                 extra_system: str | None = None) -> Iterator[dict]:
+                 extra_system: str | None = None, doc_shas: set[str] | None = None) -> Iterator[dict]:
         """Yields events: rewrite, searching, sources, listing, thinking, token, done.
-        The done event carries the TurnResult."""
+        The done event carries the TurnResult. `doc_shas` restricts every
+        search and the document listing to a library scope (None: every
+        indexed document; empty: none) -- see Retriever.search."""
         preset = self.cfg.preset(preset_name)
         result = TurnResult(model=preset.model, preset=preset.name)
         t_start = time.monotonic()
@@ -346,7 +348,7 @@ class ChatService:
             yield {"type": "searching", "query": query, "found_by": "auto"}
             t0 = time.monotonic()
             new = self._search(query, self.cfg.initial_sources, seen, result.sources, "auto", budget,
-                               self.cfg.auto_source_tokens)
+                               self.cfg.auto_source_tokens, doc_shas)
             result.stats["search_s"] = round(time.monotonic() - t0, 2)
             result.search_queries.append(query)
             yield {"type": "sources", "sources": [asdict(s) for s in new]}
@@ -426,7 +428,7 @@ class ChatService:
                     wanted = str(args.get("document") or "").strip()
                     yield {"type": "listing", "document": wanted}
                     try:
-                        reply = self.library.describe(wanted or None)
+                        reply = self.library.describe(wanted or None, doc_shas)
                     except (RuntimeError, httpx.HTTPError) as exc:
                         reply = f"The document list is unavailable ({exc})."
                     # Not sources, but it shares the prompt with them.
@@ -436,7 +438,8 @@ class ChatService:
                     reply = "Error: call search_documents with a non-empty 'query'."
                 else:
                     yield {"type": "searching", "query": tool_query, "found_by": "tool"}
-                    new = self._search(tool_query, self.cfg.tool_results, seen, result.sources, "tool", budget)
+                    new = self._search(tool_query, self.cfg.tool_results, seen, result.sources, "tool", budget,
+                                       doc_shas=doc_shas)
                     result.search_queries.append(tool_query)
                     yield {"type": "sources", "sources": [asdict(s) for s in new]}
                     reply = ("\n\n".join(s.for_prompt() for s in new) if new

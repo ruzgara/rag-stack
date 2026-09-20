@@ -47,8 +47,16 @@
   <h3>Documents</h3>
   <div class="row"><input type="file" id="file" multiple style="max-width:100%"></div>
   <div id="docs" class="small"></div>
+  <h3>Account</h3>
+  <div id="who" class="small"></div>
+  <form id="signin" class="row" style="display:none;flex-direction:column;align-items:stretch">
+    <input id="email" type="email" placeholder="you@example.com" class="small" autocomplete="username">
+    <input id="password" type="password" placeholder="password" class="small" autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+  <button id="signout" style="display:none">Sign out</button>
   <h3>API key</h3>
-  <input id="key" placeholder="QUERY_API_KEY, if set" class="small">
+  <input id="key" placeholder="QUERY_API_KEY, for scripts" class="small">
   <div id="health" class="small"></div>
 </aside>
 <main>
@@ -182,6 +190,7 @@ async function send(text) {
             d.innerHTML = "<summary>thinking…</summary><pre></pre>"; el.insertBefore(d, body); thinking = d.querySelector("pre"); }
           thinking.textContent += data.text;
         }
+        else if (ev === "queued") log(`waiting for a free slot (position ${data.position})`);
         else if (ev === "rewrite") log(data.search ? `rewritten: “${data.query}”` : "no search needed");
         else if (ev === "searching") log(`${data.found_by === "tool" ? "tool search" : "search"}: “${data.query}”`);
         else if (ev === "listing") log(data.document ? `looking up document: “${data.document}”` : "listing the knowledge base");
@@ -235,7 +244,45 @@ $("#file").onchange = async () => {
   } catch (e) { alert(e.message); }
   $("#file").value = ""; loadDocs();
 };
-function refresh() { loadConvs().catch(e => $("#convs").innerHTML = `<span class="err">${esc(e.message)}</span>`); loadDocs(); health(); }
+// The session cookie is set by /api/auth/login and sent automatically; the
+// API-key field is only for standing in for a script.
+async function whoami() {
+  try {
+    const me = await api("/api/auth/me");
+    const perms = Object.keys(me.permissions).sort().join(", ") || "no permissions yet";
+    $("#who").innerHTML = `<b>${esc(me.user.email)}</b>${me.user.is_admin ? " (admin)" : ""}<br>` +
+      `${esc(me.user.groups.join(", ") || "no groups")}<br><span class="small">${esc(perms)}</span>`;
+    $("#signin").style.display = "none";
+    $("#signout").style.display = "";
+    return me;
+  } catch {
+    $("#who").textContent = "Not signed in.";
+    $("#signin").style.display = "flex";
+    $("#signout").style.display = "none";
+    return null;
+  }
+}
+$("#signin").onsubmit = async e => {
+  e.preventDefault();
+  try {
+    await api("/api/auth/login", {method: "POST",
+      body: JSON.stringify({email: $("#email").value, password: $("#password").value})});
+    $("#password").value = "";
+    refresh();
+  } catch (err) { $("#who").innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+};
+$("#signout").onclick = async () => {
+  await api("/api/auth/logout", {method: "POST"});
+  convId = null; $("#log").innerHTML = ""; $("#convs").innerHTML = "";
+  refresh();
+};
+
+async function refresh() {
+  if (!await whoami()) return;   // nothing else works until someone is signed in
+  loadConvs().catch(e => $("#convs").innerHTML = `<span class="err">${esc(e.message)}</span>`);
+  loadDocs();
+  health();
+}
 refresh(); setInterval(health, 15000);
 </script>
 </body>

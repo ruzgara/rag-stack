@@ -1,9 +1,10 @@
 """
 Chat history storage for the query service: SQLite at data/chat.db.
 
-Every row carries a user_id. There are no user accounts yet, so everything
-is stored under LOCAL_USER; when login exists, the API passes the real user
-and every query below is already scoped by it.
+Every row carries a user_id and every query is scoped by it -- there are no
+defaults here, so a caller that forgets to say whose data it wants gets an
+error rather than someone else's. LOCAL_USER is what rows written before
+accounts existed carry; the first admin created adopts them (accounts.py).
 
 Each assistant message keeps a copy of the sources it was given (text
 included), so an old answer's citations still resolve after the index is
@@ -22,7 +23,7 @@ from typing import Iterator
 
 LOCAL_USER = "local"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
     id          TEXT PRIMARY KEY,
@@ -67,7 +68,113 @@ CREATE TABLE IF NOT EXISTS message_sources (
     rerank_score REAL,
     PRIMARY KEY (message_id, number)
 );
+
+CREATE TABLE IF NOT EXISTS uploads (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    filename    TEXT NOT NULL,   -- the name given to the file in data/inbox
+    bytes       INTEGER NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS uploads_user ON uploads (user_id, created_at DESC);
 """
+
+ACCOUNTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id             TEXT PRIMARY KEY,
+    email          TEXT NOT NULL UNIQUE,   -- stored lowercased
+    password_hash  TEXT,                   -- null when identity comes from a proxy
+    display_name   TEXT,
+    is_admin       INTEGER NOT NULL DEFAULT 0,
+    disabled       INTEGER NOT NULL DEFAULT 0,
+    -- Bumped to invalidate this user's signed session cookies everywhere
+    -- (password change, "log out everywhere"). There is no session table.
+    session_epoch  INTEGER NOT NULL DEFAULT 1,
+    created_at     REAL NOT NULL,
+    last_login_at  REAL
+);
+
+CREATE TABLE IF NOT EXISTS groups (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    created_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id TEXT NOT NULL REFERENCES groups (id) ON DELETE CASCADE,
+    user_id  TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, user_id)
+);
+
+-- A named collection of documents. Created here so grants can point at one;
+-- membership and retrieval filtering come later.
+CREATE TABLE IF NOT EXISTS libraries (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    created_at  REAL NOT NULL
+);
+
+-- One row per granted (or refused) permission. library_id is null for the
+-- global capabilities. A user's own grant beats its groups'; within either,
+-- deny beats allow. See accounts.effective_permissions.
+CREATE TABLE IF NOT EXISTS grants (
+    id           TEXT PRIMARY KEY,
+    subject_type TEXT NOT NULL CHECK (subject_type IN ('user', 'group')),
+    subject_id   TEXT NOT NULL,
+    permission   TEXT NOT NULL,
+    library_id   TEXT REFERENCES libraries (id) ON DELETE CASCADE,
+    effect       TEXT NOT NULL CHECK (effect IN ('allow', 'deny')),
+    created_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS grants_subject ON grants (subject_type, subject_id);
+-- One grant per subject, permission and library. IFNULL because SQLite counts
+-- NULLs as distinct in a unique index, which would let the global permissions
+-- (library_id IS NULL) be granted twice with opposite effects.
+CREATE UNIQUE INDEX IF NOT EXISTS grants_unique
+    ON grants (subject_type, subject_id, permission, IFNULL(library_id, ''));
+"""
+
+# Which indexed document (by sha256, from the ingest manifest -- no
+# re-embedding needed) belongs to which library, and which libraries a
+# conversation has attached for retrieval. Both cascade: deleting a library
+# drops its memberships and detaches it from every conversation.
+LIBRARIES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS library_documents (
+    library_id TEXT NOT NULL REFERENCES libraries (id) ON DELETE CASCADE,
+    doc_sha    TEXT NOT NULL,
+    added_at   REAL NOT NULL,
+    PRIMARY KEY (library_id, doc_sha)
+);
+CREATE INDEX IF NOT EXISTS library_documents_sha ON library_documents (doc_sha);
+
+CREATE TABLE IF NOT EXISTS conversation_libraries (
+    conversation_id TEXT NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
+    library_id      TEXT NOT NULL REFERENCES libraries (id) ON DELETE CASCADE,
+    PRIMARY KEY (conversation_id, library_id)
+);
+"""
+
+# Schema changes since version 1, applied in order to an existing database.
+# The CREATE TABLE above covers a fresh one; this covers yours.
+MIGRATIONS: dict[int, str] = {
+    2: """
+    CREATE TABLE IF NOT EXISTS uploads (
+        id          TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        filename    TEXT NOT NULL,
+        bytes       INTEGER NOT NULL,
+        created_at  REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS uploads_user ON uploads (user_id, created_at DESC);
+    """,
+    3: ACCOUNTS_SCHEMA,
+    4: LIBRARIES_SCHEMA,
+}
+
+# A fresh database gets everything in one go.
+SCHEMA += ACCOUNTS_SCHEMA + LIBRARIES_SCHEMA
 
 
 class NotFound(Exception):
@@ -80,7 +187,13 @@ class ChatDB:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as db:
             db.execute("PRAGMA journal_mode=WAL")  # readers don't block the writer
+            was = db.execute("PRAGMA user_version").fetchone()[0]
             db.executescript(SCHEMA)
+            # An empty database is at the current version once SCHEMA has run;
+            # an older one gets each migration above its version, in order.
+            if was:
+                for version in sorted(v for v in MIGRATIONS if v > was):
+                    db.executescript(MIGRATIONS[version])
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
@@ -102,7 +215,8 @@ class ChatDB:
 
     # ------------------------------------------------------- conversations --
 
-    def create_conversation(self, preset: str, title: str | None = None, user_id: str = LOCAL_USER) -> dict:
+    def create_conversation(self, preset: str, title: str | None = None, *, user_id: str,
+                            library_ids: list[str] | None = None) -> dict:
         now = time.time()
         conv = {"id": uuid.uuid4().hex, "title": title, "preset": preset, "created_at": now, "updated_at": now}
         with self._conn() as db:
@@ -110,9 +224,13 @@ class ChatDB:
                 "INSERT INTO conversations (id, user_id, title, preset, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (conv["id"], user_id, title, preset, now, now),
             )
+            if library_ids:
+                db.executemany("INSERT INTO conversation_libraries (conversation_id, library_id) VALUES (?, ?)",
+                               [(conv["id"], lib_id) for lib_id in library_ids])
+        conv["library_ids"] = library_ids or []
         return conv
 
-    def list_conversations(self, user_id: str = LOCAL_USER) -> list[dict]:
+    def list_conversations(self, user_id: str) -> list[dict]:
         with self._conn() as db:
             rows = db.execute(
                 """SELECT c.id, c.title, c.preset, c.created_at, c.updated_at, COUNT(m.id) AS message_count
@@ -120,9 +238,17 @@ class ChatDB:
                    WHERE c.user_id = ? GROUP BY c.id ORDER BY c.updated_at DESC""",
                 (user_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+            # A second, un-joined query rather than a second join: joining
+            # conversation_libraries alongside messages would multiply rows
+            # and throw off message_count's GROUP BY.
+            libs: dict[str, list[str]] = {}
+            for r in db.execute(
+                """SELECT cl.conversation_id, cl.library_id FROM conversation_libraries cl
+                   JOIN conversations c ON c.id = cl.conversation_id WHERE c.user_id = ?""", (user_id,)):
+                libs.setdefault(r["conversation_id"], []).append(r["library_id"])
+        return [{**dict(r), "library_ids": libs.get(r["id"], [])} for r in rows]
 
-    def get_conversation(self, conv_id: str, user_id: str = LOCAL_USER, with_messages: bool = True) -> dict:
+    def get_conversation(self, conv_id: str, user_id: str, with_messages: bool = True) -> dict:
         with self._conn() as db:
             row = db.execute(
                 "SELECT id, title, preset, created_at, updated_at FROM conversations WHERE id = ? AND user_id = ?",
@@ -131,6 +257,8 @@ class ChatDB:
             if row is None:
                 raise NotFound(conv_id)
             conv = dict(row)
+            conv["library_ids"] = [r["library_id"] for r in db.execute(
+                "SELECT library_id FROM conversation_libraries WHERE conversation_id = ?", (conv_id,))]
             if not with_messages:
                 return conv
             messages = [self._message_dict(r) for r in db.execute(
@@ -147,23 +275,27 @@ class ChatDB:
         return conv
 
     def update_conversation(self, conv_id: str, *, title: str | None = None, preset: str | None = None,
-                            user_id: str = LOCAL_USER) -> dict:
+                            library_ids: list[str] | None = None, user_id: str) -> dict:
         self.get_conversation(conv_id, user_id, with_messages=False)  # raises NotFound
         with self._conn() as db:
             if title is not None:
                 db.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conv_id))
             if preset is not None:
                 db.execute("UPDATE conversations SET preset = ? WHERE id = ?", (preset, conv_id))
+            if library_ids is not None:
+                db.execute("DELETE FROM conversation_libraries WHERE conversation_id = ?", (conv_id,))
+                db.executemany("INSERT INTO conversation_libraries (conversation_id, library_id) VALUES (?, ?)",
+                               [(conv_id, lib_id) for lib_id in library_ids])
         return self.get_conversation(conv_id, user_id, with_messages=False)
 
-    def delete_conversation(self, conv_id: str, user_id: str = LOCAL_USER) -> None:
+    def delete_conversation(self, conv_id: str, user_id: str) -> None:
         with self._conn() as db:
             if db.execute("DELETE FROM conversations WHERE id = ? AND user_id = ?", (conv_id, user_id)).rowcount == 0:
                 raise NotFound(conv_id)
 
     # ------------------------------------------------------------ messages --
 
-    def history(self, conv_id: str, user_id: str = LOCAL_USER) -> list[dict]:
+    def history(self, conv_id: str, user_id: str) -> list[dict]:
         """The conversation as chat messages, for the model. Failed
         answers are left out; so are their questions."""
         with self._conn() as db:
@@ -184,7 +316,7 @@ class ChatDB:
             out.pop()
         return out
 
-    def add_user_message(self, conv_id: str, content: str, user_id: str = LOCAL_USER) -> dict:
+    def add_user_message(self, conv_id: str, content: str, user_id: str) -> dict:
         now = time.time()
         msg = {"id": uuid.uuid4().hex, "role": "user", "content": content, "created_at": now}
         with self._conn() as db:
@@ -198,7 +330,7 @@ class ChatDB:
     def add_assistant_message(self, conv_id: str, *, content: str, model: str, preset: str, search_queries: list[str],
                               sources: list[dict], cited: set[int], status: str = "complete",
                               error: str | None = None, stats: dict | None = None,
-                              user_id: str = LOCAL_USER) -> dict:
+                              user_id: str) -> dict:
         now = time.time()
         msg_id = uuid.uuid4().hex
         with self._conn() as db:
@@ -219,6 +351,24 @@ class ChatDB:
             )
             db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conv_id))
         return {"id": msg_id, "created_at": now}
+
+    # ------------------------------------------------------------- uploads --
+
+    def record_upload(self, filename: str, size: int, user_id: str) -> None:
+        with self._conn() as db:
+            db.execute("INSERT INTO uploads (id, user_id, filename, bytes, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (uuid.uuid4().hex, user_id, filename, size, time.time()))
+
+    def upload_usage(self, window_seconds: float, user_id: str) -> tuple[int, int]:
+        """How many files this user uploaded within the window, and their total
+        size. Ingest quotas are counted here rather than from the manifest,
+        which has no user and drops nothing when a file fails to convert."""
+        with self._conn() as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS files, COALESCE(SUM(bytes), 0) AS total FROM uploads "
+                "WHERE user_id = ? AND created_at >= ?",
+                (user_id, time.time() - window_seconds)).fetchone()
+        return row["files"], row["total"]
 
     # ------------------------------------------------------------- helpers --
 

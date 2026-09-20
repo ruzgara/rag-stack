@@ -382,6 +382,12 @@ cmd_embed() {
     (cd "$REPO_ROOT/services/embed" && uv run --python 3.12 embed.py "$@")
 }
 
+# ------------------------------------------------------------------- user --
+cmd_user() {
+    load_env
+    (cd "$REPO_ROOT/services/query" && uv run --python 3.12 usercli.py "$@")
+}
+
 # ----------------------------------------------------------------- search --
 cmd_search() {
     load_env
@@ -431,7 +437,7 @@ cmd_health() {
 cmd_clean() {
     load_env
     if [[ "${1:-}" != "--yes" ]]; then
-        die "This deletes data/{inbox,work,processed,failed,markdown,docling,manifest.jsonl}, the Qdrant collection and all chat history. Re-run as: ragctl clean --yes"
+        die "This deletes data/{inbox,work,processed,failed,markdown,docling,manifest.jsonl}, the Qdrant collection, all chat history and all accounts (users, groups, grants). Re-run as: ragctl clean --yes"
     fi
 
     echo "== Local ingest data =="
@@ -454,8 +460,12 @@ cmd_clean() {
     if [[ -f "$DATA_DIR/chat.db" ]]; then
         # Delete rows rather than the file: a running query service keeps
         # using it, and would otherwise recreate it without its tables.
-        sqlite3 "$DATA_DIR/chat.db" "PRAGMA foreign_keys=ON; DELETE FROM conversations;" \
-            && ok "Deleted all conversations" || warn "Could not clear data/chat.db"
+        # Everything goes, including accounts -- this is a full reset. The
+        # next login has to be `ragctl user add ... --admin` again.
+        sqlite3 "$DATA_DIR/chat.db" \
+            "PRAGMA foreign_keys=ON; DELETE FROM conversations; DELETE FROM uploads; DELETE FROM grants; DELETE FROM group_members; DELETE FROM groups; DELETE FROM libraries; DELETE FROM users;" \
+            && ok "Deleted all conversations, uploads, users, groups and grants" \
+            || warn "Could not clear data/chat.db"
     else
         info "No chat history yet"
     fi
@@ -509,6 +519,9 @@ Usage: ./ragctl <command> [args]
   embed [--recreate] [--show-chunks [--doc SHA] [--full]]
                          Chunk, embed and index converted docs into Qdrant
                          (--show-chunks prints the chunking without embedding)
+  user <add|list|passwd|disable|admin|delete|group|member|grant|revoke|permissions>
+                         Accounts, groups and permissions. Create the first
+                         admin with: ragctl user add you@example.com --admin
   search "question" [--fused] [--json] [-v]
                          Hybrid search + GPU reranking over the index
                          (settings: RAG_* and RERANKER_* in .env)
@@ -532,6 +545,7 @@ main() {
             case "${1:-}" in check) cmd_models_check ;; *) die "Usage: ragctl models check" ;; esac ;;
         ingest) cmd_ingest "$@" ;;
         embed) cmd_embed "$@" ;;
+        user) cmd_user "$@" ;;
         search) cmd_search "$@" ;;
         health) cmd_health "$@" ;;
         clean) cmd_clean "$@" ;;

@@ -18,13 +18,30 @@ import uuid
 from typing import Any, Iterator
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from accounts import User
 from chat import ChatError, TurnResult
+from limits import Busy
 
 router = APIRouter(prefix="/v1")
+
+
+def _current_user(request: Request) -> User:
+    """The same identity check as the native API: a session cookie, or the
+    QUERY_API_KEY service account. Deferred imports keep api.py's import of
+    this module from turning circular."""
+    from api import current_user
+
+    return current_user(request)
+
+
+def _chat_user(request: Request) -> User:
+    from api import requires
+
+    return requires("chat.use")(_current_user(request))
 
 # Options with no meaning here; a client sending them would silently get
 # something other than what it asked for, so they're rejected.
@@ -62,7 +79,7 @@ def sources_footer(result: TurnResult) -> str:
 
 
 @router.get("/models")
-def models() -> dict:
+def models(user: "User" = Depends(_current_user)) -> dict:
     from api import state
 
     now = int(time.time())
@@ -72,7 +89,7 @@ def models() -> dict:
 
 
 @router.post("/chat/completions")
-def chat_completions(body: ChatCompletionRequest):
+def chat_completions(body: ChatCompletionRequest, user: "User" = Depends(_chat_user)):
     from api import state
 
     extras = body.model_extra or {}
@@ -102,7 +119,10 @@ def chat_completions(body: ChatCompletionRequest):
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
-    turn = state.chat.run_turn(question, history, preset, extra_system=extra_system)
+    # Stateless here -- there's no conversation to attach libraries to -- so
+    # every library the caller can read applies, same as a fresh /api chat.
+    doc_shas = state.accounts.document_scope(user.id)
+    turn = state.chat.run_turn(question, history, preset, extra_system=extra_system, doc_shas=doc_shas)
 
     def usage(r: TurnResult) -> dict:
         p, c = r.stats.get("prompt_tokens", 0), r.stats.get("completion_tokens", 0)
@@ -110,7 +130,12 @@ def chat_completions(body: ChatCompletionRequest):
 
     if not body.stream:
         try:
-            result = next(ev["result"] for ev in turn if ev["type"] == "done")
+            # Same queue as /api/conversations: this endpoint is another way in
+            # to the one GPU, not a way around its limits.
+            with state.gate.admit(user.id):
+                result = next(ev["result"] for ev in turn if ev["type"] == "done")
+        except Busy as exc:
+            return error(503, str(exc), "server_busy")
         except (ChatError, httpx.HTTPError, RuntimeError) as exc:
             return error(502, str(exc), "upstream_error")
         return {
@@ -128,15 +153,18 @@ def chat_completions(body: ChatCompletionRequest):
     def stream() -> Iterator[str]:
         yield chunk({"role": "assistant", "content": ""})
         try:
-            for ev in turn:
-                if ev["type"] == "token":
-                    yield chunk({"content": ev["text"]})
-                elif ev["type"] == "done":
-                    result = ev["result"]
-                    footer = sources_footer(result)
-                    if footer:
-                        yield chunk({"content": footer})
-                    yield chunk({}, "stop", usage=usage(result))
+            with state.gate.admit(user.id):
+                for ev in turn:
+                    if ev["type"] == "token":
+                        yield chunk({"content": ev["text"]})
+                    elif ev["type"] == "done":
+                        result = ev["result"]
+                        footer = sources_footer(result)
+                        if footer:
+                            yield chunk({"content": footer})
+                        yield chunk({}, "stop", usage=usage(result))
+        except Busy as exc:
+            yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'server_busy'}})}\n\n"
         except (ChatError, httpx.HTTPError, RuntimeError) as exc:
             yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'upstream_error'}})}\n\n"
         yield "data: [DONE]\n\n"

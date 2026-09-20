@@ -250,11 +250,20 @@ class Retriever:
         # Weighted RRF: score = sum over retrievers of weight / (k + rank).
         return {"rrf": {"k": self.cfg.rrf_k, "weights": [self.cfg.dense_weight, self.cfg.bm25_weight]}}
 
-    def build_query(self, question: str, vector: list[float] | None, mode: str | None = None, limit: int | None = None) -> dict:
+    def build_query(self, question: str, vector: list[float] | None, mode: str | None = None, limit: int | None = None,
+                    doc_shas: set[str] | None = None) -> dict:
         mode = mode or self.cfg.mode
         limit = limit or self.cfg.top_k
+        # A library scope has to sit on each retriever's own sub-query, not
+        # only at the top level: with prefetch + fusion, a top-level filter is
+        # applied after fusion, so an unfiltered prefetch would draw its
+        # candidates from the whole corpus and mostly discard them -- a
+        # scoped search would silently come back thin, sometimes empty.
+        doc_filter = {"must": [{"key": "doc_sha", "match": {"any": sorted(doc_shas)}}]} if doc_shas is not None else None
         dense = {"query": vector, "using": "dense"}
         bm25 = {"query": {"text": question, "model": "qdrant/bm25"}, "using": "bm25"}
+        if doc_filter is not None:
+            dense["filter"] = bm25["filter"] = doc_filter
         common = {"limit": limit, "with_payload": True}
         if mode == "dense":
             return {**dense, **common}
@@ -268,16 +277,20 @@ class Retriever:
 
     # --------------------------------------------------------------- search --
 
-    def search(self, question: str, mode: str | None = None, limit: int | None = None) -> list[Hit]:
-        """Top chunks for a question. `mode` and `limit` default to .env."""
+    def search(self, question: str, mode: str | None = None, limit: int | None = None,
+              doc_shas: set[str] | None = None) -> list[Hit]:
+        """Top chunks for a question. `mode` and `limit` default to .env.
+        `doc_shas` restricts results to those documents (an empty set matches
+        nothing, distinct from None which means unrestricted) -- how a
+        library's read permission reaches the index without re-embedding."""
         question = question.strip()
-        if not question:
+        if not question or doc_shas is not None and not doc_shas:
             return []
         self._check_index()
         mode = mode or self.cfg.mode
         vector = None if mode == "bm25" else self.embed_query(question)
         points = self._qdrant("POST", f"/collections/{self.cfg.collection}/points/query",
-                              self.build_query(question, vector, mode, limit))["points"]
+                              self.build_query(question, vector, mode, limit, doc_shas))["points"]
         return [
             Hit(
                 rank=rank,
@@ -307,16 +320,18 @@ class Retriever:
                 self._reranker = Reranker(RerankConfig.from_env())
         return self._reranker
 
-    def retrieve(self, question: str, limit: int | None = None, exclude: set[str] | None = None) -> list[Hit]:
+    def retrieve(self, question: str, limit: int | None = None, exclude: set[str] | None = None,
+                 doc_shas: set[str] | None = None) -> list[Hit]:
         """The final results for a question: hybrid search, reranked and
         thresholded when RAG_RERANK=true, grouped into whole sections when
         RAG_EXPAND_SECTIONS=true, then at most `limit` (default
         RAG_TOP_K_RERANKER), best first. Chunks whose point_id is in
         `exclude` are skipped, so asking again with the same question
-        returns the next-best unseen ones."""
+        returns the next-best unseen ones. `doc_shas` is the library scope,
+        see search()."""
         limit = limit or self.cfg.top_k_reranker
         exclude = exclude or set()
-        hits = [h for h in self.search(question) if h.point_id not in exclude]
+        hits = [h for h in self.search(question, doc_shas=doc_shas) if h.point_id not in exclude]
         if self.cfg.rerank and hits:
             # Score the text as it was indexed (heading path + chunk), so the
             # reranker sees the same context the retrievers did.
@@ -337,7 +352,11 @@ class Retriever:
 
     def _section_chunks(self, doc_sha: str, prefix: tuple[str, ...]) -> list[dict] | None:
         """Every chunk of a document whose heading path starts with prefix,
-        in document order; None if there are too many to be worth fetching."""
+        in document order; None if there are too many to be worth fetching.
+        Takes no library scope of its own: `doc_sha` always comes from a hit
+        that already passed one, and a library's membership is per document
+        (see accounts.document_scope), so every chunk of an allowed doc_sha
+        is itself allowed -- there's no narrower thing to filter out."""
         body = {
             "filter": {"must": [
                 {"key": "doc_sha", "match": {"value": doc_sha}},

@@ -92,6 +92,28 @@ def test_documents_come_from_the_index_biggest_first(lib):
     assert docs[0].sections == ["PROJECT FINANCE", "Chapter 7 Finance Documents"]
 
 
+def test_doc_shas_scopes_the_facet_request(lib, monkeypatch):
+    seen = {}
+    built = lib()
+    real = built.retriever._qdrant
+    monkeypatch.setattr(built.retriever, "_qdrant",
+                        lambda method, path, body=None: (seen.update(body=body), real(method, path, body))[1])
+
+    built.chunk_counts({GUIDE})
+
+    assert seen["body"]["filter"] == {"must": [{"key": "doc_sha", "match": {"any": [GUIDE]}}]}
+
+
+def test_an_empty_doc_shas_set_skips_the_request_entirely(lib):
+    made = lib(fail=True)  # any request would raise
+    assert made.chunk_counts(set()) == {}
+    assert made.documents(doc_shas=set()) == []
+
+
+def test_doc_shas_none_is_unrestricted(lib):
+    assert [d.sha256 for d in lib().documents(doc_shas=None)] == [GUIDE, BASEL]
+
+
 def test_documents_no_longer_in_the_index_are_left_out(lib):
     # Qdrant's facet can still list a document whose points were replaced.
     docs = lib([{"value": GUIDE, "count": 352}, {"value": GONE, "count": 0}]).documents()

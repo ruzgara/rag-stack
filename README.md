@@ -15,8 +15,12 @@ documents are OCR'd and parsed, chunked along Docling's document structure,
 embedded with Ollama and written to Qdrant with both dense and BM25 vectors,
 **retrieval** over them works (hybrid search plus GPU reranking), and a
 **query service** answers questions from them with citations over an HTTP
-API, storing chat history — natively and OpenAI-compatibly. There is still
-**no chat UI** and no user accounts; the API is what a UI will talk to.
+API, storing chat history — natively and OpenAI-compatibly. It has
+**accounts**: users with passwords, groups, and permissions as grants, all
+managed from `ragctl user` until an admin page exists. Several sessions can
+use it at once, with turns queueing for the GPU. There is still **no chat
+UI** — the API is what one will talk to — and documents are still one shared
+corpus, not yet filtered per library.
 
 **You provide the models.** What's wired up and pinned to specific
 versions: OCR, document parsing, the Ollama-backed VLM OCR fallback, and
@@ -44,9 +48,11 @@ the embedding/indexing pipeline.
             └──────────────────────────────────────────────────┘
                     ▲
    query/ (native, :8088): HTTP API (native + OpenAI-compatible)
+          sign in (session cookie) → permission check → admission queue
           question → [rewrite] → hybrid search → rerank (Apple GPU)
           → chat model via Ollama (+ optional search tool rounds)
-          → streamed answer with [n] citations; history in data/chat.db
+          → streamed answer with [n] citations
+          accounts, permissions and history all in data/chat.db
 ```
 
 | Layer | Choice | Runs where |
@@ -61,7 +67,8 @@ the embedding/indexing pipeline.
 | Reranker | bge-reranker-v2-m3 (cross-encoder) | native macOS, Apple GPU (MPS) |
 | Query service (chat + search API, history in SQLite) | FastAPI, `services/query` | native macOS, LaunchAgent |
 | Chat models | you provide (Everyday / Hard presets) | Ollama |
-| Chat UI, user accounts | not yet built | — |
+| Accounts | email + password (argon2id via `pwdlib`), signed session cookies, grant-based permissions | `services/query`, same SQLite file |
+| Chat UI | not yet built | — |
 
 Ollama and Docling run **natively** (not in Docker) so they can use Apple's
 MLX/Metal acceleration. Qdrant runs in Docker for easy, reproducible
@@ -89,10 +96,8 @@ cp .env.example .env
 ```
 
 Edit `.env`:
-- `VLM_MODEL`, `EMBED_MODEL` — exact names as they appear in `ollama list`.
-  `CHAT_MODEL_EVERYDAY` and `CHAT_MODEL_HARD` are still in `.env.example`
-  but nothing consumes them yet — they're held for the future chat
-  components.
+- `VLM_MODEL`, `EMBED_MODEL`, `CHAT_MODEL_EVERYDAY`, `CHAT_MODEL_HARD` —
+  exact names as they appear in `ollama list`.
 - `EMBED_TOKENIZER` — the HuggingFace tokenizer for your embedding model
   (`BAAI/bge-m3` for `bge-m3`), used to size chunks in tokens.
 - Leave everything else at its default unless you know you want to change it.
@@ -112,7 +117,18 @@ Then run:
 ./ragctl health
 ```
 
-to confirm every service is reachable.
+to confirm every service is reachable. Then create the account you'll use —
+nothing else works until one exists, and there is no self-registration:
+
+```bash
+./ragctl user add you@example.com --admin
+```
+
+It prompts for the password, at the terminal — piping into the prompt is
+refused, because that echoes the password and stores whatever the pipe
+delivered. To script it, `--password-stdin` reads one line deliberately. If
+you already had conversations from before accounts existed, this first admin
+adopts them.
 
 ## Using it
 
@@ -314,10 +330,10 @@ ingest and embed run automatically whenever a file lands in `data/inbox/`.
 
 `ragctl up` starts the query service (`services/query/api.py`) on
 `http://127.0.0.1:$QUERY_PORT` (default 8088). Interactive API docs are at
-`/docs`. It always binds to 127.0.0.1 — there are no user accounts yet, so
-anyone who can reach it can read every conversation. Setting
-`QUERY_API_KEY` makes every endpoint but `/api/health` require
-`Authorization: Bearer <key>`.
+`/docs`. Every endpoint but `/api/health` and `/api/auth/login` needs a
+signed-in caller (see "Accounts, groups and permissions"), and `QUERY_API_KEY`
+authenticates scripts as a service account. It still binds to 127.0.0.1: the
+accounts are real, but passwords over a LAN want TLS in front first.
 
 **Each answer:**
 1. **Rewrite** — one call to the chat model decides whether the message
@@ -355,21 +371,29 @@ answers in a few seconds but rarely searches beyond the automatic search.
 
 | Endpoint | |
 |---|---|
-| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?}`), list |
-| `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset, delete |
+| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?}`), list |
+| `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete |
 | `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error` |
-| `POST /api/search` | `{query, limit?, fused?}` → ranked chunks |
+| `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
 | `GET /api/documents` | processed documents, files waiting in the inbox, upload-ingest status |
-| `POST /api/upload` | multipart `files` → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
-| `GET /api/health` | Ollama, the Qdrant collection, the database, reranker device, presets |
+| `POST /api/upload` | multipart `files` (+ optional `library_id`) → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
+| `GET /api/quota` | what's left of your upload allowance, and how busy the machine is |
+| `GET /api/libraries` | libraries the caller can read, for attaching to a chat |
+| `POST /api/auth/login` · `POST /api/auth/logout` | `{email, password}` → sets the session cookie; clear it |
+| `GET /api/auth/me` | the caller, their groups and their effective permissions — what a UI renders itself from |
+| `POST /api/auth/password` | `{current_password, new_password}`, which signs your other sessions out |
+| `/api/admin/users` · `/api/admin/groups` · `/api/admin/grants` | users, groups, memberships and grants (needs `users.manage`); what the admin page will call |
+| `/api/admin/libraries` · `/api/admin/documents` | create/list/delete libraries, list every indexed document, and `PUT`/`DELETE .../libraries/{id}/documents/{sha}` to assign one (needs `libraries.manage`) |
+| `GET /api/health` | Ollama, the Qdrant collection, the database, reranker device, presets, current load |
 
 History is stored in `data/chat.db` (SQLite): the UI sends only the new
 message, and the service loads earlier turns, sending the model the most
 recent ones within `CHAT_HISTORY_MAX_TOKENS`. Each answer stores a copy of
 the passages it was given, so its citations still resolve after documents
 are re-ingested. An answer keeps generating and is stored even if the
-client disconnects; reopening the conversation shows it. Every row carries
-a `user_id` (`local` for now), ready for accounts.
+client disconnects; reopening the conversation shows it. Every row carries a
+`user_id` and every query is scoped by it, so one person's conversations are
+never visible to another.
 
 **OpenAI-compatible API** (`/v1`): `GET /v1/models` lists `everyday` and
 `hard`; `POST /v1/chat/completions` runs the same pipeline, streamed or
@@ -396,16 +420,19 @@ are rejected.
 ./ragctl logs [docling|ollama|ingest|query|qdrant]
 ./ragctl models check         # confirm .env model names exist in Ollama
 ./ragctl search "question"    # hybrid search + reranking (-v, --fused, --json)
+./ragctl user list            # accounts, groups and permissions (see below)
 ./ragctl up / down / restart
 ./ragctl reload               # re-apply .env changes to running services
-./ragctl clean --yes          # wipe ingest data, outputs, the index and chat history
+./ragctl clean --yes          # wipe everything: ingest data, the index, chat history, accounts
 ```
 
 `ragctl clean --yes` wipes `data/inbox`, `work`, `processed`, `failed`,
-`markdown`, `docling` and `manifest.jsonl`, deletes the Qdrant collection
-and all conversations in `data/chat.db` — it resets everything to a clean
-slate. Model caches (`data/hf-cache`, `data/docling-artifacts`) are
-left alone since they're expensive to redownload and aren't "your data."
+`markdown`, `docling` and `manifest.jsonl`, deletes the Qdrant collection,
+and clears `data/chat.db` entirely — conversations, uploads, users, groups
+and grants. It's a full reset: after running it, sign-in needs a fresh
+`ragctl user add you@example.com --admin`. Model caches (`data/hf-cache`,
+`data/docling-artifacts`) are left alone since they're expensive to
+redownload and aren't "your data."
 For a full teardown, use `ragctl uninstall` instead.
 
 ## Moving to a bigger machine (e.g. Mac Studio)
@@ -461,10 +488,172 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
   means one page triaged as `stale-ocr` (an old invisible OCR layer under a
   scan), or the quality gate rejected the embedded text. `ingest -v` prints
   the page triage.
+- **Everything returns 401** — nobody is signed in. `POST /api/auth/login`,
+  or check that an account exists at all with `ragctl user list`.
+- **A 403 saying someone "doesn't have chat.use"** — the account exists but
+  has no permissions. `ragctl user grant them@example.com chat.use`, or add
+  them to a group that has it. `ragctl user list` prints what each account
+  may do, and a `deny` on the user overrides the group.
+- **Locked out after wrong passwords** — eight failures per email or address
+  lock logins for five minutes; wait, or reset the password with
+  `ragctl user passwd them@example.com`.
+- **A forgotten password** — there is no email reset: an admin sets a new one
+  with `ragctl user passwd`. That also signs that account out everywhere.
+- **Everyone was signed out at once** — `data/session.key` was deleted or
+  `QUERY_SESSION_SECRET` changed, which invalidates every cookie. Harmless;
+  people sign in again.
 - **Versions**: `compose.yaml` pins `qdrant/qdrant` to a specific tag,
   checked at the time this repo was written — that's the only image that
   currently matters for this stack. If a pull fails because the tag was
   retired, check Qdrant's release page and bump the tag in `compose.yaml`.
+
+## Accounts, groups and permissions
+
+Everyone who uses the service has an account: an email, a password, and
+permissions. There is no self-registration — an admin creates accounts, from
+the command line today and from an admin page later.
+
+```
+ragctl user add you@example.com --admin     # the first admin (prompts for a password)
+ragctl user add alice@example.com           # a colleague
+ragctl user group add Analysts
+ragctl user member add Analysts alice@example.com
+ragctl user grant Analysts chat.use         # a whole team at once
+ragctl user grant alice@example.com chat.use --deny   # ...except Alice
+ragctl user passwd alice@example.com         # reset a password (signs them out)
+ragctl user list                            # who exists, and what they may do
+ragctl user permissions                     # what the names mean
+```
+
+**Permissions are grants, not roles.** One row says a *subject* — a user or a
+group — is allowed or refused a permission, optionally on one library rather
+than globally. Resolving them for a user goes in a fixed order:
+
+```
+is_admin            -> everything
+the user's own grant -> a deny beats an allow
+any of its groups'   -> a deny beats an allow
+nothing              -> refused
+```
+
+So a group hands a permission to a team, and one person can be lifted out of
+it — or into it — without touching the group. Note that *revoking* a grant is
+not the same as *denying* it: revoking falls back to what the groups say,
+denying overrules them.
+
+The permissions are `users.manage`, `libraries.manage` and `chat.use`
+(global), plus `library.read` and `library.write` per library. A grant naming
+anything else is refused, so a typo can't become a permission nobody notices.
+
+**Signing in.** `POST /api/auth/login` sets a signed, httpOnly session cookie;
+`GET /api/auth/me` returns the caller and their effective permissions, which
+is what a UI needs to decide what to render. Passwords are hashed with argon2id
+by `pwdlib`, and the cookie is signed by Starlette's session middleware — no
+scheme is invented here. There is no session table: the cookie carries the user
+id and a `session_epoch`, both checked against the row on every request, so
+disabling a user or changing a password takes effect at once. `QUERY_API_KEY`
+still works for scripts and the OpenAI-compatible endpoint, as a service
+account with its own row and its own grants rather than a way past them.
+
+**SSO later.** Identity arrives through one seam, so `QUERY_AUTH_MODE=proxy`
+switches the service to trusting an authenticating reverse proxy's header
+(`tailscale serve`, `oauth2-proxy`) instead of passwords, without touching
+permissions or storage. That is only sound when the service can be reached
+*only* through that proxy — otherwise anyone on the network can name themselves
+in a header — so the header is ignored entirely in password mode.
+
+**Upgrading an existing install.** `chat.db` migrates itself. Rows written
+before accounts existed are adopted by the first admin you create, so old
+conversations stay where you can see them.
+
+## Libraries
+
+A library is a named collection of documents. `library.read` and
+`library.write` are granted per library, same as any other permission, and a
+conversation chooses which libraries to search by attaching one or more of
+the ones it can read.
+
+```
+ragctl user library add "Project finance"        # name, optionally --description
+ragctl user library documents                     # every indexed document and its sha256
+ragctl user library add-doc "Project finance" infra-finance.pdf   # filename match, or a full sha256
+ragctl user library remove-doc "Project finance" infra-finance.pdf
+ragctl user library list
+ragctl user library delete "Project finance"      # grants and chat attachments on it go too
+ragctl user grant alice@example.com library.read --library <id>
+```
+
+The admin API mirrors this (`GET/POST /api/admin/libraries`,
+`DELETE /api/admin/libraries/{id}`, `PUT/DELETE
+/api/admin/libraries/{id}/documents/{sha}`, `GET /api/admin/documents`), and
+`GET /api/libraries` lists the libraries the caller can read, for a UI to
+offer when starting or editing a chat (`POST/PATCH /api/conversations`
+take `library_ids`).
+
+**No re-embedding.** The document → library mapping lives in SQLite; Qdrant
+is filtered on `doc_sha`, which every point already carries. Assigning a
+document to a library at `/api/upload` time (its `library_id` field, needing
+`library.write`) works before ingest has even run: the sha is computed from
+the uploaded bytes right there, identically to how ingest will hash the same
+file, so the mapping is already in place once embedding makes the document
+searchable.
+
+**What a search actually sees**, resolved fresh on every question rather than
+trusted from when a conversation attached its libraries — revoking
+`library.read` takes effect on the next question, not the next attach:
+
+- An **admin** searches everything, always. A document not in any library is
+  reachable only by an admin — assigning it is what makes it reachable by
+  anyone else, so a fresh install with unassigned documents isn't silently
+  wide open.
+- A **conversation with libraries attached** searches the intersection of
+  those and the ones the asker can currently read.
+- A **conversation with nothing attached** (the default for a new chat, and
+  for `/api/search` and the OpenAI-compatible endpoint, which have no
+  conversation to attach to) searches every library the asker can read, so a
+  fresh chat isn't silently mute until someone picks something.
+- Someone who can read **no** library gets no results, not an unfiltered
+  search — an empty selection and no selection are different states.
+
+## Several sessions at once
+
+The backend assumes more than one session at a time:
+
+- **Turns queue.** The bottleneck is the GPU, not the web server: the reranker
+  is one model behind a lock and Ollama holds one set of weights, so answering
+  ten questions at once only makes all ten slow. `QUERY_MAX_CONCURRENT` turns
+  run, `QUERY_MAX_PER_USER` of them per user, and the rest wait in line and
+  receive a `queued` event with their position. Past `QUERY_MAX_QUEUED` waiting
+  turns, or `QUERY_QUEUE_WAIT` seconds of waiting, the turn is refused rather
+  than left hanging. `/api/search` and the OpenAI-compatible endpoint queue in
+  the same line — they reach the same GPU.
+- **`QUERY_MAX_PER_USER` is per account**, so one person can't fill the
+  machine while colleagues wait.
+- **One turn per conversation.** Two sends to the same conversation are
+  serialised, and the question is stored once its turn is admitted, not when
+  the request arrives, so two tabs can't read each other's half-written
+  history.
+- **Ingest quotas.** Converting a document is the most expensive thing here,
+  so `/api/upload` is capped per user over a rolling window
+  (`INGEST_MAX_FILE_MB`, `INGEST_MAX_FILES_PER_WINDOW`,
+  `INGEST_MAX_MB_PER_WINDOW`, `INGEST_QUOTA_WINDOW_HOURS`). A file that
+  doesn't fit is rejected by name with the reason and the rest still go
+  through; `GET /api/quota` says what's left. **Admins have no quota at all**
+  — not the window and not the per-file cap — since filling the library is
+  their job; their uploads are still recorded, so who added what stays known.
+  Files copied into `data/inbox` by hand aren't counted either: the quota is
+  on the API, not on you.
+- **Uploads don't collide.** The inbox name is claimed with a hard link, which
+  fails rather than overwriting, so two sessions uploading `report.pdf` at the
+  same moment get `report.pdf` and `report (1).pdf`.
+- **SQLite is fine for this.** WAL is on, every row already carries a
+  `user_id`, and `chat.db` migrates itself forward (`PRAGMA user_version`).
+  Postgres becomes necessary when a second process writes — in practice, the
+  day you run uvicorn with more than one worker.
+
+What's deliberately *not* here yet: an admin UI and TLS. Bind to the LAN only
+behind a TLS terminator, and set `QUERY_HTTPS_ONLY=true` so the session cookie
+never crosses plain http.
 
 ## Tests
 
@@ -485,7 +674,11 @@ Times-Italic…), so style measurement runs on real renders. Covered: heading
 levels and cleanup, page triage, the ingest pipeline around docling, sibling
 chunk merging, embed retries, section expansion and thresholds in
 retrieval, the chat pipeline (rewrite, source budget, tool rounds,
-citations), chat history storage, and the OpenAI adapter's helpers.
+citations), chat history storage, the OpenAI adapter's helpers, the
+knowledge-base listing tool, the admission queue and ingest quotas, and
+accounts — permission precedence between users and groups, session
+lifecycle, login throttling, and that a proxy identity header is ignored
+unless the service is in proxy mode.
 
 **The OCR route end to end** is covered by the tests marked `integration` in
 `services/ingest/tests/test_ocr_integration.py`. They convert one real
@@ -507,3 +700,20 @@ them out with `-m "not integration"`.
   books (pixel height is a noisy stand-in for font size, and it has no
   notion of ALL CAPS), and it needs docling's in-process result, which
   docling-serve doesn't return.
+
+**Next, roughly in order:**
+
+- **The UI** (`ui/`, Svelte + Vite, built to static files this service
+  serves at `/`), replacing `static/test-ui.html`: sign-in, conversations,
+  citations beside the answer, library management, and an admin page for the
+  `/api/admin/*` endpoints.
+- **TLS and a LAN binding**, so a team can reach it: Caddy or
+  `tailscale serve` in front, `QUERY_HTTPS_ONLY=true`, and optionally
+  `QUERY_AUTH_MODE=proxy` to hand sign-in to an identity provider instead of
+  storing passwords at all.
+- **Tuning the concurrency limits** on the real hardware —
+  `QUERY_MAX_CONCURRENT` and `QUERY_MAX_PER_USER` were set conservatively on
+  a laptop-class machine.
+- **Postgres**, on the day the query service runs more than one worker
+  process. Until then SQLite in WAL mode is the right answer, and every query
+  is already scoped by `user_id`.

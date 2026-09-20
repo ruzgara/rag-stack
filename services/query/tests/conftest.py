@@ -132,7 +132,7 @@ class FakeLibrary:
         self.text, self.error = text, error
         self.calls: list[str | None] = []
 
-    def describe(self, name: str | None = None) -> str:
+    def describe(self, name: str | None = None, doc_shas: set[str] | None = None) -> str:
         self.calls.append(name)
         if self.error:
             raise self.error
@@ -146,7 +146,8 @@ class FakeRetriever:
         self.results = results
         self.calls: list[dict] = []
 
-    def retrieve(self, question: str, limit: int | None = None, exclude: set[str] | None = None) -> list[Hit]:
-        self.calls.append({"question": question, "limit": limit, "exclude": set(exclude or ())})
+    def retrieve(self, question: str, limit: int | None = None, exclude: set[str] | None = None,
+                doc_shas: set[str] | None = None) -> list[Hit]:
+        self.calls.append({"question": question, "limit": limit, "exclude": set(exclude or ()), "doc_shas": doc_shas})
         hits = [h for h in self.results.get(question, []) if not (set(h.ids) & set(exclude or ()))]
         return hits[:limit] if limit else hits

@@ -88,23 +88,30 @@ class Library:
     def __init__(self, retriever):
         self.retriever = retriever
 
-    def chunk_counts(self) -> dict[str, int]:
-        """Passages per document, straight from the index."""
+    def chunk_counts(self, doc_shas: set[str] | None = None) -> dict[str, int]:
+        """Passages per document, straight from the index. `doc_shas`
+        restricts this to a library scope (see Retriever.search); an empty
+        set short-circuits to nothing, since faceting with an impossible
+        filter would still be a wasted round trip."""
+        if doc_shas is not None and not doc_shas:
+            return {}
         cfg = self.retriever.cfg
+        body = {"key": "doc_sha", "limit": MAX_DOCS, "exact": True}
+        if doc_shas is not None:
+            body["filter"] = {"must": [{"key": "doc_sha", "match": {"any": sorted(doc_shas)}}]}
         try:
-            result = self.retriever._qdrant(
-                "POST", f"/collections/{cfg.collection}/facet",
-                {"key": "doc_sha", "limit": MAX_DOCS, "exact": True})
+            result = self.retriever._qdrant("POST", f"/collections/{cfg.collection}/facet", body)
         except (RuntimeError, httpx.HTTPError):
             return {}
         # A document whose points were replaced can linger in the facet with
         # a count of 0; it isn't in the index any more.
         return {hit["value"]: hit["count"] for hit in result.get("hits", []) if hit["count"] > 0}
 
-    def documents(self, sections: int = MAX_SECTIONS) -> list[Document]:
-        """Indexed documents, largest first."""
+    def documents(self, sections: int = MAX_SECTIONS, doc_shas: set[str] | None = None) -> list[Document]:
+        """Indexed documents, largest first. `doc_shas` is a library scope --
+        see chunk_counts."""
         rows = manifest_documents()
-        counts = self.chunk_counts()
+        counts = self.chunk_counts(doc_shas)
         docs = []
         for sha, count in counts.items():
             rec = rows.get(sha, {})
@@ -115,12 +122,15 @@ class Library:
         docs.sort(key=lambda d: -d.chunks)
         return docs[:MAX_DOCS]
 
-    def describe(self, name: str | None = None) -> str:
+    def describe(self, name: str | None = None, doc_shas: set[str] | None = None) -> str:
         """The document list as the model sees it; with `name`, one
-        document's sections in full."""
+        document's sections in full. `doc_shas` is a library scope -- see
+        chunk_counts; without it, callers must not pass a non-admin user's
+        request through unscoped, or they'd learn about documents outside
+        every library they can read."""
         if name:
             wanted = name.strip().lower()
-            matches = [d for d in self.documents(MAX_SECTIONS_ONE)
+            matches = [d for d in self.documents(MAX_SECTIONS_ONE, doc_shas)
                        if wanted in d.filename.lower() or wanted in d.sha256]
             if not matches:
                 return (f"No document in the knowledge base matches {name!r}. "
@@ -131,7 +141,7 @@ class Library:
                 lines.append("Sections: " + ("; ".join(doc.sections) if doc.sections else "(none detected)"))
             return "\n".join(lines)
 
-        docs = self.documents()
+        docs = self.documents(doc_shas=doc_shas)
         if not docs:
             return "The knowledge base is empty: no documents have been indexed yet."
         total = sum(d.chunks for d in docs)

@@ -113,7 +113,7 @@ def test_section_lookup_filters_by_document_and_heading(search_cfg):
 
 def ranked_retriever(cfg, hits, scores):
     r, _ = retriever(cfg)
-    r.search = lambda question, mode=None, limit=None: [h for h in hits]
+    r.search = lambda question, mode=None, limit=None, doc_shas=None: [h for h in hits]
     r._reranker = FakeReranker(scores)
     return r
 
@@ -163,6 +163,12 @@ def test_no_chunk_is_returned_twice_when_the_enclosing_section_is_too_big(search
     assert [h.ids for h in out] == [["p10", "p11", "p12", "p13", "p14"], ["p09"], ["p15"]]
     all_ids = [i for h in out for i in h.ids]
     assert len(all_ids) == len(set(all_ids))
+
+
+def test_retrieve_with_an_empty_doc_shas_set_finds_nothing(search_cfg):
+    r, qdrant = retriever(search_cfg())
+    assert r.retrieve("bond parties", doc_shas=set()) == []
+    assert qdrant.requests == []
 
 
 def test_retrieve_skips_excluded_chunks(search_cfg):
@@ -218,6 +224,41 @@ def test_single_retriever_and_dbsf_queries(search_cfg):
                                                                   "with_payload": True}
     assert r.build_query("q", None, mode="bm25")["using"] == "bm25"
     assert r.build_query("q", [0.1])["query"] == {"fusion": "dbsf"}
+
+
+def test_a_library_scope_is_applied_to_each_retriever_not_only_the_fused_query(search_cfg):
+    """With prefetch + fusion, a filter placed only at the top level would
+    apply after fusion: an unfiltered prefetch would draw its candidates
+    from the whole corpus and mostly discard them, so a scoped search would
+    silently come back thin. The filter has to sit on each sub-query."""
+    r, _ = retriever(search_cfg())
+    q = r.build_query("bond parties", [0.1, 0.2], doc_shas={"doc2", "doc1"})
+    want = {"must": [{"key": "doc_sha", "match": {"any": ["doc1", "doc2"]}}]}
+    assert q["prefetch"][0]["filter"] == want
+    assert q["prefetch"][1]["filter"] == want
+    assert "filter" not in q  # the outer query has no top-level filter of its own
+
+
+def test_a_library_scope_on_a_single_retriever_mode(search_cfg):
+    r, _ = retriever(search_cfg())
+    q = r.build_query("q", [0.1], mode="dense", doc_shas={"doc1"})
+    assert q["filter"] == {"must": [{"key": "doc_sha", "match": {"any": ["doc1"]}}]}
+
+
+def test_no_doc_shas_means_no_filter_at_all(search_cfg):
+    r, _ = retriever(search_cfg())
+    q = r.build_query("bond parties", [0.1, 0.2])
+    assert "filter" not in q["prefetch"][0]
+    assert "filter" not in q["prefetch"][1]
+
+
+def test_an_empty_doc_shas_set_matches_nothing_without_a_request(search_cfg):
+    """Distinct from None (unrestricted): a non-admin with zero readable
+    libraries must get no results, not an unfiltered search -- and without
+    even a wasted round trip to Qdrant."""
+    r, qdrant = retriever(search_cfg())
+    assert r.search("bond parties", doc_shas=set()) == []
+    assert qdrant.requests == []
 
 
 def test_an_index_built_with_another_model_is_refused(search_cfg):

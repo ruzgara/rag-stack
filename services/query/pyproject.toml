@@ -14,6 +14,11 @@ dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn>=0.32,<1",
     "python-multipart>=0.0.20,<1",
+    # Password hashing (argon2id) and signed session cookies. pwdlib is the
+    # maintained successor to passlib; itsdangerous comes with Starlette's
+    # SessionMiddleware. Neither hashing nor signing is written here.
+    "pwdlib[argon2]>=0.3,<1",
+    "itsdangerous>=2.2,<3",
 ]
 
 [tool.uv]
