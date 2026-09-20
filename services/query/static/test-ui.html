@@ -44,8 +44,12 @@
   <div class="row"><button id="new">+ New chat</button>
     <select id="preset"><option>everyday</option><option>hard</option></select></div>
   <div id="convs"></div>
+  <h3>Libraries</h3>
+  <div id="libs" class="small">Sign in to see libraries.</div>
+  <div class="row" id="libAdminRow" style="display:none"><button id="newLib">+ New library</button></div>
   <h3>Documents</h3>
-  <div class="row"><input type="file" id="file" multiple style="max-width:100%"></div>
+  <div class="row"><input type="file" id="file" multiple style="max-width:100%">
+    <select id="uploadLib"><option value="">(no library)</option></select></div>
   <div id="docs" class="small"></div>
   <h3>Account</h3>
   <div id="who" class="small"></div>
@@ -141,6 +145,8 @@ async function openConv(id) {
   convId = id;
   const c = await api(`/api/conversations/${id}`);
   $("#preset").value = c.preset;
+  convLibraryIds = c.library_ids || [];
+  renderLibraries();
   $("#log").innerHTML = "";
   let last = null;
   for (const m of c.messages) {
@@ -164,7 +170,8 @@ async function send(text) {
   busy = true;
   try {
     if (!convId) {
-      const c = await api("/api/conversations", {method: "POST", body: JSON.stringify({preset: $("#preset").value})});
+      const c = await api("/api/conversations", {method: "POST",
+        body: JSON.stringify({preset: $("#preset").value, library_ids: convLibraryIds.length ? convLibraryIds : null})});
       convId = c.id; loadConvs();
     }
     addMsg("user", text);
@@ -194,6 +201,7 @@ async function send(text) {
         else if (ev === "rewrite") log(data.search ? `rewritten: “${data.query}”` : "no search needed");
         else if (ev === "searching") log(`${data.found_by === "tool" ? "tool search" : "search"}: “${data.query}”`);
         else if (ev === "listing") log(data.document ? `looking up document: “${data.document}”` : "listing the knowledge base");
+        else if (ev === "listing_libraries") log("listing libraries");
         else if (ev === "sources") { sources.push(...data.sources); showSources(sources); }
         else if (ev === "done") {
           renderAnswer(body, data.answer, data.sources); showSources(data.sources);
@@ -223,6 +231,52 @@ async function loadDocs() {
   } catch (e) { $("#docs").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
 }
 
+// --------------------------------------------------------------- libraries --
+
+let libraries = [], convLibraryIds = [], isLibrariesAdmin = false;
+
+async function loadLibraries() {
+  try {
+    libraries = (await api("/api/libraries")).libraries;
+  } catch (e) { $("#libs").innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+  renderLibraries();
+  const sel = $("#uploadLib");
+  sel.innerHTML = `<option value="">(no library)</option>` +
+    libraries.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+}
+
+function renderLibraries() {
+  const box = $("#libs");
+  if (!libraries.length) { box.textContent = "No libraries yet."; return; }
+  box.innerHTML = libraries.map(l => `
+    <div class="row" data-lib="${l.id}">
+      <input type="checkbox" ${convLibraryIds.includes(l.id) ? "checked" : ""}>
+      <span title="${esc(l.description || "")}">${esc(l.name)} <span class="small">(${l.document_count})</span></span>
+      ${isLibrariesAdmin ? '<span class="del small" style="visibility:visible;cursor:pointer" title="Delete">✕</span>' : ""}
+    </div>`).join("");
+  box.querySelectorAll("[data-lib]").forEach(row => {
+    const id = row.dataset.lib;
+    row.querySelector("input").onchange = e => {
+      convLibraryIds = e.target.checked ? [...convLibraryIds, id] : convLibraryIds.filter(x => x !== id);
+      if (convId) api(`/api/conversations/${convId}`, {method: "PATCH", body: JSON.stringify({library_ids: convLibraryIds})}).catch(e => alert(e.message));
+    };
+    const del = row.querySelector(".del");
+    if (del) del.onclick = async () => {
+      if (!confirm(`Delete library "${libraries.find(l => l.id === id).name}"?`)) return;
+      try { await api(`/api/admin/libraries/${id}`, {method: "DELETE"}); convLibraryIds = convLibraryIds.filter(x => x !== id); loadLibraries(); }
+      catch (e) { alert(e.message); }
+    };
+  });
+}
+
+$("#newLib").onclick = async () => {
+  const name = prompt("Library name:");
+  if (!name) return;
+  const description = prompt("Description (optional):") || null;
+  try { await api("/api/admin/libraries", {method: "POST", body: JSON.stringify({name, description})}); loadLibraries(); }
+  catch (e) { alert(e.message); }
+};
+
 async function health() {
   try {
     const r = await fetch("/api/health"), h = await r.json();
@@ -232,12 +286,13 @@ async function health() {
   } catch { $("#health").innerHTML = '<span class="err">API unreachable</span>'; }
 }
 
-$("#new").onclick = () => { convId = null; $("#log").innerHTML = ""; $("#sources").textContent = ""; loadConvs(); $("#q").focus(); };
+$("#new").onclick = () => { convId = null; convLibraryIds = []; renderLibraries(); $("#log").innerHTML = ""; $("#sources").textContent = ""; loadConvs(); $("#q").focus(); };
 $("#preset").onchange = () => { if (convId) api(`/api/conversations/${convId}`, {method: "PATCH", body: JSON.stringify({preset: $("#preset").value})}).then(loadConvs); };
 $("#ask").onsubmit = e => { e.preventDefault(); const t = $("#q").value.trim(); if (t) { $("#q").value = ""; send(t); } };
 $("#q").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#ask").requestSubmit(); } };
 $("#file").onchange = async () => {
   const fd = new FormData(); for (const f of $("#file").files) fd.append("files", f);
+  if ($("#uploadLib").value) fd.append("library_id", $("#uploadLib").value);
   try {
     const r = await api("/api/upload", {method: "POST", body: fd});
     alert(`Saved: ${r.saved.join(", ") || "none"}\n${r.rejected.map(x => x.filename + ": " + x.reason).join("\n")}\nIngest: ${r.ingest}`);
@@ -254,6 +309,8 @@ async function whoami() {
       `${esc(me.user.groups.join(", ") || "no groups")}<br><span class="small">${esc(perms)}</span>`;
     $("#signin").style.display = "none";
     $("#signout").style.display = "";
+    isLibrariesAdmin = me.user.is_admin || !!me.permissions["libraries.manage"];
+    $("#libAdminRow").style.display = isLibrariesAdmin ? "" : "none";
     return me;
   } catch {
     $("#who").textContent = "Not signed in.";
@@ -280,6 +337,7 @@ $("#signout").onclick = async () => {
 async function refresh() {
   if (!await whoami()) return;   // nothing else works until someone is signed in
   loadConvs().catch(e => $("#convs").innerHTML = `<span class="err">${esc(e.message)}</span>`);
+  loadLibraries();
   loadDocs();
   health();
 }

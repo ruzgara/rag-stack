@@ -1,0 +1,703 @@
+<!doctype html>
+<!-- Admin console for the query API. Served at /admin by api.py.
+     Everything here calls /api/admin/*; the server decides what is allowed,
+     this page only decides what is worth showing. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rag-stack admin</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1b; --muted:#6b6b6b; --line:#e2e2e2; --soft:#f5f5f4; --accent:#2f5bd3; --err:#b3261e; --ok:#1a7f37; --warn:#9a6700; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#e8e8e8; --muted:#9a9a9a; --line:#2e2e2e; --soft:#202020; --accent:#7ea0ff; --err:#ff8a80; --ok:#5fd98a; --warn:#e3b341; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; gap:16px; padding:10px 20px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header b { font-size:15px; } header .sp { flex:1; }
+  nav { display:flex; gap:4px; padding:0 20px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  nav button { border:0; border-bottom:2px solid transparent; background:none; padding:8px 12px; cursor:pointer; color:var(--muted); font:inherit; }
+  nav button.on { color:var(--fg); border-bottom-color:var(--accent); font-weight:600; }
+  main { padding:20px; max-width:1100px; }
+  .panel { display:none; } .panel.on { display:block; }
+  h2 { font-size:15px; margin:0 0 4px; } h3 { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:22px 0 8px; }
+  p.hint { color:var(--muted); margin:0 0 14px; max-width:70ch; }
+  button, select, input, textarea { font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  button { cursor:pointer; } button:hover:not(:disabled) { background:var(--soft); } button:disabled { opacity:.5; cursor:default; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; } button.primary:hover:not(:disabled) { filter:brightness(1.1); background:var(--accent); }
+  button.danger { color:var(--err); border-color:var(--err); }
+  button.small { padding:2px 6px; font-size:12px; }
+  table { border-collapse:collapse; width:100%; margin-bottom:8px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); font-weight:600; }
+  td.actions { text-align:right; white-space:nowrap; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .small { font-size:12px; color:var(--muted); }
+  .tag { font-size:11px; border:1px solid var(--line); border-radius:99px; padding:1px 7px; color:var(--muted); }
+  .tag.admin { color:var(--accent); border-color:var(--accent); }
+  .tag.off { color:var(--err); border-color:var(--err); }
+  .tag.allow { color:var(--ok); border-color:var(--ok); } .tag.deny { color:var(--err); border-color:var(--err); }
+  .none { white-space:nowrap; font-size:12px; color:var(--muted); }  /* a placeholder that breaks mid-phrase reads as broken text */
+  code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; background:var(--soft); padding:1px 4px; border-radius:4px; }
+  #env { width:100%; height:60vh; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12.5px; line-height:1.5; white-space:pre; tab-size:4; resize:vertical; }
+  .bar { position:sticky; bottom:0; background:var(--bg); border-top:1px solid var(--line); padding:10px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .note { border:1px solid var(--line); border-left-width:3px; border-radius:6px; padding:8px 10px; margin:10px 0; white-space:pre-wrap; }
+  .note.err { border-left-color:var(--err); color:var(--err); }
+  .note.ok { border-left-color:var(--ok); } .note.warn { border-left-color:var(--warn); }
+  pre.log { background:var(--soft); border:1px solid var(--line); border-radius:6px; padding:10px; max-height:300px; overflow:auto; font-size:12px; margin:0; }
+  dialog { border:1px solid var(--line); border-radius:10px; background:var(--bg); color:var(--fg); padding:18px; min-width:min(420px, 92vw); }
+  dialog::backdrop { background:rgba(0,0,0,.45); }
+  dialog label { display:block; margin:10px 0 2px; font-size:12px; color:var(--muted); }
+  dialog input, dialog select { width:100%; }
+  #toast { position:fixed; right:16px; bottom:16px; max-width:min(460px,92vw); display:flex; flex-direction:column; gap:8px; z-index:10; }
+  #toast div { border:1px solid var(--line); border-left-width:3px; border-radius:6px; padding:8px 12px; background:var(--bg); box-shadow:0 4px 18px rgba(0,0,0,.12); white-space:pre-wrap; }
+  #toast div.err { border-left-color:var(--err); color:var(--err); } #toast div.ok { border-left-color:var(--ok); }
+  #gate { padding:40px 20px; max-width:340px; }
+</style>
+</head>
+<body>
+
+<div id="gate" hidden>
+  <h2>rag-stack admin</h2>
+  <p class="hint">Sign in with an admin account.</p>
+  <form id="signin">
+    <label class="small">Email</label><input id="email" type="email" autocomplete="username" required style="width:100%">
+    <label class="small" style="margin-top:8px;display:block">Password</label><input id="password" type="password" autocomplete="current-password" required style="width:100%">
+    <button class="primary" style="margin-top:12px">Sign in</button>
+  </form>
+  <div id="gateMsg" class="note err" hidden></div>
+</div>
+
+<div id="app" hidden>
+<header>
+  <b>rag-stack admin</b>
+  <span class="small" id="whoami"></span>
+  <span class="sp"></span>
+  <span class="small" id="healthLine"></span>
+  <a href="/ui" class="small">chat UI</a>
+  <button class="small" id="signout">Sign out</button>
+</header>
+<nav>
+  <button data-tab="users" class="on">Users</button>
+  <button data-tab="groups">Groups</button>
+  <button data-tab="libraries">Libraries</button>
+  <button data-tab="documents">Documents</button>
+  <button data-tab="config">Configuration</button>
+</nav>
+<main>
+
+  <section class="panel on" id="tab-users">
+    <h2>Users</h2>
+    <p class="hint">The same operations as <code>ragctl user</code>. Permissions resolve in a fixed order: an admin gets everything; otherwise the user's own grant wins over their groups', and a deny beats an allow at the same level.</p>
+    <div class="row"><button class="primary" id="newUser">+ New user</button></div>
+    <h3>Accounts</h3>
+    <table><thead><tr><th>Email</th><th>Name</th><th>Groups</th><th>Effective permissions</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
+    <h3>Permission names</h3>
+    <table><thead><tr><th>Permission</th><th>Scope</th><th>Allows</th></tr></thead><tbody id="permRows"></tbody></table>
+  </section>
+
+  <section class="panel" id="tab-groups">
+    <h2>Groups</h2>
+    <p class="hint">A group hands a permission to a team; a single user can still be lifted out of it with a grant of their own.</p>
+    <div class="row"><button class="primary" id="newGroup">+ New group</button></div>
+    <h3>Groups</h3>
+    <table><thead><tr><th>Name</th><th>Members</th><th>Grants</th><th></th></tr></thead><tbody id="groupRows"></tbody></table>
+  </section>
+
+  <section class="panel" id="tab-libraries">
+    <h2>Libraries</h2>
+    <p class="hint">A library is a named set of documents. <code>library.read</code> on one lets a user search and cite it; a user who can't read a library is never told it exists.</p>
+    <div class="row"><button class="primary" id="newLibrary">+ New library</button></div>
+    <table><thead><tr><th>Name</th><th>Description</th><th>Documents</th><th>Id</th><th></th></tr></thead><tbody id="libraryRows"></tbody></table>
+  </section>
+
+  <section class="panel" id="tab-documents">
+    <h2>Documents</h2>
+    <p class="hint">Every indexed document, and which libraries it belongs to. A document in no library is reachable only by an admin.</p>
+    <div class="row"><input id="docFilter" placeholder="filter by filename…" style="min-width:260px"></div>
+    <table><thead><tr><th>File</th><th>Pages</th><th>Chunks</th><th style="min-width:180px">In libraries</th><th></th></tr></thead><tbody id="docRows"></tbody></table>
+  </section>
+
+  <section class="panel" id="tab-config">
+    <h2>Configuration</h2>
+    <p class="hint">The repository's <code>.env</code>, as text. It is checked against the real config loaders before it is written, and the previous version is kept in <code>data/env-backups/</code>. Values are shown unmasked — secrets included — because masking could not be saved back.</p>
+    <div id="envNotes"></div>
+    <textarea id="env" spellcheck="false" autocomplete="off" wrap="off"></textarea>
+    <div class="bar">
+      <button class="primary" id="saveEnv" disabled>Save</button>
+      <button id="checkEnv">Check</button>
+      <button id="revertEnv" disabled>Discard changes</button>
+      <span class="sp" style="flex:1"></span>
+      <select id="backupPick" title="load a previous version into the editor"><option value="">Previous versions…</option></select>
+      <button id="showExample" class="small">Show .env.example</button>
+    </div>
+
+    <h3>Applying changes</h3>
+    <p class="hint">A saved file changes nothing until it is applied. Most settings are picked up by a live reload; a few can only be reached by restarting the service or the whole stack, and the buttons say which.</p>
+    <div class="row">
+      <button id="reloadNow">Live reload</button>
+      <button id="stackReload">Reload stack</button>
+      <button class="danger" id="restartNow">Restart query service</button>
+    </div>
+    <div id="applyNotes"></div>
+    <pre class="log" id="stackLog" hidden></pre>
+
+    <h3>Health</h3>
+    <div class="row"><button id="refreshHealth" class="small">Refresh</button></div>
+    <pre class="log" id="healthBox"></pre>
+  </section>
+
+</main>
+</div>
+
+<dialog id="modal"><form method="dialog" id="modalForm">
+  <b id="modalTitle"></b>
+  <div id="modalBody"></div>
+  <div class="row" style="margin-top:16px;justify-content:flex-end">
+    <button value="cancel">Cancel</button><button class="primary" value="ok" id="modalOk">OK</button>
+  </div>
+</form></dialog>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// ---------------------------------------------------------------- plumbing --
+
+async function api(path, opts = {}) {
+  const init = {...opts, headers: {"content-type": "application/json", ...(opts.headers || {})}};
+  if (init.body && typeof init.body !== "string") init.body = JSON.stringify(init.body);
+  const r = await fetch(path, init);
+  if (r.status === 401) { showGate(); throw new Error("not signed in"); }
+  if (!r.ok) {
+    let detail = await r.text();
+    try { detail = JSON.parse(detail).detail ?? detail; } catch {}
+    const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    err.status = r.status;
+    throw err;
+  }
+  return r.status === 204 ? null : r.json();
+}
+
+function toast(message, kind = "ok") {
+  const el = document.createElement("div");
+  el.className = kind;
+  el.textContent = message;
+  $("#toast").appendChild(el);
+  setTimeout(() => el.remove(), kind === "err" ? 9000 : 4000);
+}
+
+// Wraps an action so a failure is reported rather than lost to the console.
+const guard = fn => async (...args) => {
+  try { await fn(...args); } catch (e) { toast(e.message, "err"); }
+};
+
+function confirmed(question) { return window.confirm(question); }
+
+/** A small modal form. fields: [{name, label, type, value, options, required}]. */
+function ask(title, fields, okLabel = "Save") {
+  return new Promise(resolve => {
+    $("#modalTitle").textContent = title;
+    $("#modalOk").textContent = okLabel;
+    $("#modalBody").innerHTML = fields.map(f => {
+      const id = `f_${f.name}`;
+      if (f.type === "select")
+        return `<label for="${id}">${esc(f.label)}</label><select id="${id}">${
+          (f.options || []).map(o => `<option value="${esc(o.value)}"${o.value === f.value ? " selected" : ""}>${esc(o.label)}</option>`).join("")}</select>`;
+      if (f.type === "checkbox")
+        return `<label style="margin-top:10px"><input type="checkbox" id="${id}"${f.value ? " checked" : ""} style="width:auto"> ${esc(f.label)}</label>`;
+      return `<label for="${id}">${esc(f.label)}</label><input id="${id}" type="${f.type || "text"}" value="${esc(f.value ?? "")}"${
+        f.required ? " required" : ""}${f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : ""}>`;
+    }).join("");
+    const dialog = $("#modal");
+    const done = () => {
+      dialog.removeEventListener("close", done);
+      if (dialog.returnValue !== "ok") return resolve(null);
+      const out = {};
+      for (const f of fields) {
+        const el = $(`#f_${f.name}`);
+        out[f.name] = f.type === "checkbox" ? el.checked : el.value;
+      }
+      resolve(out);
+    };
+    dialog.addEventListener("close", done);
+    dialog.showModal();
+    $("#modalBody").querySelector("input, select")?.focus();
+  });
+}
+
+// ------------------------------------------------------------------- state --
+
+let me = null, cache = {users: [], groups: [], libraries: [], documents: [], permissions: {}};
+
+function showGate() {
+  $("#app").hidden = true; $("#gate").hidden = false;
+}
+
+async function boot() {
+  try {
+    me = await api("/api/auth/me");
+  } catch { return showGate(); }
+  if (!me.user.is_admin) {
+    $("#gate").hidden = false; $("#app").hidden = true;
+    $("#gateMsg").hidden = false;
+    $("#gateMsg").textContent = `${me.user.email} is signed in but is not an admin. This console needs an admin account.`;
+    return;
+  }
+  $("#gate").hidden = true; $("#app").hidden = false;
+  $("#whoami").textContent = `${me.user.email} · admin · ${me.auth_mode} auth`;
+  await Promise.all([loadAccounts(), loadDocuments(), loadEnv(), loadHealth()]);
+}
+
+$("#signin").onsubmit = guard(async e => {
+  e.preventDefault();
+  $("#gateMsg").hidden = true;
+  try {
+    await api("/api/auth/login", {method: "POST", body: {email: $("#email").value, password: $("#password").value}});
+  } catch (err) {
+    $("#gateMsg").hidden = false; $("#gateMsg").textContent = err.message; return;
+  }
+  await boot();
+});
+
+$("#signout").onclick = guard(async () => {
+  await api("/api/auth/logout", {method: "POST"});
+  location.reload();
+});
+
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".panel").forEach(p => p.classList.toggle("on", p.id === `tab-${b.dataset.tab}`));
+});
+
+// ------------------------------------------------------- users and groups --
+
+async function loadAccounts() {
+  const [users, groups, libraries] = await Promise.all([
+    api("/api/admin/users"), api("/api/admin/groups"), api("/api/admin/libraries"),
+  ]);
+  cache.users = users.users; cache.permissions = users.permissions;
+  cache.groups = groups.groups; cache.libraries = libraries.libraries;
+  // Grants are per subject, so they are fetched alongside rather than inline.
+  const subjects = [...cache.users.map(u => ["user", u.id]), ...cache.groups.map(g => ["group", g.id])];
+  const grants = await Promise.all(subjects.map(([t, id]) => api(`/api/admin/grants/${t}/${id}`)));
+  cache.grants = new Map(subjects.map(([t, id], i) => [`${t}:${id}`, grants[i].grants]));
+  renderUsers(); renderGroups(); renderLibraries(); renderPermissions();
+}
+
+const libName = id => cache.libraries.find(l => l.id === id)?.name || id;
+const grantsFor = (type, id) => cache.grants.get(`${type}:${id}`) || [];
+
+function grantTags(type, id) {
+  const grants = grantsFor(type, id);
+  if (!grants.length) return '<span class="small">none</span>';
+  return grants.map(g => `<span class="tag ${g.effect}">${esc(g.permission)}${
+    g.library_id ? " · " + esc(libName(g.library_id)) : ""}</span>`).join(" ");
+}
+
+/** What a user may actually do, as the server resolved it, with their own
+ *  grants underneath so a surprising result can be traced to the grant that
+ *  caused it -- a deny in particular, which removes a permission and so can
+ *  never show up in the resolved list. */
+function effectiveCell(u) {
+  if (u.is_admin) return '<span class="small">everything (admin)</span>';
+  if (u.disabled) return '<span class="small">nothing (disabled)</span>';
+  const effective = Object.entries(u.effective || {});
+  const resolved = effective.length
+    ? effective.map(([name, libs]) => libs.map(lib =>
+        `<span class="tag allow">${esc(name)}${lib && lib !== "None" ? " · " + esc(libName(lib)) : ""}</span>`).join(" ")).join(" ")
+    : '<span class="small">nothing yet</span>';
+  const own = grantsFor("user", u.id);
+  const ownLine = own.length
+    ? `<div class="small" style="margin-top:3px">own grants: ${own.map(g =>
+        `<span class="tag ${g.effect}">${g.effect === "deny" ? "deny " : ""}${esc(g.permission)}${
+          g.library_id ? " · " + esc(libName(g.library_id)) : ""}</span>`).join(" ")}</div>`
+    : "";
+  return resolved + ownLine;
+}
+
+function renderUsers() {
+  $("#userRows").innerHTML = cache.users.map(u => {
+    const flags = [u.is_admin ? '<span class="tag admin">admin</span>' : "",
+                   u.disabled ? '<span class="tag off">disabled</span>' : ""].join(" ");
+    const self = u.id === me.user.id;
+    return `<tr data-id="${u.id}">
+      <td>${esc(u.email)} ${flags}${self ? '<span class="small"> · you</span>' : ""}<div class="small">${esc(u.id)}</div></td>
+      <td>${esc(u.display_name || "")}</td>
+      <td class="small">${esc((u.groups || []).join(", ")) || "—"}</td>
+      <td>${effectiveCell(u)}</td>
+      <td class="actions">
+        <button class="small" data-act="edit">Edit</button>
+        <button class="small" data-act="grant">Grant</button>
+        <button class="small" data-act="passwd">Password</button>
+        <button class="small danger" data-act="delete"${self ? " disabled" : ""}>Delete</button>
+      </td></tr>`;
+  }).join("") || '<tr><td colspan="5" class="small">No users.</td></tr>';
+}
+
+function renderPermissions() {
+  $("#permRows").innerHTML = Object.entries(cache.permissions).map(([name, p]) =>
+    `<tr><td><code>${esc(name)}</code></td><td class="small">${esc(p.scope)}</td><td class="small">${esc(p.describes)}</td></tr>`).join("");
+}
+
+function renderGroups() {
+  $("#groupRows").innerHTML = cache.groups.map(g => {
+    const members = (g.members || []).map(id => cache.users.find(u => u.id === id)?.email || id);
+    return `<tr data-id="${g.id}">
+      <td>${esc(g.name)}<div class="small">${esc(g.id)}</div></td>
+      <td class="small">${esc(members.join(", ")) || "—"}</td>
+      <td>${grantTags("group", g.id)}</td>
+      <td class="actions">
+        <button class="small" data-act="members">Members</button>
+        <button class="small" data-act="grant">Grant</button>
+        <button class="small danger" data-act="delete">Delete</button>
+      </td></tr>`;
+  }).join("") || '<tr><td colspan="4" class="small">No groups.</td></tr>';
+}
+
+function renderLibraries() {
+  $("#libraryRows").innerHTML = cache.libraries.map(l =>
+    `<tr data-id="${l.id}">
+      <td>${esc(l.name)}</td><td class="small">${esc(l.description || "")}</td>
+      <td>${l.document_count}</td><td class="small"><code>${esc(l.id)}</code></td>
+      <td class="actions"><button class="small danger" data-act="delete">Delete</button></td>
+    </tr>`).join("") || '<tr><td colspan="5" class="small">No libraries.</td></tr>';
+  // The upload/grant dialogs pick from the same list.
+  for (const select of document.querySelectorAll("select.libraryPick"))
+    select.innerHTML = cache.libraries.map(l => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join("");
+}
+
+$("#newUser").onclick = guard(async () => {
+  const proxy = me.auth_mode === "proxy";
+  const form = await ask("New user", [
+    {name: "email", label: "Email", type: "email", required: true},
+    {name: "display_name", label: "Display name (optional)"},
+    {name: "password", label: proxy ? "Password (not used in proxy mode)" : "Password (at least 10 characters)", type: "password"},
+    {name: "is_admin", label: "Administrator", type: "checkbox"},
+  ], "Create");
+  if (!form) return;
+  await api("/api/admin/users", {method: "POST", body: {
+    email: form.email, display_name: form.display_name || null,
+    password: form.password || null, is_admin: form.is_admin}});
+  toast(`Created ${form.email}.`);
+  if (!form.is_admin) toast(`${form.email} has no permissions yet — grant chat.use to let them ask questions.`);
+  await loadAccounts();
+});
+
+$("#userRows").onclick = guard(async e => {
+  const button = e.target.closest("button[data-act]"); if (!button) return;
+  const id = button.closest("tr").dataset.id;
+  const user = cache.users.find(u => u.id === id);
+  if (button.dataset.act === "edit") {
+    const form = await ask(`Edit ${user.email}`, [
+      {name: "display_name", label: "Display name", value: user.display_name || ""},
+      {name: "is_admin", label: "Administrator", type: "checkbox", value: user.is_admin},
+      {name: "disabled", label: "Disabled (refuse logins, keep history)", type: "checkbox", value: user.disabled},
+    ]);
+    if (!form) return;
+    await api(`/api/admin/users/${id}`, {method: "PATCH", body: {
+      display_name: form.display_name || null, is_admin: form.is_admin, disabled: form.disabled}});
+    toast(`Updated ${user.email}.`);
+  } else if (button.dataset.act === "passwd") {
+    const form = await ask(`New password for ${user.email}`, [
+      {name: "password", label: "Password (at least 10 characters)", type: "password", required: true}], "Change");
+    if (!form?.password) return;
+    await api(`/api/admin/users/${id}`, {method: "PATCH", body: {password: form.password}});
+    toast(`Password changed; ${user.email} is signed out everywhere.`);
+  } else if (button.dataset.act === "grant") {
+    await grantDialog("user", id, user.email);
+  } else if (button.dataset.act === "delete") {
+    if (!confirmed(`Delete ${user.email}? Their conversations are kept.`)) return;
+    await api(`/api/admin/users/${id}`, {method: "DELETE"});
+    toast(`Deleted ${user.email}.`);
+  }
+  await loadAccounts();
+});
+
+$("#newGroup").onclick = guard(async () => {
+  const form = await ask("New group", [
+    {name: "name", label: "Name", required: true},
+    {name: "description", label: "Description (optional)"}], "Create");
+  if (!form) return;
+  await api("/api/admin/groups", {method: "POST", body: {name: form.name, description: form.description || null}});
+  toast(`Created group ${form.name}.`);
+  await loadAccounts();
+});
+
+$("#groupRows").onclick = guard(async e => {
+  const button = e.target.closest("button[data-act]"); if (!button) return;
+  const id = button.closest("tr").dataset.id;
+  const group = cache.groups.find(g => g.id === id);
+  if (button.dataset.act === "delete") {
+    if (!confirmed(`Delete group ${group.name}? Its grants go with it.`)) return;
+    await api(`/api/admin/groups/${id}`, {method: "DELETE"});
+    toast(`Deleted group ${group.name}.`);
+  } else if (button.dataset.act === "grant") {
+    await grantDialog("group", id, group.name);
+  } else if (button.dataset.act === "members") {
+    const inGroup = new Set(group.members || []);
+    const form = await ask(`Members of ${group.name}`, [
+      {name: "action", label: "Action", type: "select", options: [
+        {value: "add", label: "Add to group"}, {value: "remove", label: "Remove from group"}]},
+      {name: "user", label: "User", type: "select", options: cache.users.map(u =>
+        ({value: u.id, label: `${u.email}${inGroup.has(u.id) ? " (member)" : ""}`}))},
+    ], "Apply");
+    if (!form) return;
+    const path = `/api/admin/groups/${id}/members/${form.user}`;
+    await api(path, {method: form.action === "add" ? "PUT" : "DELETE"});
+    toast(`Membership updated.`);
+  }
+  await loadAccounts();
+});
+
+/** Grant or revoke one permission for a user or a group. */
+async function grantDialog(type, id, label) {
+  const names = Object.entries(cache.permissions);
+  const form = await ask(`Permissions for ${label}`, [
+    {name: "permission", label: "Permission", type: "select",
+     options: names.map(([n, p]) => ({value: n, label: `${n} — ${p.describes}`}))},
+    {name: "library_id", label: "Library (only for the library.* permissions)", type: "select",
+     options: [{value: "", label: "— none (global permission) —"},
+               ...cache.libraries.map(l => ({value: l.id, label: l.name}))]},
+    {name: "effect", label: "Effect", type: "select", options: [
+      {value: "allow", label: "Allow"},
+      {value: "deny", label: "Deny (overrides the subject's groups)"},
+      {value: "revoke", label: "Revoke (remove the grant, fall back to groups)"}]},
+  ], "Apply");
+  if (!form) return;
+  const body = {subject_type: type, subject_id: id, permission: form.permission,
+                library_id: form.library_id || null, effect: form.effect === "revoke" ? "allow" : form.effect};
+  if (form.effect === "revoke") {
+    await api("/api/admin/grants", {method: "DELETE", body});
+    toast(`Revoked ${form.permission} from ${label}.`);
+  } else {
+    await api("/api/admin/grants", {method: "POST", body});
+    toast(`${form.effect === "deny" ? "Denied" : "Allowed"} ${form.permission} for ${label}.`);
+  }
+}
+
+// --------------------------------------------------------------- libraries --
+
+$("#newLibrary").onclick = guard(async () => {
+  const form = await ask("New library", [
+    {name: "name", label: "Name", required: true},
+    {name: "description", label: "Description (shown to the chat model)"}], "Create");
+  if (!form) return;
+  await api("/api/admin/libraries", {method: "POST", body: {name: form.name, description: form.description || null}});
+  toast(`Created library ${form.name}.`);
+  await Promise.all([loadAccounts(), loadDocuments()]);
+});
+
+$("#libraryRows").onclick = guard(async e => {
+  const button = e.target.closest("button[data-act='delete']"); if (!button) return;
+  const id = button.closest("tr").dataset.id;
+  const library = cache.libraries.find(l => l.id === id);
+  if (!confirmed(`Delete ${library.name}? Grants on it and its attachments to chats go too. The documents stay indexed.`)) return;
+  await api(`/api/admin/libraries/${id}`, {method: "DELETE"});
+  toast(`Deleted ${library.name}.`);
+  await Promise.all([loadAccounts(), loadDocuments()]);
+});
+
+// --------------------------------------------------------------- documents --
+
+async function loadDocuments() {
+  cache.documents = (await api("/api/admin/documents")).documents;
+  renderDocuments();
+}
+
+$("#docFilter").oninput = renderDocuments;
+
+function renderDocuments() {
+  const needle = $("#docFilter").value.trim().toLowerCase();
+  const shown = cache.documents.filter(d => !needle || (d.filename || "").toLowerCase().includes(needle));
+  $("#docRows").innerHTML = shown.map(d => `<tr data-sha="${esc(d.sha256)}">
+      <td>${esc(d.filename || d.sha256)}<div class="small">${esc(d.sha256.slice(0, 16))}…</div></td>
+      <td>${d.pages ?? ""}</td><td>${d.chunks ?? ""}</td>
+      <td>${(d.libraries || []).map(id => `<span class="tag">${esc(libName(id))}</span>`).join(" ") || '<span class="none">— no library —</span>'}</td>
+      <td class="actions"><button class="small" data-act="libs">Libraries…</button></td>
+    </tr>`).join("") || `<tr><td colspan="5" class="small">${
+      cache.documents.length ? "Nothing matches that filter." : "No documents indexed yet."}</td></tr>`;
+}
+
+$("#docRows").onclick = guard(async e => {
+  const button = e.target.closest("button[data-act='libs']"); if (!button) return;
+  const sha = button.closest("tr").dataset.sha;
+  const doc = cache.documents.find(d => d.sha256 === sha);
+  if (!cache.libraries.length) return toast("Create a library first.", "err");
+  const inLibs = new Set(doc.libraries || []);
+  const form = await ask(`Libraries for ${doc.filename || sha.slice(0, 12)}`, [
+    {name: "action", label: "Action", type: "select", options: [
+      {value: "add", label: "Add to library"}, {value: "remove", label: "Remove from library"}]},
+    {name: "library_id", label: "Library", type: "select",
+     options: cache.libraries.map(l => ({value: l.id, label: `${l.name}${inLibs.has(l.id) ? " (already in)" : ""}`}))},
+  ], "Apply");
+  if (!form) return;
+  await api(`/api/admin/libraries/${form.library_id}/documents/${sha}`,
+            {method: form.action === "add" ? "PUT" : "DELETE"});
+  toast("Library membership updated.");
+  await Promise.all([loadDocuments(), loadAccounts()]);
+});
+
+// ----------------------------------------------------------- configuration --
+
+let envSaved = "", envStamp = null;
+
+function envDirty() { return $("#env").value !== envSaved; }
+
+function setEnvButtons() {
+  const dirty = envDirty();
+  $("#saveEnv").disabled = !dirty;
+  $("#revertEnv").disabled = !dirty;
+}
+
+function notes(target, items) {
+  $(target).innerHTML = items.filter(Boolean).map(([kind, text]) =>
+    `<div class="note ${kind}">${esc(text)}</div>`).join("");
+}
+
+async function loadEnv() {
+  const data = await api("/api/admin/system/env");
+  envSaved = data.text; envStamp = data.stamp;
+  $("#env").value = data.text;
+  $("#backupPick").innerHTML = '<option value="">Previous versions…</option>' + data.backups.map(b =>
+    `<option value="${esc(b.name)}">${new Date(b.saved_at * 1000).toLocaleString()}</option>`).join("");
+  setEnvButtons();
+  notes("#envNotes", [
+    data.problems.length ? ["err", "The file on disk has problems:\n• " + data.problems.join("\n• ")] : null,
+    data.shadowed.length ? ["warn", "Overridden by the process environment, so editing these here changes nothing until the service is restarted without them: " + data.shadowed.join(", ")] : null,
+  ]);
+}
+
+$("#env").oninput = setEnvButtons;
+
+$("#revertEnv").onclick = () => { $("#env").value = envSaved; setEnvButtons(); notes("#envNotes", []); };
+
+$("#checkEnv").onclick = guard(async () => {
+  const result = await api("/api/admin/system/env/check", {method: "POST", body: {text: $("#env").value}});
+  notes("#envNotes", [
+    result.problems.length
+      ? ["err", "Not valid yet:\n• " + result.problems.join("\n• ")]
+      : ["ok", result.changed.length
+          ? `Valid. ${result.changed.length} setting(s) changed: ${result.changed.join(", ")} — ${tierNote(result.tier)}`
+          : "Valid, and unchanged from the saved file."],
+    result.shadowed.length ? ["warn", "Overridden by the process environment: " + result.shadowed.join(", ")] : null,
+  ]);
+});
+
+function tierNote(tier) {
+  return {
+    runtime: "a live reload applies them.",
+    restart: "the query service has to restart.",
+    stack: "the stack has to be reloaded, then the query service restarted.",
+    none: "nothing to apply.",
+  }[tier] || "";
+}
+
+$("#saveEnv").onclick = guard(async () => {
+  const result = await api("/api/admin/system/env", {method: "PUT", body: {text: $("#env").value, stamp: envStamp}});
+  envSaved = $("#env").value; envStamp = result.stamp;
+  setEnvButtons();
+  notes("#envNotes", [
+    ["ok", `Saved${result.backup ? ` (previous version kept as ${result.backup})` : ""}. ` +
+           (result.changed.length ? `Changed: ${result.changed.join(", ")} — ${tierNote(result.tier)}` : "Nothing changed.")],
+    result.shadowed.length ? ["warn", "Overridden by the process environment: " + result.shadowed.join(", ")] : null,
+  ]);
+  await loadEnv();
+  toast("Saved .env. It is not applied until you reload.");
+});
+
+$("#backupPick").onchange = guard(async e => {
+  const name = e.target.value; if (!name) return;
+  if (envDirty() && !confirmed("Discard your unsaved edits and load this version?")) { e.target.value = ""; return; }
+  const data = await api(`/api/admin/system/env/backups/${encodeURIComponent(name)}`);
+  $("#env").value = data.text;
+  setEnvButtons();
+  e.target.value = "";
+  notes("#envNotes", [["warn", `Loaded ${name} into the editor. Nothing is written until you save.`]]);
+});
+
+$("#showExample").onclick = guard(async () => {
+  const data = await api("/api/admin/system/env/example");
+  const w = window.open("", "_blank", "width=820,height=700");
+  if (!w) return toast("The browser blocked the popup.", "err");
+  w.document.write(`<title>.env.example</title><pre style="font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;padding:16px">${esc(data.text)}</pre>`);
+  w.document.close();
+});
+
+// ------------------------------------------------------------------ reload --
+
+$("#reloadNow").onclick = guard(async () => {
+  if (envDirty() && !confirmed("The editor has unsaved changes, which a reload will not pick up. Reload anyway?")) return;
+  const result = await api("/api/admin/system/reload", {method: "POST"});
+  notes("#applyNotes", [["ok",
+    "Reloaded in place: retrieval, chat presets, queue limits, upload quotas, the API key and the auth mode are live now.\n" +
+    "Not reachable this way — " + result.not_applied.join(", ") + " — use the buttons above for those."]]);
+  toast("Live reload done.");
+  await loadHealth();
+});
+
+$("#stackReload").onclick = guard(async () => {
+  if (!confirmed("Re-render the LaunchAgent scripts and restart Qdrant, docling and the inbox watcher?\n\n" +
+                 "The query service keeps running; restart it afterwards to pick up a changed port or session setting.")) return;
+  await api("/api/admin/system/stack-reload", {method: "POST"});
+  notes("#applyNotes", [["warn", "Stack reload running…"]]);
+  $("#stackLog").hidden = false;
+  pollStack();
+});
+
+async function pollStack() {
+  const status = await api("/api/admin/system/stack-reload");
+  $("#stackLog").textContent = status.tail || "(no output yet)";
+  $("#stackLog").scrollTop = $("#stackLog").scrollHeight;
+  if (status.running) return setTimeout(guard(pollStack), 1500);
+  const code = status.last_run?.exit_code;
+  notes("#applyNotes", [code === 0
+    ? ["ok", "Stack reloaded. If you changed QUERY_PORT or a session setting, restart the query service now."]
+    : ["err", `Stack reload exited ${code}. See the output below and data/logs/stack-reload.log.`]]);
+  toast(code === 0 ? "Stack reloaded." : `Stack reload failed (exit ${code}).`, code === 0 ? "ok" : "err");
+}
+
+$("#restartNow").onclick = guard(async () => {
+  if (!confirmed("Restart the query service?\n\nIt exits and launchd starts it again — chats in flight are dropped, " +
+                 "and if the service was started by hand rather than by launchd it will stay down.")) return;
+  await api("/api/admin/system/restart", {method: "POST"});
+  notes("#applyNotes", [["warn", "Restarting… waiting for the service to answer again."]]);
+  setTimeout(waitForService, 2000);
+});
+
+async function waitForService(attempt = 0) {
+  try {
+    const r = await fetch("/api/health", {cache: "no-store"});
+    if (r.ok || r.status === 503) {
+      notes("#applyNotes", [["ok", "The service is back."]]);
+      toast("Query service restarted.");
+      return boot();
+    }
+  } catch {}
+  if (attempt > 20) return notes("#applyNotes", [["err",
+    "The service has not come back after ~40s. Check data/logs/query-api.log, or start it with `./ragctl up`."]]);
+  setTimeout(() => waitForService(attempt + 1), 2000);
+}
+
+// ------------------------------------------------------------------ health --
+
+async function loadHealth() {
+  const r = await fetch("/api/health", {cache: "no-store"});
+  const data = await r.json();
+  $("#healthBox").textContent = JSON.stringify(data, null, 2);
+  const bad = Object.entries(data).filter(([k, v]) => v && typeof v === "object" && v.ok === false).map(([k]) => k);
+  $("#healthLine").innerHTML = data.ok
+    ? '<span class="tag allow">healthy</span>'
+    : `<span class="tag deny">unhealthy: ${esc(bad.join(", "))}</span>`;
+}
+
+$("#refreshHealth").onclick = guard(loadHealth);
+
+window.addEventListener("beforeunload", e => { if (envDirty()) e.preventDefault(); });
+
+boot();
+</script>
+</body>
+</html>

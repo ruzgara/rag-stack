@@ -122,7 +122,9 @@ def chat_completions(body: ChatCompletionRequest, user: "User" = Depends(_chat_u
     # Stateless here -- there's no conversation to attach libraries to -- so
     # every library the caller can read applies, same as a fresh /api chat.
     doc_shas = state.accounts.document_scope(user.id)
-    turn = state.chat.run_turn(question, history, preset, extra_system=extra_system, doc_shas=doc_shas)
+    library_overview = state.accounts.library_overview(user.id)
+    turn = state.chat.run_turn(question, history, preset, extra_system=extra_system, doc_shas=doc_shas,
+                               library_overview=library_overview)
 
     def usage(r: TurnResult) -> dict:
         p, c = r.stats.get("prompt_tokens", 0), r.stats.get("completion_tokens", 0)

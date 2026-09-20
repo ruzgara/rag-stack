@@ -17,8 +17,8 @@ def service(results=None, ollama: FakeOllama | None = None, library=None,
             retriever, ollama)
 
 
-def run(svc: ChatService, question: str, history=None, preset=None) -> tuple[list[dict], object]:
-    events = list(svc.run_turn(question, history or [], preset))
+def run(svc: ChatService, question: str, history=None, preset=None, library_overview=None) -> tuple[list[dict], object]:
+    events = list(svc.run_turn(question, history or [], preset, library_overview=library_overview))
     return events, events[-1]["result"]
 
 
@@ -314,3 +314,47 @@ def test_both_tools_can_be_called_in_one_round():
     tool_messages = [m for m in [r for r in ollama.chat_requests if r.get("stream")][1]["messages"]
                      if m["role"] == "tool"]
     assert [m["tool_name"] for m in tool_messages] == ["list_documents", "search_documents"]
+
+
+# --------------------------------------------------------------- libraries --
+
+def test_list_libraries_is_not_offered_without_an_overview():
+    ollama = FakeOllama(streams=[answer("ok")])
+    svc, _, _ = service({}, ollama)
+    run(svc, "q")   # no library_overview passed
+    tools = [r for r in ollama.chat_requests if r.get("stream")][0]["tools"]
+    assert [t["function"]["name"] for t in tools] == ["search_documents", "list_documents"]
+
+
+def test_list_libraries_is_offered_alongside_the_other_tools():
+    ollama = FakeOllama(streams=[answer("ok")])
+    svc, _, _ = service({}, ollama)
+    run(svc, "q", library_overview=[])
+    tools = [r for r in ollama.chat_requests if r.get("stream")][0]["tools"]
+    assert [t["function"]["name"] for t in tools] == ["search_documents", "list_documents", "list_libraries"]
+
+
+def test_list_libraries_reports_scope_for_the_readable_libraries_only():
+    overview = [
+        {"name": "Attached", "description": "In scope", "in_scope": True, "document_count": 3},
+        {"name": "Readable only", "description": None, "in_scope": False, "document_count": 1},
+    ]
+    ollama = FakeOllama(streams=[calls({"name": "list_libraries", "arguments": {}}), answer("Here's what exists.")])
+    svc, _, _ = service({}, ollama)
+    events, _ = run(svc, "what libraries are there?", library_overview=overview)
+
+    assert [e for e in events if e["type"] == "listing_libraries"] == [{"type": "listing_libraries"}]
+    second = [r for r in ollama.chat_requests if r.get("stream")][1]["messages"]
+    reply = second[-1]["content"]
+    assert reply == (
+        "- Attached: searchable now (3 documents) -- In scope\n"
+        "- Readable only: not attached to this conversation (1 documents)"
+    )
+
+
+def test_list_libraries_with_none_readable_says_so():
+    ollama = FakeOllama(streams=[calls({"name": "list_libraries", "arguments": {}}), answer("None yet.")])
+    svc, _, _ = service({}, ollama)
+    _, _ = run(svc, "what libraries are there?", library_overview=[])
+    second = [r for r in ollama.chat_requests if r.get("stream")][1]["messages"]
+    assert second[-1]["content"] == "No libraries available."

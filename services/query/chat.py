@@ -74,6 +74,20 @@ DOCUMENTS_TOOL = {
     },
 }
 
+LIBRARIES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_libraries",
+        "description": (
+            "List the libraries (document collections) the user has access to, with their document "
+            "counts and whether each is attached to this conversation. Use it when the user asks what "
+            "libraries or collections exist, or why a search or list_documents didn't cover something "
+            "that might be in a library they haven't attached here."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
 # [2], [1, 3], [1; 3], and ranges [1-4] / [1–4]
 _CITE_ITEM = r"\d+(?:\s*[-–]\s*\d+)?"
 CITATION_RE = re.compile(rf"\[({_CITE_ITEM}(?:\s*[,;]\s*{_CITE_ITEM})*)\]")
@@ -322,11 +336,15 @@ class ChatService:
         return new
 
     def run_turn(self, question: str, history: list[dict], preset_name: str | None = None,
-                 extra_system: str | None = None, doc_shas: set[str] | None = None) -> Iterator[dict]:
+                 extra_system: str | None = None, doc_shas: set[str] | None = None,
+                 library_overview: list[dict] | None = None) -> Iterator[dict]:
         """Yields events: rewrite, searching, sources, listing, thinking, token, done.
         The done event carries the TurnResult. `doc_shas` restricts every
         search and the document listing to a library scope (None: every
-        indexed document; empty: none) -- see Retriever.search."""
+        indexed document; empty: none) -- see Retriever.search. `library_overview`
+        is Accounts.library_overview()'s output, offered back to the model
+        verbatim through list_libraries -- already filtered to libraries the
+        caller can read, so the model never learns about ones it can't."""
         preset = self.cfg.preset(preset_name)
         result = TurnResult(model=preset.model, preset=preset.name)
         t_start = time.monotonic()
@@ -386,6 +404,7 @@ class ChatService:
                     # between turns and Ollama can reuse its cache for it.
                     {"role": "user", "content": user_turn}]
 
+        available_tools = [SEARCH_TOOL, DOCUMENTS_TOOL] + ([LIBRARIES_TOOL] if library_overview is not None else [])
         rounds = 0
         prompt_tokens = eval_tokens = 0
         t_first_token = None
@@ -394,7 +413,7 @@ class ChatService:
             offer_tools = tools_on and rounds < self.cfg.max_tool_rounds and budget[0] > 0
             content, tool_calls = "", []
             for chunk in self._chat_stream(preset.model, messages, think=preset.think,
-                                           tools=[SEARCH_TOOL, DOCUMENTS_TOOL] if offer_tools else None):
+                                           tools=available_tools if offer_tools else None):
                 msg = chunk.get("message") or {}
                 if msg.get("thinking"):
                     yield {"type": "thinking", "text": msg["thinking"]}
@@ -434,6 +453,19 @@ class ChatService:
                     # Not sources, but it shares the prompt with them.
                     budget[0] -= estimate_tokens(reply)
                     result.stats["listed_documents"] = result.stats.get("listed_documents", 0) + 1
+                elif name == LIBRARIES_TOOL["function"]["name"]:
+                    yield {"type": "listing_libraries"}
+                    if library_overview:
+                        lines = []
+                        for lib in library_overview:
+                            note = (f"searchable now ({lib['document_count']} documents)" if lib["in_scope"] else
+                                    f"not attached to this conversation ({lib['document_count']} documents)")
+                            desc = f" -- {lib['description']}" if lib["description"] else ""
+                            lines.append(f"- {lib['name']}: {note}{desc}")
+                        reply = "\n".join(lines)
+                    else:
+                        reply = "No libraries available."
+                    budget[0] -= estimate_tokens(reply)
                 elif name != SEARCH_TOOL["function"]["name"] or not tool_query:
                     reply = "Error: call search_documents with a non-empty 'query'."
                 else:

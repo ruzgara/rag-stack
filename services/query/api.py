@@ -6,9 +6,11 @@ Native API (for the rag-stack UI) under /api, OpenAI-compatible API under /v1
 
   uvicorn api:app --host 127.0.0.1 --port $QUERY_PORT
 
-It always binds to 127.0.0.1: there are no user accounts yet, so anyone who
-can reach it can read every conversation. If QUERY_API_KEY is set, every
-endpoint except /api/health requires `Authorization: Bearer <key>`.
+It binds to 127.0.0.1. Every endpoint except /api/health identifies its
+caller -- a signed session cookie, a proxy header, or QUERY_API_KEY as the
+service account -- and checks the caller's permissions (see accounts.py).
+Admins additionally get /api/admin/system, which edits .env and reloads the
+service; the admin UI for all of it is served at /admin.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from pydantic import BaseModel, Field
 from chat import ChatConfig, ChatError, ChatService
 from accounts import Accounts, Denied, Invalid, PERMISSIONS, User
 from auth import SESSION_MAX_AGE, Auth, as_http_error, hash_password, session_secret, verify_password
+import settings
 from db import ChatDB, NotFound
 from limits import Busy, Gate, GateConfig, UploadLimits
 from retrieval import REPO_ROOT, Retriever, SearchConfig, load_env
@@ -117,21 +120,46 @@ class State:
 state = State()
 
 
+def build_runtime(env: dict) -> None:
+    """Builds everything that reads .env, from a fresh environment.
+
+    Startup and POST /api/admin/system/reload both come through here, so a
+    reload configures the service exactly as a restart would rather than
+    through a second, drifting code path. The database and the accounts on it
+    are deliberately not rebuilt: their path is fixed, and dropping the
+    connection would only interrupt requests in flight.
+
+    Everything is constructed before anything is swapped in, so a config that
+    turns out to be bad leaves the running service untouched.
+    """
+    retriever = Retriever(SearchConfig.from_env(env))
+    try:
+        chat = ChatService(retriever, ChatConfig.from_env(env))
+        gate = Gate(GateConfig.from_env(env))
+        uploads = UploadLimits.from_env(env)
+        auth = Auth(state.accounts, env)
+    except BaseException:
+        retriever.close()
+        raise
+
+    previous = getattr(state, "retriever", None)
+    state.retriever, state.chat, state.gate, state.uploads, state.auth = retriever, chat, gate, uploads, auth
+    state.ingest.autorun = (env.get("INGEST_AUTORUN") or "false").strip().lower() == "true"
+    state.api_key = (env.get("QUERY_API_KEY") or "").strip()
+    if previous is not None and previous is not retriever:
+        previous.close()
+    if retriever.cfg.rerank:
+        # Load the reranker onto the GPU now rather than on the first question.
+        threading.Thread(target=lambda: retriever.reranker, daemon=True).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     env = load_env()
-    state.retriever = Retriever(SearchConfig.from_env(env))
-    state.chat = ChatService(state.retriever, ChatConfig.from_env(env))
     state.db = ChatDB(DATA_DIR / "chat.db")
     state.accounts = Accounts(state.db)
-    state.auth = Auth(state.accounts, env)
-    state.ingest = IngestRunner(autorun=(env.get("INGEST_AUTORUN") or "false").strip().lower() == "true")
-    state.api_key = (env.get("QUERY_API_KEY") or "").strip()
-    state.gate = Gate(GateConfig.from_env(env))
-    state.uploads = UploadLimits.from_env(env)
-    if state.retriever.cfg.rerank:
-        # Load the reranker onto the GPU now rather than on the first question.
-        threading.Thread(target=lambda: state.retriever.reranker, daemon=True).start()
+    state.ingest = IngestRunner(autorun=False)
+    build_runtime(env)
     yield
     state.retriever.close()
 
@@ -193,9 +221,20 @@ def requires(permission: str):
     return dependency
 
 
+def superuser(user: User = Depends(current_user)) -> User:
+    """Only a real admin, never a grant. The system endpoints edit .env, and
+    .env can set QUERY_AUTH_MODE=proxy -- after which anyone able to set a
+    header is anyone they like. A delegable permission would make that a
+    permission an admin could hand out by accident."""
+    if not user.is_admin:
+        raise HTTPException(403, "only an admin can change the system configuration")
+    return user
+
+
 CurrentUser = Depends(current_user)
 Admin = Depends(requires("users.manage"))
 LibrariesAdmin = Depends(requires("libraries.manage"))
+Superuser = Depends(superuser)
 
 
 def sse(event: str, data: dict) -> str:
@@ -284,12 +323,25 @@ def change_password(body: PasswordChange, user: User = CurrentUser) -> None:
 
 
 # ------------------------------------------------------------------ admin --
-# The admin UI comes later; these are what it will call, and what `ragctl
-# user` does locally.
+# What the admin UI at /admin calls, and what `ragctl user` does locally --
+# the two are deliberately the same set of operations.
 
 @app.get("/api/admin/users")
 def admin_list_users(admin: User = Admin) -> dict:
-    return {"users": [u.public() for u in state.accounts.users()],
+    """Users, with their permissions already resolved.
+
+    `effective` is what each user may actually do -- their own grants and
+    their groups', with the precedence rules applied. It is resolved here,
+    by the same accounts.effective_permissions() `ragctl user list` calls,
+    rather than left for the UI to work out from the raw grants: a second
+    implementation of "deny beats allow, own beats group" in JavaScript would
+    eventually disagree with this one, and the disagreement would show an
+    admin a permission nobody has.
+    """
+    return {"users": [{**u.public(),
+                       "effective": {name: sorted(str(v) for v in libs)
+                                     for name, libs in state.accounts.effective_permissions(u.id).items()}}
+                      for u in state.accounts.users()],
             "permissions": {name: {"describes": text, "scope": "library" if name.startswith("library.") else "global"}
                             for name, text in PERMISSIONS.items()}}
 
@@ -382,6 +434,177 @@ def admin_grant(body: GrantRequest, admin: User = Admin) -> None:
 @app.delete("/api/admin/grants", status_code=204)
 def admin_revoke(body: GrantRequest, admin: User = Admin) -> None:
     state.accounts.revoke(body.subject_type, body.subject_id, body.permission, body.library_id)
+
+
+# ----------------------------------------------------------------- system --
+# Editing .env from the browser, and the reload that applies it. See
+# settings.py for why the file is handled as raw text and what each reload
+# tier can and cannot reach.
+
+
+class EnvSave(BaseModel):
+    text: str
+    stamp: str | None = None     # the stamp from the GET, to catch a concurrent edit
+
+
+class EnvCheck(BaseModel):
+    text: str
+
+
+class StackReloader:
+    """Runs `ragctl reload --skip-query` in the background.
+
+    --skip-query matters: a plain `ragctl reload` boots out
+    com.ragstack.query, which is this process's own LaunchAgent, so the
+    command would be killed by the very step it was running -- and killed
+    between the bootout and the bootstrap, leaving the service down with
+    nothing to bring it back. Skipping that step lets the command finish; the
+    query service then applies the re-rendered config by restarting itself
+    (POST /api/admin/system/restart), which launchd's KeepAlive turns into a
+    fresh process.
+    """
+
+    LOG = "stack-reload.log"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running = False
+        self.last_run: dict | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._running:
+                raise Busy("a stack reload is already running")
+            self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        started = time.time()
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        code = -1
+        try:
+            with (LOG_DIR / self.LOG).open("a") as log:
+                log.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} reload from the admin UI ====\n")
+                log.flush()
+                env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+                code = subprocess.run([str(REPO_ROOT / "ragctl"), "reload", "--skip-query"],
+                                      stdout=log, stderr=subprocess.STDOUT, env=env).returncode
+        finally:
+            self.last_run = {"started_at": started, "finished_at": time.time(), "exit_code": code}
+            with self._lock:
+                self._running = False
+
+    def status(self) -> dict:
+        return {"running": self._running, "last_run": self.last_run, "log": f"data/logs/{self.LOG}"}
+
+    def tail(self, lines: int = 120) -> str:
+        path = LOG_DIR / self.LOG
+        return "\n".join(path.read_text(errors="replace").splitlines()[-lines:]) if path.exists() else ""
+
+
+stack_reloader = StackReloader()
+
+
+@app.get("/api/admin/system/env")
+def admin_read_env(admin: User = Superuser) -> dict:
+    """The .env file as text, with anything already wrong with it."""
+    return {**settings.read(), "backups": settings.backups()}
+
+
+@app.get("/api/admin/system/env/example")
+def admin_read_env_example(admin: User = Superuser) -> dict:
+    """.env.example, to copy a forgotten setting and its comment out of."""
+    return {"text": settings.example()}
+
+
+@app.post("/api/admin/system/env/check")
+def admin_check_env(body: EnvCheck, admin: User = Superuser) -> dict:
+    """Validates without writing, so the editor can say what's wrong as it's
+    typed and what a save would need reloading."""
+    current = settings.read()["text"]
+    return {"problems": settings.validate(body.text), "shadowed": settings.shadowed(body.text),
+            **settings.impact(current, body.text)}
+
+
+@app.put("/api/admin/system/env")
+def admin_write_env(body: EnvSave, admin: User = Superuser) -> dict:
+    """Validates, backs up and replaces .env. Nothing is applied yet -- the
+    reply says which reload tier the change needs."""
+    try:
+        return settings.save(body.text, body.stamp)
+    except settings.Conflict as exc:
+        raise HTTPException(409, str(exc)) from None
+    except Invalid as exc:
+        raise as_http_error(exc) from None
+
+
+@app.get("/api/admin/system/env/backups")
+def admin_list_env_backups(admin: User = Superuser) -> dict:
+    return {"backups": settings.backups()}
+
+
+@app.get("/api/admin/system/env/backups/{name}")
+def admin_read_env_backup(name: str, admin: User = Superuser) -> dict:
+    """A backup's text. Restoring is the same as saving it back, so the UI
+    loads it into the editor rather than applying it behind the admin's back."""
+    try:
+        return {"name": name, "text": settings.backup_text(name)}
+    except Invalid as exc:
+        raise HTTPException(404, str(exc)) from None
+
+
+@app.post("/api/admin/system/reload")
+def admin_reload(admin: User = Superuser) -> dict:
+    """Rebuilds everything that reads .env, in this process. Covers the
+    retriever, chat presets, queue limits, upload quotas, the API key and the
+    auth mode -- but not the session cookie or the listening port, which
+    belong to middleware installed at import and to uvicorn's arguments. The
+    reply says so rather than reporting a success that didn't reach them."""
+    try:
+        build_runtime(load_env())
+    except Exception as exc:  # noqa: BLE001 -- a bad .env shouldn't 500 silently
+        raise HTTPException(400, f"reload failed, the previous configuration is still running: {exc}") from None
+    return {"reloaded": True,
+            "not_applied": sorted(settings.RESTART_KEYS | settings.STACK_KEYS),
+            "note": "these keys need a restart or a stack reload; the rest are live now"}
+
+
+@app.post("/api/admin/system/stack-reload", status_code=202)
+def admin_stack_reload(admin: User = Superuser) -> dict:
+    """Re-renders the LaunchAgent scripts and restarts Qdrant, docling,
+    Ollama's tuning and the inbox watcher. Runs in the background; poll this
+    endpoint's GET for progress."""
+    try:
+        stack_reloader.start()
+    except Busy as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"started": True, **stack_reloader.status()}
+
+
+@app.get("/api/admin/system/stack-reload")
+def admin_stack_reload_status(admin: User = Superuser) -> dict:
+    return {**stack_reloader.status(), "tail": stack_reloader.tail()}
+
+
+@app.post("/api/admin/system/restart", status_code=202)
+def admin_restart(admin: User = Superuser) -> dict:
+    """Restarts this process, for the keys a live reload can't reach.
+
+    It exits non-zero and lets launchd start it again: com.ragstack.query is
+    KeepAlive/SuccessfulExit=false, so a non-zero exit is exactly the case it
+    relaunches. That also re-runs the rendered query-api.sh, which is how a
+    changed QUERY_PORT takes effect -- so a stack reload (which re-renders it)
+    belongs before this. Outside launchd nothing restarts it and the service
+    stays down, which is why the reply says as much.
+    """
+    def bye() -> None:
+        time.sleep(1.0)  # let this response reach the browser first
+        os._exit(1)
+
+    threading.Thread(target=bye, daemon=True).start()
+    return {"restarting": True,
+            "note": "launchd restarts com.ragstack.query on a non-zero exit; if this service was started "
+                    "by hand it will stay down. Give it a few seconds, then reload the page."}
 
 
 # -------------------------------------------------------------- libraries --
@@ -553,6 +776,7 @@ def send_message(conv_id: str, body: NewMessage, user: User = Depends(requires("
     # attached these libraries: a revoked library.read stops applying here,
     # not only on the next attach.
     doc_shas = state.accounts.document_scope(user.id, conv["library_ids"])
+    library_overview = state.accounts.library_overview(user.id, conv["library_ids"])
 
     def stream() -> Iterator[str]:
         history = state.db.history(conv_id, user_id=user.id)
@@ -564,7 +788,8 @@ def send_message(conv_id: str, body: NewMessage, user: User = Depends(requires("
         queries: list[str] = []
         finished = False
         try:
-            for ev in state.chat.run_turn(body.content, history, preset, doc_shas=doc_shas):
+            for ev in state.chat.run_turn(body.content, history, preset, doc_shas=doc_shas,
+                                          library_overview=library_overview):
                 kind = ev["type"]
                 if kind == "done":
                     r = ev["result"]
@@ -635,6 +860,7 @@ class SearchRequest(BaseModel):
 @app.post("/api/search")
 def search(body: SearchRequest, user: User = Depends(requires("chat.use"))) -> dict:
     t0 = time.monotonic()
+    _check_libraries(user, body.library_ids)
     doc_shas = state.accounts.document_scope(user.id, body.library_ids)
     try:
         # Reranking runs on the same GPU as the answers, so searches queue
@@ -795,6 +1021,15 @@ def health() -> JSONResponse:
                                         for name, p in state.chat.cfg.presets.items()}}
     ok = all(c["ok"] for c in checks.values())
     return JSONResponse({"ok": ok, **checks}, status_code=200 if ok else 503)
+
+
+@app.get("/admin", include_in_schema=False)
+def admin_ui() -> FileResponse:
+    """The admin console (static/admin.html): accounts, groups, libraries and
+    the .env editor. Served to anyone -- the page itself holds no secrets and
+    every call it makes is checked server-side, so it renders a sign-in form
+    for a caller who turns out not to be an admin."""
+    return FileResponse(Path(__file__).parent / "static" / "admin.html")
 
 
 @app.get("/ui", include_in_schema=False)

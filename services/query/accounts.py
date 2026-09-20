@@ -368,19 +368,40 @@ class Accounts:
         granted = self.effective_permissions(user_id).get("library.read", set())
         return None if "*" in granted else {lib for lib in granted if lib}
 
+    def library_overview(self, user_id: str, selected: list[str] | None = None) -> list[dict]:
+        """The libraries this user can read, annotated for the chat model
+        with whether each is in scope for the current turn (`in_scope` --
+        accessible and, if the caller narrowed to `selected` libraries, one
+        of those). Libraries the user can't read are left out entirely --
+        the model never learns they exist."""
+        readable = self.readable_libraries(user_id)
+        selected_set = set(selected) if selected else None
+        overview = []
+        for lib in self.libraries():
+            if readable is not None and lib["id"] not in readable:
+                continue
+            overview.append({"name": lib["name"], "description": lib["description"],
+                             "document_count": lib["document_count"],
+                             "in_scope": selected_set is None or lib["id"] in selected_set})
+        return overview
+
     def document_scope(self, user_id: str, selected: list[str] | None = None) -> set[str] | None:
         """Which documents (by sha256) a search may return: None for no
-        restriction at all (an admin), otherwise the documents in the
-        readable libraries -- narrowed to `selected` (a conversation's
-        attached libraries) when it names any, else every library the user
-        can read, so a fresh conversation with nothing attached isn't
-        silently mute. `selected` is re-checked against current grants on
-        every call, not trusted from when it was attached: revoking
-        library.read takes effect on the next search, not the next attach."""
+        restriction at all (an admin with nothing selected), otherwise the
+        documents in the readable libraries -- narrowed to `selected` (a
+        conversation's attached libraries) when it names any, even for an
+        admin, else every library the user can read, so a fresh conversation
+        with nothing attached isn't silently mute. `selected` is re-checked
+        against current grants on every call, not trusted from when it was
+        attached: revoking library.read takes effect on the next search, not
+        the next attach."""
         readable = self.readable_libraries(user_id)
-        if readable is None:
-            return None
-        libs = readable if not selected else readable & set(selected)
+        if not selected:
+            if readable is None:
+                return None
+            libs = readable
+        else:
+            libs = set(selected) if readable is None else readable & set(selected)
         if not libs:
             return set()
         with self.db._conn() as db:

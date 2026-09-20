@@ -273,6 +273,19 @@ cmd_restart() {
 cmd_reload() {
     # Re-render configs from .env and restart the native services + containers
     # so changed settings actually take effect.
+    #
+    # --skip-query leaves com.ragstack.query alone. The admin UI reloads the
+    # stack by running this from *inside* the query service, and reloading
+    # that agent would boot out the process running this script -- between
+    # the bootout and the bootstrap, leaving nothing to start it again. The
+    # UI restarts the query service itself afterwards instead.
+    local skip_query=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --skip-query) skip_query=true; shift ;;
+            *) die "reload: unknown option $1" ;;
+        esac
+    done
     load_env
     render_all
     load_agent "com.ragstack.ollama-env"
@@ -283,8 +296,12 @@ cmd_reload() {
         unload_agent "com.ragstack.ingest"
     fi
     compose up -d --force-recreate "${COMPOSE_SERVICES[@]}"
-    load_agent "com.ragstack.query"
-    ok "Reloaded."
+    if [[ "$skip_query" == "true" ]]; then
+        ok "Reloaded (query service left running; restart it to pick up QUERY_PORT and session settings)."
+    else
+        load_agent "com.ragstack.query"
+        ok "Reloaded."
+    fi
 }
 
 # -------------------------------------------------------------- status --
@@ -488,7 +505,9 @@ Usage: ./ragctl <command> [args]
   up                    Start native services (incl. the query API) + Docker containers
   down                  Stop Docker containers + docling-serve (Ollama.app left running)
   restart               down then up
-  reload                Re-render configs from .env and restart everything
+  reload [--skip-query] Re-render configs from .env and restart everything
+                         (--skip-query leaves the query API running; it is how
+                          the admin UI reloads the stack from inside it)
   status                Show what's running and reachable
   logs [svc]             Tail logs (svc: docling, ollama, ingest, query, qdrant)
   models check           Verify .env model names exist in 'ollama list'

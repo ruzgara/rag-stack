@@ -337,7 +337,18 @@ def test_deleting_a_library_detaches_it_from_conversations(acc):
 def test_an_admin_has_no_document_restriction(acc):
     admin = user(acc, "admin@example.com", is_admin=True)
     assert acc.document_scope(admin.id) is None
-    assert acc.document_scope(admin.id, ["some-library"]) is None
+
+
+def test_an_admin_still_narrows_to_a_selected_library(acc):
+    """An admin can read every library, but picking one in the UI has to
+    actually filter -- not fall through to "no restriction" just because
+    the admin's own read access is unrestricted."""
+    admin = user(acc, "admin@example.com", is_admin=True)
+    a, b = acc.create_library("A"), acc.create_library("B")
+    acc.add_document(a["id"], "sha-a")
+    acc.add_document(b["id"], "sha-b")
+
+    assert acc.document_scope(admin.id, [a["id"]]) == {"sha-a"}
 
 
 def test_a_user_with_no_readable_libraries_gets_an_empty_scope(acc):
@@ -392,3 +403,52 @@ def test_document_scope_is_recomputed_from_current_grants(acc):
     acc.revoke("user", created.id, "library.read", lib["id"])
 
     assert acc.document_scope(created.id, [lib["id"]]) == set()
+
+
+# ----------------------------------------------------------- overview --
+
+def test_library_overview_omits_libraries_the_user_cannot_read(acc):
+    created = user(acc)
+    attached, readable_only = acc.create_library("Attached"), acc.create_library("Readable only")
+    acc.create_library("Locked")  # no grant -- must not appear at all
+    acc.add_document(attached["id"], "sha-a")
+    acc.grant("user", created.id, "library.read", attached["id"])
+    acc.grant("user", created.id, "library.read", readable_only["id"])
+
+    overview = {o["name"]: o for o in acc.library_overview(created.id, [attached["id"]])}
+
+    assert set(overview) == {"Attached", "Readable only"}
+    assert overview["Attached"]["in_scope"] and overview["Attached"]["document_count"] == 1
+    assert not overview["Readable only"]["in_scope"]
+
+
+def test_library_overview_with_nothing_selected_is_in_scope_for_every_readable_library(acc):
+    created = user(acc)
+    readable = acc.create_library("Readable")
+    acc.create_library("Locked")  # no grant -- must not appear at all
+    acc.grant("user", created.id, "library.read", readable["id"])
+
+    overview = {o["name"]: o for o in acc.library_overview(created.id)}
+
+    assert set(overview) == {"Readable"}
+    assert overview["Readable"]["in_scope"]
+
+
+def test_library_overview_for_an_admin_is_every_library_in_scope_by_default(acc):
+    admin = user(acc, "admin@example.com", is_admin=True)
+    acc.create_library("A")
+    acc.create_library("B")
+
+    overview = acc.library_overview(admin.id)
+
+    assert {o["name"] for o in overview} == {"A", "B"}
+    assert all(o["in_scope"] for o in overview)
+
+
+def test_library_overview_for_an_admin_narrows_to_a_selection_like_everyone_else(acc):
+    admin = user(acc, "admin@example.com", is_admin=True)
+    a, b = acc.create_library("A"), acc.create_library("B")
+
+    overview = {o["name"]: o for o in acc.library_overview(admin.id, [a["id"]])}
+
+    assert overview["A"]["in_scope"] and not overview["B"]["in_scope"]
