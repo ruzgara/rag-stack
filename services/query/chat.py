@@ -13,7 +13,8 @@ One turn:
      depends on the question -- one passage for a narrow one, many for a broad
      one -- rather than a fixed count (CHAT_INITIAL_SOURCES only caps it).
   3. Answer: the chat model streams its answer from Ollama. If the preset has
-     tools on, it may call search_documents for more passages -- at most
+     tools on, it may call search_documents for more passages, or
+     list_documents to see what the knowledge base holds -- at most
      CHAT_MAX_TOOL_ROUNDS times, within CHAT_MAX_SOURCE_TOKENS. Passages
      already given are never returned again, and numbering continues, so
      earlier citations stay valid.
@@ -33,6 +34,7 @@ from typing import Iterator
 
 import httpx
 
+from library import Library
 from retrieval import Hit, Retriever, _bool, _float, _int, estimate_tokens, load_env
 
 PROMPTS = Path(__file__).parent / "prompts"
@@ -50,6 +52,24 @@ SEARCH_TOOL = {
             "type": "object",
             "properties": {"query": {"type": "string", "description": "What to search for, as a focused query"}},
             "required": ["query"],
+        },
+    },
+}
+
+DOCUMENTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_documents",
+        "description": (
+            "List the documents in the knowledge base: filenames, page counts and main sections. "
+            "Use it when the user asks which documents or sources are available, whether a particular "
+            "document is there, or what one of them covers -- searching can't answer those. "
+            "Returns no passage text, so nothing it returns can be cited."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"document": {"type": "string",
+                                        "description": "Optional: part of a filename, for that document's sections in full"}},
         },
     },
 }
@@ -200,9 +220,11 @@ def trim_history(history: list[dict], max_tokens: int) -> list[dict]:
 
 
 class ChatService:
-    def __init__(self, retriever: Retriever, cfg: ChatConfig | None = None, client: httpx.Client | None = None):
+    def __init__(self, retriever: Retriever, cfg: ChatConfig | None = None, client: httpx.Client | None = None,
+                 library: Library | None = None):
         self.cfg = cfg or ChatConfig.from_env()
         self.retriever = retriever
+        self.library = library or Library(retriever)
         self.client = client or httpx.Client()
         self._tool_support: dict[str, bool] = {}
 
@@ -301,7 +323,7 @@ class ChatService:
 
     def run_turn(self, question: str, history: list[dict], preset_name: str | None = None,
                  extra_system: str | None = None) -> Iterator[dict]:
-        """Yields events: rewrite, searching, sources, thinking, token, done.
+        """Yields events: rewrite, searching, sources, listing, thinking, token, done.
         The done event carries the TurnResult."""
         preset = self.cfg.preset(preset_name)
         result = TurnResult(model=preset.model, preset=preset.name)
@@ -370,7 +392,7 @@ class ChatService:
             offer_tools = tools_on and rounds < self.cfg.max_tool_rounds and budget[0] > 0
             content, tool_calls = "", []
             for chunk in self._chat_stream(preset.model, messages, think=preset.think,
-                                           tools=[SEARCH_TOOL] if offer_tools else None):
+                                           tools=[SEARCH_TOOL, DOCUMENTS_TOOL] if offer_tools else None):
                 msg = chunk.get("message") or {}
                 if msg.get("thinking"):
                     yield {"type": "thinking", "text": msg["thinking"]}
@@ -398,8 +420,19 @@ class ChatService:
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {}
+                name = fn.get("name")
                 tool_query = str(args.get("query") or "").strip()
-                if fn.get("name") != SEARCH_TOOL["function"]["name"] or not tool_query:
+                if name == DOCUMENTS_TOOL["function"]["name"]:
+                    wanted = str(args.get("document") or "").strip()
+                    yield {"type": "listing", "document": wanted}
+                    try:
+                        reply = self.library.describe(wanted or None)
+                    except (RuntimeError, httpx.HTTPError) as exc:
+                        reply = f"The document list is unavailable ({exc})."
+                    # Not sources, but it shares the prompt with them.
+                    budget[0] -= estimate_tokens(reply)
+                    result.stats["listed_documents"] = result.stats.get("listed_documents", 0) + 1
+                elif name != SEARCH_TOOL["function"]["name"] or not tool_query:
                     reply = "Error: call search_documents with a non-empty 'query'."
                 else:
                     yield {"type": "searching", "query": tool_query, "found_by": "tool"}
@@ -408,7 +441,7 @@ class ChatService:
                     yield {"type": "sources", "sources": [asdict(s) for s in new]}
                     reply = ("\n\n".join(s.for_prompt() for s in new) if new
                              else "No further relevant passages found for this query.")
-                messages.append({"role": "tool", "tool_name": fn.get("name", ""), "content": reply})
+                messages.append({"role": "tool", "tool_name": name or "", "content": reply})
 
         # 4. Resolve citations.
         result.answer = "\n\n".join(p.strip() for p in parts if p.strip())

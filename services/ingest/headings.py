@@ -56,6 +56,10 @@ MAX_STYLES = 8
 # this share of the page height from the top or bottom edge.
 RUNNING_MIN_PAGES = 3
 RUNNING_MARGIN = 0.12
+# Deepest heading level kept. docling's markdown export writes a level-n
+# heading as n+1 hashes (it keeps "#" for the document title), and markdown
+# has only six levels, so deeper trees are clamped here.
+MAX_LEVEL = 5
 # Longer "headings" are sentences docling mislabelled.
 MAX_HEADING_WORDS = 14
 # Use bookmarks when at least this share of headings match one.
@@ -348,7 +352,8 @@ def assign_levels(pdf_path: Path, doc: dict, lock=None) -> dict:
                 report["source"] = "flat"
 
         for h in heads:
-            lvl = levels.get(h.index, 1)
+            # A deeper bookmark tree would export as invalid "#######" lines.
+            lvl = min(levels.get(h.index, 1), MAX_LEVEL)
             h.item["level"] = lvl
             report["levels"][lvl] = report["levels"].get(lvl, 0) + 1
         report["levels"] = dict(sorted(report["levels"].items()))

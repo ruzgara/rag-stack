@@ -51,15 +51,18 @@ def BODY(step: float = 30.0) -> Item:
 
 
 def add_text(pdf: pdfium.PdfDocument, page: pdfium.PdfPage, text: str, x: float, y: float, font: str,
-             size: float, invisible: bool = False) -> tuple[float, float, float, float]:
-    """Places one line of text; returns its (left, bottom, right, top) in PDF points."""
+             size: float, invisible: bool = False, angle: int = 0) -> tuple[float, float, float, float]:
+    """Places one line of text; returns its (left, bottom, right, top) in PDF
+    points. angle turns the line counter-clockwise, as a book does with a wide
+    table typeset sideways on a portrait page."""
     f = pdfium_c.FPDFText_LoadStandardFont(pdf.raw, font.encode())
     obj = pdfium_c.FPDFPageObj_CreateTextObj(pdf.raw, f, ctypes.c_float(size))
     buf = ctypes.create_string_buffer((text + "\0").encode("utf-16-le"))
     pdfium_c.FPDFText_SetText(obj, ctypes.cast(buf, ctypes.POINTER(pdfium_c.FPDF_WCHAR)))
     if invisible:
         pdfium_c.FPDFTextObj_SetTextRenderMode(obj, pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE)
-    pdfium_c.FPDFPageObj_Transform(obj, 1, 0, 0, 1, x, y)
+    cos, sin = {0: (1, 0), 90: (0, 1), 180: (-1, 0), 270: (0, -1)}[angle % 360]
+    pdfium_c.FPDFPageObj_Transform(obj, cos, sin, -sin, cos, x, y)
     pdfium_c.FPDFPage_InsertObject(page.raw, obj)
     l, b, r, t = (ctypes.c_float() for _ in range(4))
     pdfium_c.FPDFPageObj_GetBounds(obj, *(ctypes.byref(v) for v in (l, b, r, t)))

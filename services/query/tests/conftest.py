@@ -115,10 +115,28 @@ def answer(*tokens: str, prompt_tokens: int = 100) -> list[dict]:
 
 def tool_call(query: str) -> list[dict]:
     """A streamed turn that only calls search_documents."""
+    return calls({"name": "search_documents", "arguments": {"query": query}})
+
+
+def calls(*functions: dict) -> list[dict]:
+    """A streamed turn that only makes the given tool calls."""
     return [{"message": {"role": "assistant", "content": "",
-                         "tool_calls": [{"function": {"name": "search_documents", "arguments": {"query": query}}}]},
-             "done": False},
+                         "tool_calls": [{"function": f} for f in functions]}, "done": False},
             {"message": {"role": "assistant", "content": ""}, "done": True, "prompt_eval_count": 50, "eval_count": 5}]
+
+
+class FakeLibrary:
+    """Stands in for the document list."""
+
+    def __init__(self, text: str = "The knowledge base holds 2 document(s).", error: Exception | None = None):
+        self.text, self.error = text, error
+        self.calls: list[str | None] = []
+
+    def describe(self, name: str | None = None) -> str:
+        self.calls.append(name)
+        if self.error:
+            raise self.error
+        return self.text if name is None else f"{self.text} matching {name}"
 
 
 class FakeRetriever:

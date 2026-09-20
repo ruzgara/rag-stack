@@ -3,14 +3,23 @@
 Batch document ingestion for rag-stack.
 
 Pipeline per file in data/inbox (up to DOCLING_LOC_NUM_WORKERS files at once):
-  1. PDF triage, per page and without rendering: born-digital (visible text,
-     not covered by an image) vs scanned (page-sized image, with or without
-     an old invisible OCR layer).
-  2. Born-digital PDFs: docling-serve converts the embedded text, no OCR.
-     If that text fails the quality gate, the file drops to step 3.
-  3. Scanned PDFs: tesseract orientation detection marks sideways/upside-down
-     pages rotated (lossless, nothing is rasterized), then docling-serve OCRs
-     every page with ocrmac (Apple Vision). Images go straight to ocrmac.
+  1. PDF triage, per page and without rendering: "digital" (visible text, not
+     covered by an image), "scan" (a page-sized image with no text layer of
+     its own, or a few real lines stamped over it), "stale-ocr" (a page-sized
+     image carrying someone else's invisible OCR text) or "empty".
+  2. Any stale-ocr page routes the whole file to step 3 (force_ocr has to
+     replace that text, and docling-serve takes one option set per file).
+     Otherwise: docling-serve converts the embedded text, no OCR -- it is
+     exactly what the typesetter wrote, which no OCR engine can match. Any
+     scan pages (a cover, an inserted plate) only get their own images
+     OCR'd; the good text elsewhere is kept. A digital page's sideways angle
+     comes from its text matrices; a scan page's comes from tesseract OSD,
+     run only on that page. If the embedded text fails the quality gate, the
+     file drops to step 3.
+  3. Force-OCR PDFs: OSD measures rotation on scan/stale-ocr pages (digital
+     pages still use their text matrices), lossless rotation is applied, then
+     docling-serve OCRs every page with ocrmac (Apple Vision), replacing any
+     old OCR layer. Images go straight to ocrmac.
   4. Quality gate: too little text or too many junk characters -> VLM
      fallback (docling-serve vlm pipeline with the configured Ollama model).
   5. PDFs: heading levels (headings.py). docling marks every heading level 1;
@@ -35,6 +44,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -43,6 +53,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,10 +82,16 @@ SUPPORTED_SUFFIXES = PDF_SUFFIXES | IMAGE_SUFFIXES | {
 }
 
 JUNK_CHAR_RE = re.compile(r"[�\x00-\x08\x0b\x0c\x0e-\x1f]")
+# The same characters minus the replacement char, stripped from the output.
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Document fields that hold text; everything else in the JSON is left alone.
+TEXT_KEYS = {"text", "orig", "caption"}
 
 # A page counts as scanned when images cover more than this share of it.
 # Born-digital pages with figures sit well below; scans are ~1.0.
 SCAN_IMAGE_COVER = 0.5
+# Share of a page's text objects that must agree before it counts as sideways.
+ROTATION_MIN_SHARE = 0.6
 # Resolution pages are rendered at for orientation detection only.
 OSD_DPI = 150
 # Minimum tesseract orientation confidence to rotate a page. Sideways pages
@@ -182,7 +199,11 @@ def append_manifest(result: Result) -> None:
 # -------------------------------------------------------------------- triage --
 
 def page_needs_ocr(page) -> str:
-    """'digital', 'scanned' or 'empty', from the page's objects alone."""
+    """'digital', 'scan', 'stale-ocr' or 'empty', from the page's objects
+    alone. The distinction that matters isn't how much of the page is a scan,
+    it's whether an old OCR text layer needs overwriting: that's the only
+    case that requires force_ocr, since it's the only case where docling
+    would otherwise trust text it shouldn't."""
     width, height = page.get_size()
     image_area = 0.0
     visible = invisible = 0
@@ -195,24 +216,30 @@ def page_needs_ocr(page) -> str:
                 invisible += 1
             else:
                 visible += 1
-    # A page-sized image means a scan, whether its text is missing, an old
-    # invisible OCR layer, or a few real lines laid over the scan.
     if image_area / (width * height) > SCAN_IMAGE_COVER:
-        return "scanned"
+        # A page-sized image with an invisible text layer is someone else's
+        # OCR result sitting under the scan; visible text here is a stamp,
+        # not a substitute for reading the image.
+        return "stale-ocr" if invisible else "scan"
     if visible:
         return "digital"
-    return "scanned" if invisible else "empty"
+    return "stale-ocr" if invisible else "empty"
 
 
-def triage_pdf(path: Path) -> tuple[int, dict[str, int]]:
-    """Page count and how many pages are digital / scanned / empty."""
-    counts = {"digital": 0, "scanned": 0, "empty": 0}
+def triage_pdf(path: Path) -> tuple[int, dict[str, int], list[str]]:
+    """Page count, how many pages are digital / scan / stale-ocr / empty, and
+    the per-page labels in page order (the rotation step needs to know which
+    pages are which)."""
+    counts = {"digital": 0, "scan": 0, "stale-ocr": 0, "empty": 0}
+    labels: list[str] = []
     with PDFIUM_LOCK:
         pdf = pdfium.PdfDocument(path)
         try:
             for i in range(len(pdf)):
-                counts[page_needs_ocr(pdf[i])] += 1
-            return len(pdf), counts
+                label = page_needs_ocr(pdf[i])
+                counts[label] += 1
+                labels.append(label)
+            return len(pdf), counts, labels
         finally:
             pdf.close()
 
@@ -227,49 +254,97 @@ def detect_orientation(png: Path) -> tuple[int, float]:
     return (int(rotate.group(1)) if rotate else 0, float(conf.group(1)) if conf else 0.0)
 
 
-def fix_rotation(path: Path, sha: str, workers: int) -> tuple[Path, list[int]]:
-    """Mark sideways or upside-down pages rotated. docling never rotates pages
-    itself, and OCRs a sideways table into a transposed one. Only the page's
-    /Rotate flag changes -- nothing is rasterized. Returns the path to convert
-    (a copy in data/work if any page was rotated) and the rotated page numbers."""
-    if not shutil.which("tesseract"):
-        log("  ! tesseract not found (brew install tesseract); skipping rotation detection")
-        return path, []
+def fix_rotation(path: Path, sha: str, labels: list[str], workers: int) -> tuple[Path, list[int]]:
+    """Mark sideways or upside-down pages rotated, measuring each page the
+    cheap way when it's available. A "digital" page states its angle exactly
+    in its text objects' matrices (free, no rendering). A "scan" or
+    "stale-ocr" page has no reliable text of its own, so it's measured by
+    tesseract OSD on a rendered page instead -- run only on those pages, so a
+    129-page book with one scanned cover renders 1 page, not 129, while a
+    150-page scan with no text layer still gets OSD everywhere. docling never
+    rotates pages itself, and OCRs a sideways table into a transposed one.
+    Only the page's /Rotate flag changes -- nothing is rasterized. Returns the
+    path to convert (a copy in data/work if any page was rotated) and the
+    rotated page numbers."""
+    osd_indices = [i for i, label in enumerate(labels) if label in ("scan", "stale-ocr")]
 
-    t0 = time.monotonic()
-    with tempfile.TemporaryDirectory(dir=WORK, prefix=f"{sha[:12]}-osd-") as tmp:
-        with PDFIUM_LOCK:
-            pdf = pdfium.PdfDocument(path)
-            n_pages = len(pdf)
-        try:
-            pngs = []
-            for i in range(n_pages):
-                # Lock per page, not per document, so a long book doesn't
-                # stall the other file's triage and rendering.
+    to_rotate: dict[int, int] = {i: a for i, a in text_rotations(path).items() if labels[i] == "digital"}
+    if digital := sum(1 for label in labels if label == "digital"):
+        vprint(f"  rotation: {digital} digital page(s) measured from text matrices, "
+               f"sideways: {[i + 1 for i in to_rotate] or 'none'}")
+
+    if osd_indices:
+        if not shutil.which("tesseract"):
+            log("  ! tesseract not found (brew install tesseract); skipping OSD for scanned pages")
+        else:
+            t0 = time.monotonic()
+            with tempfile.TemporaryDirectory(dir=WORK, prefix=f"{sha[:12]}-osd-") as tmp:
+                pngs = []
                 with PDFIUM_LOCK:
-                    bitmap = pdf[i].render(scale=OSD_DPI / 72, grayscale=True)
-                    image = bitmap.to_pil()
-                png = Path(tmp) / f"{i}.png"
-                image.save(png)
-                pngs.append(png)
-        finally:
-            with PDFIUM_LOCK:
-                pdf.close()
-        with ThreadPoolExecutor(workers) as pool:
-            orientations = list(pool.map(detect_orientation, pngs))
+                    pdf = pdfium.PdfDocument(path)
+                try:
+                    for i in osd_indices:
+                        # Lock per page, not per document, so a long book
+                        # doesn't stall the other file's triage and rendering.
+                        with PDFIUM_LOCK:
+                            image = pdf[i].render(scale=OSD_DPI / 72, grayscale=True).to_pil()
+                        png = Path(tmp) / f"{i}.png"
+                        image.save(png)
+                        pngs.append((i, png))
+                finally:
+                    with PDFIUM_LOCK:
+                        pdf.close()
+                with ThreadPoolExecutor(workers) as pool:
+                    orientations = list(pool.map(detect_orientation, [png for _, png in pngs]))
+            osd_rotate = {i: rot for (i, _), (rot, conf) in zip(pngs, orientations)
+                          if rot and conf >= OSD_MIN_CONFIDENCE}
+            vprint(f"  rotation: OSD checked {len(osd_indices)} scanned page(s) in {time.monotonic() - t0:.1f}s, "
+                   f"sideways: {[i + 1 for i in osd_rotate] or 'none'}")
+            to_rotate |= osd_rotate
 
-    to_rotate = {i: rot for i, (rot, conf) in enumerate(orientations) if rot and conf >= OSD_MIN_CONFIDENCE}
-    vprint(f"  rotation: checked {len(orientations)} pages in {time.monotonic() - t0:.1f}s, "
-           f"rotating {[i + 1 for i in to_rotate] or 'none'}")
+    return apply_rotations(path, sha, to_rotate)
+
+
+def text_rotations(path: Path) -> dict[int, int]:
+    """Pages whose embedded text runs sideways, and the clockwise rotation that
+    puts it upright. Books typeset wide tables rotated on a portrait page, and
+    docling's layout model reads the rendered image, so it sees those pages
+    sideways unless the page is marked rotated. A born-digital page states its
+    angle exactly in each text object's matrix, so unlike tesseract OSD this
+    costs no rendering and no OCR."""
+    out: dict[int, int] = {}
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(path)
+        try:
+            for i in range(len(pdf)):
+                angles: Counter[int] = Counter()
+                for obj in pdf[i].get_objects(max_depth=3):
+                    if obj.type == pdfium_c.FPDF_PAGEOBJ_TEXT:
+                        matrix = obj.get_matrix()
+                        angles[round(math.degrees(math.atan2(matrix.b, matrix.a)) / 90) % 4 * 90] += 1
+                if not angles:
+                    continue
+                angle, count = angles.most_common(1)[0]
+                if angle and count >= ROTATION_MIN_SHARE * sum(angles.values()):
+                    out[i] = angle
+            return out
+        finally:
+            pdf.close()
+
+
+def apply_rotations(path: Path, sha: str, to_rotate: dict[int, int]) -> tuple[Path, list[int]]:
+    """Mark the given pages rotated in a copy under data/work. Only the /Rotate
+    flag changes; nothing is rasterized. Returns the path to convert and the
+    rotated page numbers."""
     if not to_rotate:
         return path, []
-
     out = WORK / f"{sha}.pdf"
     with PDFIUM_LOCK:
         pdf = pdfium.PdfDocument(path)
         try:
             for i, rot in to_rotate.items():
                 pdf[i].set_rotation((pdf[i].get_rotation() + rot) % 360)
+            WORK.mkdir(parents=True, exist_ok=True)
             pdf.save(out)
         finally:
             pdf.close()
@@ -316,12 +391,19 @@ def docling_convert(client: httpx.Client, cfg: Config, path: Path, options: dict
     return md, doc_json
 
 
-def convert_digital(client: httpx.Client, cfg: Config, path: Path) -> tuple[str, dict]:
-    return docling_convert(client, cfg, path, {
+def convert_digital(client: httpx.Client, cfg: Config, path: Path, ocr_images: bool = False) -> tuple[str, dict]:
+    """The embedded text, unchanged. With ocr_images, docling also OCRs the
+    bitmap areas -- the scanned pages of an otherwise digital book -- while
+    leaving the pages that have text of their own alone (force_ocr stays off)."""
+    options = {
         "do_ocr": "false",
         "table_mode": "accurate",
         "pdf_backend": "dlparse_v4",
-    }, "digital")
+    }
+    if ocr_images:
+        options |= {"do_ocr": "true", "force_ocr": "false",
+                    "ocr_engine": "ocrmac", "ocr_lang": cfg.ocr_lang}
+    return docling_convert(client, cfg, path, options, "digital+ocr-images" if ocr_images else "digital")
 
 
 def convert_ocr(client: httpx.Client, cfg: Config, path: Path) -> tuple[str, dict]:
@@ -355,6 +437,25 @@ def convert_vlm(client: httpx.Client, cfg: Config, path: Path) -> tuple[str, dic
         "pipeline": "vlm",
         "vlm_pipeline_model_api": json.dumps(vlm_api),
     }, "vlm")
+
+
+def strip_control_chars(md: str, doc_json: dict) -> tuple[str, dict]:
+    """Drop control characters from the converted text. Symbol fonts map their
+    bullets and dingbats to code points like 0x07, which come through as
+    control characters in the embedded text -- readable neither to a person nor
+    to the embedding model. Runs after the quality gate, which needs to see
+    them: a page that is mostly junk means a broken font map, not a bullet."""
+    def clean(value):
+        if isinstance(value, str):
+            return CONTROL_CHAR_RE.sub("", value)
+        if isinstance(value, list):
+            return [clean(v) for v in value]
+        if isinstance(value, dict):
+            return {k: (clean(v) if k in TEXT_KEYS or isinstance(v, (list, dict)) else v)
+                    for k, v in value.items()}
+        return value
+
+    return CONTROL_CHAR_RE.sub("", md), clean(doc_json)
 
 
 def quality_gate_reason(md: str, pages: int, min_chars_per_page: int) -> str | None:
@@ -412,30 +513,49 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, sha: str, osd_wor
         convert_path = path
 
         if suffix in PDF_SUFFIXES:
-            pages, counts = triage_pdf(path)
+            pages, counts, labels = triage_pdf(path)
             vprint(f"  sha256={sha}, pages={pages}: {counts['digital']} digital, "
-                   f"{counts['scanned']} scanned, {counts['empty']} empty")
-            needs_ocr = counts["scanned"] > 0
+                   f"{counts['scan']} scan, {counts['stale-ocr']} stale-ocr, {counts['empty']} empty")
+            # Only a stale OCR layer needs force_ocr (it has to be overwritten,
+            # not trusted). A bare scan's own image is read by ocr_images on
+            # the digital route -- reading the whole book from pixels because
+            # of one scanned cover costs accuracy, not just time: OCR mangles
+            # what the embedded text has exactly (currency signs, rating
+            # codes) and loses the real table cells.
+            needs_ocr = bool(counts["stale-ocr"])
+            ocr_images = bool(counts["scan"]) and not needs_ocr
         else:
             pages = 1
+            labels = []
             needs_ocr = suffix in IMAGE_SUFFIXES
+            ocr_images = False
             vprint(f"  sha256={sha}, {suffix} file")
         result.pages = pages
 
         md, doc_json = "", {}
         if suffix in PDF_SUFFIXES and not needs_ocr:
-            route_parts.append("digital")
-            md, doc_json = convert_digital(client, cfg, path)
+            convert_path, rotated = fix_rotation(path, sha, labels, osd_workers)
+            if rotated:
+                route_parts.append(f"rotated:{len(rotated)}")
+            route_parts.append("digital+ocr-images" if ocr_images else "digital")
+            md, doc_json = convert_digital(client, cfg, convert_path, ocr_images=ocr_images)
             reason = quality_gate_reason(md, pages, cfg.min_chars_per_page)
             if reason:
                 # Embedded text can be garbage (fonts without a usable
                 # character map) even when it's visible; OCR the page images.
                 vprint(f"  quality gate: embedded text rejected ({reason}), switching to OCR")
                 needs_ocr = True
+                # That text is being read from pixels now, so its matrices are
+                # no more trustworthy than the characters were: measure every
+                # page's orientation with OSD instead.
+                labels = ["scan" if label == "digital" else label for label in labels]
 
         if needs_ocr:
             if suffix in PDF_SUFFIXES:
-                convert_path, rotated = fix_rotation(path, sha, osd_workers)
+                # This pass measures the pages the rejected one took from their
+                # text matrices, so its rotation tag is superseded.
+                route_parts = [p for p in route_parts if not p.startswith("rotated:")]
+                convert_path, rotated = fix_rotation(path, sha, labels, osd_workers)
                 if rotated:
                     route_parts.append(f"rotated:{len(rotated)}")
             route_parts.append("ocrmac")
@@ -451,6 +571,8 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, sha: str, osd_wor
             md, doc_json = convert_vlm(client, cfg, convert_path)
         else:
             vprint("  quality gate: passed")
+
+        md, doc_json = strip_control_chars(md, doc_json)
 
         if suffix in PDF_SUFFIXES and cfg.heading_levels and doc_json:
             md, doc_json, source = fix_heading_levels(convert_path, md, doc_json)

@@ -128,22 +128,50 @@ and run:
 file, `--reprocess` and `--fix-headings` (below) and `-v`/`--verbose`.
 
 There's nothing to configure per file. Each PDF is first triaged page by
-page (instant, nothing is rendered):
+page (instant, nothing is rendered) into one of four labels:
 
-- **Born-digital** (visible text, not covered by a page-sized image): Docling
-  converts the embedded text directly — no OCR, exact text, ~0.1 s/page. If
-  that text fails the quality check (e.g. fonts with no usable character
-  map), the file is OCR'd instead.
-- **Scanned** (any page that's a page-sized image — with no text, an old
-  invisible OCR layer, or a few real lines over the scan): tesseract's
-  orientation detection finds sideways or upside-down pages and marks them
-  rotated (lossless — the PDF's page rotation flag, nothing is
-  rasterized), then Docling OCRs every page with **ocrmac** (Apple
-  Vision), replacing any old OCR layer. ~0.5–0.8 s/page. Without the
-  rotation step, a table printed sideways comes out transposed.
+- **digital**: visible text, not covered by a page-sized image.
+- **scan**: a page-sized image with no text layer of its own, or with a few
+  real lines stamped over it (a signature block, a page number).
+- **stale-ocr**: a page-sized image carrying someone else's invisible OCR
+  text layer underneath.
+- **empty**: neither text nor a page-sized image.
 
-A document is OCR'd as a whole if any of its pages needs it. Images are
-OCR'd with ocrmac too; other formats (docx, html…) are converted directly.
+Any `stale-ocr` page sends the whole file through OCR with `force_ocr` on,
+because that old text layer has to be overwritten, not trusted — and
+docling-serve takes one option set for the whole file, so there's no way to
+force just that page and leave the rest alone. A document with a minority of
+stale-ocr pages still pays for full OCR on every page; splitting the PDF and
+merging the resulting DoclingDocuments would fix that, but isn't done here.
+
+Otherwise, Docling converts the embedded text directly — no OCR, exact text,
+~0.1 s/page — and any `scan` pages just have their own images OCR'd with
+**ocrmac** (Apple Vision, `do_ocr=true, force_ocr=false`), leaving pages that
+have real text alone. This is what saves a book with a scanned cover or an
+inserted plate: OCR'ing the whole thing to catch one page would read a `£`
+as `€` and a `Baa2` rating as `Baaz`, and rebuild table cells that the
+embedded text already states exactly. If the embedded text fails the quality
+check (e.g. fonts with no usable character map), the file drops to full OCR
+instead.
+
+The force-OCR route (any stale-ocr page, or embedded text that failed the
+quality check) OCRs every page with ocrmac, replacing any old OCR layer,
+~0.5–0.8 s/page.
+
+Sideways or upside-down pages are marked rotated (lossless — the PDF's page
+rotation flag, nothing is rasterized) before conversion either way, but the
+angle is measured differently per page: a `digital` page states its angle
+exactly in its text objects' matrices, for free. A `scan` or `stale-ocr`
+page has no text of its own to measure, so tesseract's orientation
+detection runs on a render of just that page. This means a 129-page book
+with a single scanned cover renders and OSDs one page, not 129, while a
+150-page scan with no text layer still gets OSD everywhere it needs it.
+Without the rotation step, a table printed sideways comes out transposed.
+
+Images are OCR'd with ocrmac too; other formats (docx, html…) are converted
+directly. Control characters are stripped from the result: symbol fonts map
+their bullets to code points like 0x07, which mean nothing to a reader or to
+the embedding model.
 Then comes a quality check and, only if that fails (or you pass
 `--force-vlm`), Docling's VLM pipeline using your configured `VLM_MODEL`
 as a last resort.
@@ -428,6 +456,11 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
 - **A sideways page wasn't rotated** — orientation detection skips pages it
   isn't confident about (mostly near-blank ones). Check with `ingest -v`,
   which lists the pages it rotated.
+- **A born-digital book was OCR'd anyway** — check `route` in
+  `data/manifest.jsonl`: `ocrmac` on a document whose pages are digital
+  means one page triaged as `stale-ocr` (an old invisible OCR layer under a
+  scan), or the quality gate rejected the embedded text. `ingest -v` prints
+  the page triage.
 - **Versions**: `compose.yaml` pins `qdrant/qdrant` to a specific tag,
   checked at the time this repo was written — that's the only image that
   currently matters for this stack. If a pull fails because the tag was

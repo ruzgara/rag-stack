@@ -1,5 +1,6 @@
+import httpx
 import pytest
-from conftest import CHAT_ENV, FakeOllama, FakeRetriever, answer, make_hit, tool_call
+from conftest import CHAT_ENV, FakeLibrary, FakeOllama, FakeRetriever, answer, calls, make_hit, tool_call
 
 from chat import ChatConfig, ChatError, ChatService, Source, resolve_citations, trim_history
 
@@ -8,10 +9,12 @@ def config(**env) -> ChatConfig:
     return ChatConfig.from_env({**CHAT_ENV, **{k: str(v) for k, v in env.items()}})
 
 
-def service(results=None, ollama: FakeOllama | None = None, **env) -> tuple[ChatService, FakeRetriever, FakeOllama]:
+def service(results=None, ollama: FakeOllama | None = None, library=None,
+            **env) -> tuple[ChatService, FakeRetriever, FakeOllama]:
     retriever = FakeRetriever(results or {})
     ollama = ollama or FakeOllama(streams=[answer("ok")])
-    return ChatService(retriever, config(**env), client=ollama.client()), retriever, ollama
+    return (ChatService(retriever, config(**env), client=ollama.client(), library=library or FakeLibrary()),
+            retriever, ollama)
 
 
 def run(svc: ChatService, question: str, history=None, preset=None) -> tuple[list[dict], object]:
@@ -246,3 +249,68 @@ def test_an_ollama_error_mid_stream_is_raised():
     svc, _, _ = service({}, ollama)
     with pytest.raises(ChatError, match="model runner crashed"):
         run(svc, "q")
+
+
+# ------------------------------------------------------- the document list --
+
+def test_the_model_can_ask_what_the_knowledge_base_holds():
+    ollama = FakeOllama(streams=[calls({"name": "list_documents", "arguments": {}}), answer("Two books.")])
+    lib = FakeLibrary()
+    svc, _, _ = service({}, ollama, library=lib)
+    events, result = run(svc, "what documents do you have?")
+
+    assert [e for e in events if e["type"] == "listing"] == [{"type": "listing", "document": ""}]
+    assert lib.calls == [None]
+    second = [r for r in ollama.chat_requests if r.get("stream")][1]["messages"]
+    assert second[-1] == {"role": "tool", "tool_name": "list_documents",
+                          "content": "The knowledge base holds 2 document(s)."}
+    assert result.answer == "Two books."
+    assert result.sources == [] and result.cited == []   # a listing is not a citable source
+    assert result.stats["listed_documents"] == 1
+
+
+def test_one_document_can_be_looked_up_by_name():
+    ollama = FakeOllama(streams=[calls({"name": "list_documents", "arguments": {"document": "basel"}}),
+                                 answer("It covers the NSFR.")])
+    lib = FakeLibrary()
+    svc, _, _ = service({}, ollama, library=lib)
+    events, _ = run(svc, "what does the basel paper cover?")
+    assert lib.calls == ["basel"]
+    assert [e for e in events if e["type"] == "listing"] == [{"type": "listing", "document": "basel"}]
+
+
+def test_the_document_list_is_offered_as_a_tool_beside_search():
+    ollama = FakeOllama(streams=[answer("ok")])
+    svc, _, _ = service({}, ollama)
+    run(svc, "q")
+    tools = [r for r in ollama.chat_requests if r.get("stream")][0]["tools"]
+    assert [t["function"]["name"] for t in tools] == ["search_documents", "list_documents"]
+
+
+def test_a_broken_document_list_doesnt_fail_the_answer():
+    ollama = FakeOllama(streams=[calls({"name": "list_documents", "arguments": {}}), answer("Can't tell just now.")])
+    svc, _, _ = service({}, ollama, library=FakeLibrary(error=httpx.ConnectError("qdrant down")))
+    _, result = run(svc, "what do you have?")
+    second = [r for r in ollama.chat_requests if r.get("stream")][1]["messages"]
+    assert "The document list is unavailable" in second[-1]["content"]
+    assert result.answer == "Can't tell just now."
+
+
+def test_the_listing_counts_against_the_source_budget():
+    listing = "x" * 4000
+    ollama = FakeOllama(streams=[calls({"name": "list_documents", "arguments": {}}), answer("ok")])
+    svc, _, _ = service({}, ollama, library=FakeLibrary(text=listing))
+    _, result = run(svc, "q")
+    assert result.stats["source_tokens"] >= len(listing) // 4
+
+
+def test_both_tools_can_be_called_in_one_round():
+    ollama = FakeOllama(streams=[calls({"name": "list_documents", "arguments": {}},
+                                       {"name": "search_documents", "arguments": {"query": "bonds"}}),
+                                 answer("Answer [1].")])
+    svc, retriever, _ = service({"bonds": [make_hit("a", ["BONDS"])]}, ollama)
+    _, result = run(svc, "q")
+    assert [s.point_id for s in result.sources] == ["a"]
+    tool_messages = [m for m in [r for r in ollama.chat_requests if r.get("stream")][1]["messages"]
+                     if m["role"] == "tool"]
+    assert [m["tool_name"] for m in tool_messages] == ["list_documents", "search_documents"]

@@ -204,6 +204,7 @@ def send_message(conv_id: str, body: NewMessage) -> StreamingResponse:
       user      the stored question {id}
       rewrite   {query, search}: whether to search at all, and the (standalone) search query
       searching {query, found_by}: a search is running (auto or tool)
+      listing   {document}: the model asked what the knowledge base holds
       sources   {sources: [...]}: passages added, numbered for citation
       thinking  {text}: reasoning tokens (presets with thinking on)
       token     {text}: answer tokens

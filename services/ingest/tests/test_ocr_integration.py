@@ -43,8 +43,8 @@ def converted(cfg, tmp_path_factory) -> dict:
     """The fixture page through the real OCR route, once for all tests."""
     monkeypatch = pytest.MonkeyPatch()  # module-scoped, so not the fixture
     monkeypatch.setattr(ingest, "WORK", tmp_path_factory.mktemp("work"))
-    pages, counts = ingest.triage_pdf(FIXTURE)
-    work, rotated = ingest.fix_rotation(FIXTURE, "fixture", 2)
+    pages, counts, labels = ingest.triage_pdf(FIXTURE)
+    work, rotated = ingest.fix_rotation(FIXTURE, "fixture", labels, 2)
     with httpx.Client() as client:
         md, doc = ingest.convert_ocr(client, cfg, work)
     fixed_md, fixed_doc, source = ingest.fix_heading_levels(work, md, doc)
@@ -66,7 +66,7 @@ def table_rows(md: str) -> dict[str, str]:
 # ------------------------------------------------------------------ route --
 
 def test_the_page_is_recognised_as_a_scan(converted):
-    assert (converted["pages"], converted["counts"]) == (1, {"digital": 0, "scanned": 1, "empty": 0})
+    assert (converted["pages"], converted["counts"]) == (1, {"digital": 0, "scan": 1, "stale-ocr": 0, "empty": 0})
 
 
 def test_the_sideways_page_is_turned_upright(converted):

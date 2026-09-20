@@ -184,6 +184,7 @@ async function send(text) {
         }
         else if (ev === "rewrite") log(data.search ? `rewritten: “${data.query}”` : "no search needed");
         else if (ev === "searching") log(`${data.found_by === "tool" ? "tool search" : "search"}: “${data.query}”`);
+        else if (ev === "listing") log(data.document ? `looking up document: “${data.document}”` : "listing the knowledge base");
         else if (ev === "sources") { sources.push(...data.sources); showSources(sources); }
         else if (ev === "done") {
           renderAnswer(body, data.answer, data.sources); showSources(data.sources);
