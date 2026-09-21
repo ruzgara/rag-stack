@@ -220,6 +220,11 @@ CREATE TABLE IF NOT EXISTS workspace_libraries (
 );
 """
 
+# A chat inside a workspace has no libraries of its own: it searches whatever
+# its workspace holds at the time of each turn, so attaching a library to the
+# workspace reaches every chat in it, old ones included. conversation_libraries
+# is only read and written for chats outside any workspace.
+
 # Everything in one go -- no migrations. This system has never shipped
 # outside dev, so there's no installed base to carry forward; when the
 # schema changes, it changes here and dev databases get dropped and
@@ -229,6 +234,11 @@ SCHEMA += ACCOUNTS_SCHEMA + LIBRARIES_SCHEMA + WORKSPACES_SCHEMA
 
 class NotFound(Exception):
     pass
+
+
+class WorkspaceLibraries(ValueError):
+    """Raised on an attempt to give a chat inside a workspace its own
+    libraries -- they come from the workspace (see the note above SCHEMA)."""
 
 
 class ChatDB:
@@ -360,13 +370,9 @@ class ChatDB:
         now = time.time()
         conv = {"id": uuid.uuid4().hex, "title": title, "preset": preset, "workspace_id": workspace_id,
                 "created_at": now, "updated_at": now, "deleted": 0, "archived": 0}
+        if workspace_id is not None and library_ids is not None:
+            raise WorkspaceLibraries("a chat in a workspace uses the workspace's libraries")
         with self._conn() as db:
-            # A chat placed in a workspace starts with that workspace's
-            # libraries unless the caller named its own -- otherwise a
-            # workspace's libraries would be a table nothing ever reads.
-            if library_ids is None and workspace_id is not None:
-                library_ids = [r["library_id"] for r in db.execute(
-                    "SELECT library_id FROM workspace_libraries WHERE workspace_id = ?", (workspace_id,))]
             db.execute(
                 "INSERT INTO conversations (id, user_id, title, preset, workspace_id, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -375,8 +381,18 @@ class ChatDB:
             if library_ids:
                 db.executemany("INSERT INTO conversation_libraries (conversation_id, library_id) VALUES (?, ?)",
                                [(conv["id"], lib_id) for lib_id in library_ids])
-        conv["library_ids"] = library_ids or []
+            conv["library_ids"] = self._library_ids(db, conv["id"], workspace_id)
         return conv
+
+    @staticmethod
+    def _library_ids(db: sqlite3.Connection, conv_id: str, workspace_id: str | None) -> list[str]:
+        """A chat's effective libraries: its workspace's if it has one,
+        otherwise its own."""
+        if workspace_id is not None:
+            return [r["library_id"] for r in db.execute(
+                "SELECT library_id FROM workspace_libraries WHERE workspace_id = ?", (workspace_id,))]
+        return [r["library_id"] for r in db.execute(
+            "SELECT library_id FROM conversation_libraries WHERE conversation_id = ?", (conv_id,))]
 
     def list_conversations(self, user_id: str, workspace_id: str | None = None, deleted: bool = False,
                            archived: bool = False) -> list[dict]:
@@ -414,9 +430,16 @@ class ChatDB:
             libs: dict[str, list[str]] = {}
             for r in db.execute(
                 """SELECT cl.conversation_id, cl.library_id FROM conversation_libraries cl
-                   JOIN conversations c ON c.id = cl.conversation_id WHERE c.user_id = ?""", (user_id,)):
+                   JOIN conversations c ON c.id = cl.conversation_id
+                   WHERE c.user_id = ? AND c.workspace_id IS NULL""", (user_id,)):
                 libs.setdefault(r["conversation_id"], []).append(r["library_id"])
-        return [{**dict(r), "library_ids": libs.get(r["id"], [])} for r in rows]
+            ws_libs: dict[str, list[str]] = {}
+            for r in db.execute(
+                """SELECT wl.workspace_id, wl.library_id FROM workspace_libraries wl
+                   JOIN workspaces w ON w.id = wl.workspace_id WHERE w.owner_id = ?""", (user_id,)):
+                ws_libs.setdefault(r["workspace_id"], []).append(r["library_id"])
+        return [{**dict(r), "library_ids": ws_libs.get(r["workspace_id"], []) if r["workspace_id"] is not None
+                 else libs.get(r["id"], [])} for r in rows]
 
     def get_conversation(self, conv_id: str, user_id: str, with_messages: bool = True) -> dict:
         with self._conn() as db:
@@ -432,8 +455,7 @@ class ChatDB:
             if row is None:
                 raise NotFound(conv_id)
             conv = dict(row)
-            conv["library_ids"] = [r["library_id"] for r in db.execute(
-                "SELECT library_id FROM conversation_libraries WHERE conversation_id = ?", (conv_id,))]
+            conv["library_ids"] = self._library_ids(db, conv_id, conv["workspace_id"])
             if not with_messages:
                 return conv
             messages = [self._message_dict(r) for r in db.execute(
@@ -451,7 +473,9 @@ class ChatDB:
 
     def update_conversation(self, conv_id: str, *, title: str | None = None, preset: str | None = None,
                             library_ids: list[str] | None = None, user_id: str) -> dict:
-        self.get_conversation(conv_id, user_id, with_messages=False)  # raises NotFound
+        conv = self.get_conversation(conv_id, user_id, with_messages=False)  # raises NotFound
+        if library_ids is not None and conv["workspace_id"] is not None:
+            raise WorkspaceLibraries("a chat in a workspace uses the workspace's libraries; change the workspace's")
         with self._conn() as db:
             if title is not None:
                 db.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conv_id))

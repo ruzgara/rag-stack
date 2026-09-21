@@ -41,7 +41,7 @@ from chat import ChatConfig, ChatError, ChatService
 from accounts import Accounts, Denied, Invalid, PERMISSIONS, User
 from auth import SESSION_MAX_AGE, Auth, as_http_error, hash_password, session_secret, verify_password
 import settings
-from db import ChatDB, NotFound
+from db import ChatDB, NotFound, WorkspaceLibraries
 from limits import Busy, Gate, GateConfig, UploadLimits
 from retrieval import REPO_ROOT, Retriever, SearchConfig, load_env
 
@@ -668,6 +668,20 @@ def list_libraries(user: User = CurrentUser) -> dict:
     return {"libraries": libraries}
 
 
+@app.post("/api/libraries", status_code=201)
+def create_library(body: NewLibrary, user: User = CurrentUser) -> dict:
+    """Self-service creation: any signed-in user may start a library, not
+    just an admin -- they become its owner and pick up library.read,
+    library.write and library.share on it at once (Accounts.create_owned_library),
+    so it's usable right away instead of invisible until someone grants
+    access to it. Compare POST /api/admin/libraries, which needs
+    libraries.manage and grants nothing automatically."""
+    try:
+        return state.accounts.create_owned_library(body.name, body.description, user)
+    except Invalid as exc:
+        raise as_http_error(exc) from None
+
+
 @app.get("/api/libraries/{library_id}")
 def library_detail(library_id: str, user: User = CurrentUser) -> dict:
     """A library's own documents (name, pages, ingest status/route), for
@@ -780,7 +794,9 @@ def admin_remove_document(library_id: str, doc_sha: str, admin: User = Libraries
 # holding the libraries and chats it was given. Deleting one is a soft
 # delete (see ChatDB.delete_workspace) that also hides its chats, though
 # neither is actually removed; libraries themselves stay regardless, since
-# they're the global, admin-managed rows from the section above.
+# they're the global, admin-managed rows from the section above. A chat in a
+# workspace searches the workspace's libraries as they are at each turn, so
+# changing them here changes what every chat in it searches.
 
 
 def _get_workspace(workspace_id: str, user: User) -> dict:
@@ -899,11 +915,16 @@ def _get_conversation(conv_id: str, user: User, with_messages: bool = True) -> d
 
 @app.post("/api/conversations", status_code=201)
 def create_conversation(body: NewConversation, user: User = Depends(requires("chat.use"))) -> dict:
+    """A chat inside a workspace takes no `library_ids`: it always searches
+    whatever the workspace holds at the time of each turn."""
     _check_libraries(user, body.library_ids)
     if body.workspace_id is not None:
         _get_workspace(body.workspace_id, user)  # 404 if missing or not this user's
-    return state.db.create_conversation(_check_preset(body.preset), body.title, user_id=user.id,
-                                        library_ids=body.library_ids, workspace_id=body.workspace_id)
+    try:
+        return state.db.create_conversation(_check_preset(body.preset), body.title, user_id=user.id,
+                                            library_ids=body.library_ids, workspace_id=body.workspace_id)
+    except WorkspaceLibraries as exc:
+        raise HTTPException(422, str(exc)) from None
 
 
 @app.get("/api/conversations")
@@ -928,6 +949,8 @@ def update_conversation(conv_id: str, body: ConversationUpdate, user: User = Cur
                                             library_ids=body.library_ids, user_id=user.id)
     except NotFound:
         raise HTTPException(404, "conversation not found") from None
+    except WorkspaceLibraries as exc:
+        raise HTTPException(422, str(exc)) from None
 
 
 @app.delete("/api/conversations/{conv_id}", status_code=204)

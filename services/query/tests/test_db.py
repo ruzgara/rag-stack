@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from db import ChatDB, NotFound
+from db import ChatDB, NotFound, WorkspaceLibraries
 
 USER = "user-under-test"
 OTHER = "someone-else"
@@ -491,7 +491,7 @@ def test_deleted_workspaces_are_listed_separately(db):
     assert [w["id"] for w in db.list_workspaces(deleted=True)] == [removed["id"]]
 
 
-def test_a_conversation_in_a_workspace_defaults_to_the_workspaces_libraries(db):
+def test_a_conversation_in_a_workspace_uses_the_workspaces_libraries(db):
     make_library(db, "lib-a", "A")
     ws = db.create_workspace("Research")
     db.update_workspace(ws["id"], library_ids=["lib-a"])
@@ -499,7 +499,43 @@ def test_a_conversation_in_a_workspace_defaults_to_the_workspaces_libraries(db):
     conv = db.create_conversation("everyday", workspace_id=ws["id"])
     assert conv["library_ids"] == ["lib-a"]
 
-    # Naming libraries explicitly overrides the workspace's.
+
+def test_changing_a_workspaces_libraries_reaches_its_existing_conversations(db):
+    make_library(db, "lib-a", "A")
     make_library(db, "lib-b", "B")
-    conv2 = db.create_conversation("everyday", workspace_id=ws["id"], library_ids=["lib-b"])
-    assert conv2["library_ids"] == ["lib-b"]
+    ws = db.create_workspace("Research")
+    db.update_workspace(ws["id"], library_ids=["lib-a"])
+    conv = db.create_conversation("everyday", workspace_id=ws["id"])
+
+    db.update_workspace(ws["id"], library_ids=["lib-a", "lib-b"])
+
+    assert db.get_conversation(conv["id"], with_messages=False)["library_ids"] == ["lib-a", "lib-b"]
+    assert db.list_conversations()[0]["library_ids"] == ["lib-a", "lib-b"]
+
+    db.update_workspace(ws["id"], library_ids=[])
+    assert db.get_conversation(conv["id"], with_messages=False)["library_ids"] == []
+    assert db.list_conversations()[0]["library_ids"] == []
+
+
+def test_a_conversation_in_a_workspace_cannot_have_its_own_libraries(db):
+    make_library(db, "lib-a", "A")
+    ws = db.create_workspace("Research")
+
+    with pytest.raises(WorkspaceLibraries):
+        db.create_conversation("everyday", workspace_id=ws["id"], library_ids=["lib-a"])
+
+    conv = db.create_conversation("everyday", workspace_id=ws["id"])
+    with pytest.raises(WorkspaceLibraries):
+        db.update_conversation(conv["id"], library_ids=["lib-a"])
+
+
+def test_a_conversation_outside_a_workspace_keeps_its_own_libraries(db):
+    make_library(db, "lib-a", "A")
+    make_library(db, "lib-b", "B")
+    ws = db.create_workspace("Research")
+    db.update_workspace(ws["id"], library_ids=["lib-b"])
+
+    conv = db.create_conversation("everyday", library_ids=["lib-a"])
+
+    assert db.get_conversation(conv["id"], with_messages=False)["library_ids"] == ["lib-a"]
+    assert db.list_conversations()[0]["library_ids"] == ["lib-a"]

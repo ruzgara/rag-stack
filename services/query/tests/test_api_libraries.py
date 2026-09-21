@@ -88,6 +88,54 @@ def test_a_librarys_grants_are_listed_the_other_way_round(acc, admin, member):
         {"subject_type": "user", "subject_id": member.id, "permission": "library.read", "effect": "allow"}]
 
 
+# --------------------------------------------------------- self-service creation --
+
+def test_a_plain_member_can_create_a_library(acc, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance", description="filings"), user=member)
+
+    assert lib["owner_id"] == member.id
+    assert lib["description"] == "filings"
+
+
+def test_a_member_created_library_appears_in_their_own_list_and_is_usable(acc, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
+
+    assert {l["id"] for l in api.list_libraries(user=member)["libraries"]} == {lib["id"]}
+
+    detail = api.library_detail(lib["id"], user=member)
+    assert detail["id"] == lib["id"]
+
+    assert acc.allowed(member.id, "library.write", lib["id"])
+    assert acc.allowed(member.id, "library.share", lib["id"])
+
+    target = acc.create_user("target@example.com", display_name="Target")
+    api.share_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,
+                                                   permission="library.read"), user=member)
+    assert acc.allowed(target.id, "library.read", lib["id"])
+
+
+def test_another_user_cannot_see_a_library_they_did_not_create_or_receive(acc, member):
+    api.create_library(api.NewLibrary(name="Project finance"), user=member)
+    other = acc.create_user("other@example.com", display_name="Other")
+
+    assert api.list_libraries(user=other)["libraries"] == []
+    with pytest.raises(HTTPException) as exc:
+        api.library_detail((acc.libraries()[0])["id"], user=other)
+    assert exc.value.status_code == 403
+
+
+def test_a_blank_library_name_is_rejected_for_self_service_creation(member):
+    with pytest.raises(HTTPException) as exc:
+        api.create_library(api.NewLibrary(name="   "), user=member)
+    assert exc.value.status_code == 400
+
+
+def test_the_admin_endpoint_still_grants_nothing_automatically(acc, admin):
+    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
+    assert acc.grants_of("user", admin.id) == []
+    assert api.list_libraries(user=admin)["libraries"][0]["id"] == lib["id"]  # sees it only as an admin
+
+
 # --------------------------------------------------------- listing for a user --
 
 def test_an_admin_sees_every_library_a_member_sees_only_readable_ones(acc, admin, member):

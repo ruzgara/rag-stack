@@ -266,7 +266,11 @@ class Accounts:
 
     # ----------------------------------------------------------- libraries --
 
-    def create_library(self, name: str, description: str | None = None, owner_id: str | None = None) -> dict:
+    def create_library(self, name: str, description: str | None = None, owner_id: str | None = None,
+                       *, grant_owner: bool = False) -> dict:
+        """`grant_owner` also gives the owner library.read, library.write and
+        library.share on the new library, in the same transaction --
+        owner_id alone confers no access (see effective_permissions)."""
         name = (name or "").strip()
         if not name:
             raise Invalid("a library needs a name")
@@ -277,6 +281,9 @@ class Accounts:
                 raise Invalid(f"a library called {name!r} already exists")
             db.execute("INSERT INTO libraries (id, name, description, owner_id, created_at) VALUES (?, ?, ?, ?, ?)",
                        (library["id"], name, description, owner_id, library["created_at"]))
+            if grant_owner and owner_id is not None:
+                for permission in ("library.read", "library.write", "library.share"):
+                    self._insert_grant(db, "user", owner_id, permission, library["id"], "allow")
         return library
 
     def libraries(self) -> list[dict]:
@@ -284,6 +291,12 @@ class Accounts:
             return [{**dict(r), "document_count": db.execute(
                 "SELECT COUNT(*) FROM library_documents WHERE library_id = ?", (r["id"],)).fetchone()[0]}
                 for r in db.execute("SELECT * FROM libraries ORDER BY name")]
+
+    def create_owned_library(self, name: str, description: str | None, owner: User) -> dict:
+        """Self-service creation: any signed-in user may create a library,
+        and comes away able to see, fill and share it rather than locked out
+        of their own creation until an admin catches up."""
+        return self.create_library(name, description, owner_id=owner.id, grant_owner=True)
 
     def library(self, library_id: str) -> dict:
         with self.db._conn() as db:
@@ -331,6 +344,19 @@ class Accounts:
 
     # -------------------------------------------------------------- grants --
 
+    def _insert_grant(self, db: sqlite3.Connection, subject_type: str, subject_id: str, permission: str,
+                      library_id: str | None, effect: str) -> None:
+        """The bare insert/upsert, on a connection the caller already holds
+        open -- so a grant can share a transaction with whatever else the
+        caller is doing (create_owned_library), not just stand alone the
+        way grant() below does."""
+        db.execute(
+            """INSERT INTO grants (id, subject_type, subject_id, permission, library_id, effect, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (subject_type, subject_id, permission, IFNULL(library_id, ''))
+               DO UPDATE SET effect = excluded.effect""",
+            (uuid.uuid4().hex, subject_type, subject_id, permission, library_id, effect, time.time()))
+
     def grant(self, subject_type: str, subject_id: str, permission: str, library_id: str | None = None,
               effect: str = "allow") -> None:
         if subject_type not in ("user", "group"):
@@ -342,12 +368,7 @@ class Accounts:
             table = "users" if subject_type == "user" else "groups"
             if not db.execute(f"SELECT 1 FROM {table} WHERE id = ?", (subject_id,)).fetchone():
                 raise NotFound(f"no {subject_type} {subject_id}")
-            db.execute(
-                """INSERT INTO grants (id, subject_type, subject_id, permission, library_id, effect, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT (subject_type, subject_id, permission, IFNULL(library_id, ''))
-                   DO UPDATE SET effect = excluded.effect""",
-                (uuid.uuid4().hex, subject_type, subject_id, permission, library_id, effect, time.time()))
+            self._insert_grant(db, subject_type, subject_id, permission, library_id, effect)
 
     def revoke(self, subject_type: str, subject_id: str, permission: str, library_id: str | None = None) -> None:
         """Removes the grant entirely, which is not the same as denying it: the

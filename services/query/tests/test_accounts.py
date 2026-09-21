@@ -468,6 +468,28 @@ def test_a_library_name_is_unique_and_not_blank(acc):
         acc.create_library("   ")
 
 
+def test_create_owned_library_grants_the_owner_full_access(acc):
+    owner = user(acc, "owner@example.com")
+    lib = acc.create_owned_library("Project finance", "bond and infrastructure filings", owner)
+
+    assert lib["owner_id"] == owner.id
+    assert acc.grants_of("user", owner.id) == [
+        {"permission": "library.read", "library_id": lib["id"], "effect": "allow"},
+        {"permission": "library.share", "library_id": lib["id"], "effect": "allow"},
+        {"permission": "library.write", "library_id": lib["id"], "effect": "allow"},
+    ]
+    assert acc.readable_libraries(owner.id) == {lib["id"]}
+
+
+def test_create_owned_library_rejects_a_blank_or_duplicate_name(acc):
+    owner = user(acc, "owner@example.com")
+    acc.create_owned_library("Project finance", None, owner)
+    with pytest.raises(Invalid, match="already exists"):
+        acc.create_owned_library("Project finance", None, owner)
+    with pytest.raises(Invalid, match="needs a name"):
+        acc.create_owned_library("   ", None, owner)
+
+
 def test_a_missing_library_is_not_found(acc):
     with pytest.raises(NotFound):
         acc.library("no-such-library")

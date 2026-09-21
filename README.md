@@ -379,9 +379,9 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | Endpoint | |
 |---|---|
 | `POST /api/workspaces` · `GET /api/workspaces` | create (`{name, description?}`), list your own workspaces |
-| `GET` · `PATCH` · `DELETE /api/workspaces/{id}` | open, rename / change `description` / change `library_ids`, delete (also deletes the chats in it) |
+| `GET` · `PATCH` · `DELETE /api/workspaces/{id}` | open, rename / change `description` / change `library_ids` (every chat in the workspace, old ones included, searches these), delete (also deletes the chats in it) |
 | `GET /api/workspaces/{id}/conversations` | chats in this workspace |
-| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?, workspace_id?}`), list |
+| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?, workspace_id?}`; `library_ids` only outside a workspace, 422 otherwise), list |
 | `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete |
 | `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error` |
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
@@ -389,6 +389,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `POST /api/upload` | multipart `files` (+ optional `library_id`) → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
 | `GET /api/quota` | what's left of your upload allowance, and how busy the machine is |
 | `GET /api/libraries` | libraries the caller can read, for attaching to a chat |
+| `POST /api/libraries` | any signed-in user creates a library (`{name, description?}`) and becomes its owner, with `library.read`/`write`/`share` on it right away |
 | `POST /api/auth/login` · `POST /api/auth/logout` | `{email, password}` → sets the session cookie; clear it |
 | `GET /api/auth/me` | the caller, their groups and their effective permissions — what a UI renders itself from |
 | `POST /api/auth/password` | `{current_password, new_password}`, which signs your other sessions out |
@@ -599,7 +600,10 @@ The admin API mirrors this (`GET/POST /api/admin/libraries`,
 /api/admin/libraries/{id}/documents/{sha}`, `GET /api/admin/documents`), and
 `GET /api/libraries` lists the libraries the caller can read, for a UI to
 offer when starting or editing a chat (`POST/PATCH /api/conversations`
-take `library_ids`).
+take `library_ids`). Any signed-in user can also start their own library
+with `POST /api/libraries`, no `libraries.manage` needed -- they become its
+owner and land with `library.read`/`write`/`share` on it, unlike a library
+made through the admin API, whose owner gets no automatic access at all.
 
 **No re-embedding.** The document → library mapping lives in SQLite; Qdrant
 is filtered on `doc_sha`, which every point already carries. Assigning a

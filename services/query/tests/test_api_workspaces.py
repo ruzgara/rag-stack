@@ -140,6 +140,34 @@ def test_a_conversation_can_be_created_inside_a_workspace(member):
     assert [c["id"] for c in api.list_workspace_conversations(ws["id"], user=member)] == [conv["id"]]
 
 
+def test_a_library_added_to_a_workspace_reaches_its_existing_chats(acc, member):
+    lib = acc.create_library("Project finance")
+    acc.grant("user", member.id, "library.read", lib["id"])
+    ws = api.create_workspace(api.NewWorkspace(name="Research"), user=member)
+    conv = api.create_conversation(api.NewConversation(preset="everyday", workspace_id=ws["id"]), user=member)
+    assert conv["library_ids"] == []
+
+    api.update_workspace(ws["id"], api.WorkspaceUpdate(library_ids=[lib["id"]]), user=member)
+
+    assert api.get_conversation(conv["id"], user=member)["library_ids"] == [lib["id"]]
+
+
+def test_a_chat_in_a_workspace_rejects_its_own_libraries(acc, member):
+    lib = acc.create_library("Project finance")
+    acc.grant("user", member.id, "library.read", lib["id"])
+    ws = api.create_workspace(api.NewWorkspace(name="Research"), user=member)
+
+    with pytest.raises(HTTPException) as exc:
+        api.create_conversation(api.NewConversation(preset="everyday", workspace_id=ws["id"],
+                                                    library_ids=[lib["id"]]), user=member)
+    assert exc.value.status_code == 422
+
+    conv = api.create_conversation(api.NewConversation(preset="everyday", workspace_id=ws["id"]), user=member)
+    with pytest.raises(HTTPException) as exc:
+        api.update_conversation(conv["id"], api.ConversationUpdate(library_ids=[lib["id"]]), user=member)
+    assert exc.value.status_code == 422
+
+
 def test_a_conversation_cannot_be_created_in_someone_elses_workspace(member, other_member):
     ws = api.create_workspace(api.NewWorkspace(name="Research"), user=member)
 
