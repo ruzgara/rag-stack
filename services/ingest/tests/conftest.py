@@ -15,6 +15,7 @@ from pathlib import Path
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytest
+from PIL import Image
 from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel, DoclingDocument, ProvenanceItem, Size
 
 PAGE_W, PAGE_H = 595.0, 842.0
@@ -67,6 +68,16 @@ def add_text(pdf: pdfium.PdfDocument, page: pdfium.PdfPage, text: str, x: float,
     l, b, r, t = (ctypes.c_float() for _ in range(4))
     pdfium_c.FPDFPageObj_GetBounds(obj, *(ctypes.byref(v) for v in (l, b, r, t)))
     return l.value, b.value, r.value, t.value
+
+
+def add_image(pdf: pdfium.PdfDocument, page: pdfium.PdfPage, x: float, y: float, w: float, h: float) -> None:
+    """Places a grey rectangle of w x h points with its bottom-left at (x, y):
+    a chart or a table pasted onto the page as a picture, with no text of its
+    own. Triage only measures the area it covers, so the pixels don't matter."""
+    image = pdfium.PdfImage.new(pdf)
+    image.set_bitmap(pdfium.PdfBitmap.from_pil(Image.new("L", (60, 80), 200)))
+    image.set_matrix(pdfium.PdfMatrix().scale(w, h).translate(x, y))
+    page.insert_obj(image)
 
 
 def build(path: Path, pages: list[list[Item]]) -> tuple[Path, dict]:

@@ -66,7 +66,8 @@ def table_rows(md: str) -> dict[str, str]:
 # ------------------------------------------------------------------ route --
 
 def test_the_page_is_recognised_as_a_scan(converted):
-    assert (converted["pages"], converted["counts"]) == (1, {"digital": 0, "scan": 1, "stale-ocr": 0, "empty": 0})
+    assert (converted["pages"], converted["counts"]) == (
+        1, {"digital": 0, "figure": 0, "scan": 1, "stale-ocr": 0, "empty": 0})
 
 
 def test_the_sideways_page_is_turned_upright(converted):

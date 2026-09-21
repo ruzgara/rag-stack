@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pypdfium2 as pdfium
 import pytest
-from conftest import BODY, PAGE_H, PAGE_W, H, add_text, levels_of
+from conftest import BODY, PAGE_H, PAGE_W, H, add_image, add_text, levels_of
 from PIL import Image
 
 import ingest
@@ -54,13 +54,22 @@ def test_triage_classifies_each_page(tmp_path):
     invisible_only = pdf.new_page(PAGE_W, PAGE_H)
     add_text(pdf, invisible_only, "hidden", 60, 700, "Times-Roman", 11, invisible=True)
     invisible_only.gen_content()               # invisible text, no image -> stale-ocr
+    figure = pdf.new_page(PAGE_W, PAGE_H)      # real text + a pasted-in chart -> figure
+    add_image(pdf, figure, 30, 450, 535, 320)
+    add_text(pdf, figure, "Figure 1. Ten common mistakes", 60, 700, "Times-Roman", 11)
+    figure.gen_content()
+    logo = pdf.new_page(PAGE_W, PAGE_H)        # text + a header logo -> still digital
+    add_image(pdf, logo, 450, 806, 96, 21)
+    add_text(pdf, logo, "Born-digital text", 60, 700, "Times-Roman", 11)
+    logo.gen_content()
     path = tmp_path / "mixed.pdf"
     pdf.save(path)
 
     pages, counts, labels = ingest.triage_pdf(path)
-    assert pages == 6
-    assert counts == {"digital": 1, "scan": 2, "stale-ocr": 2, "empty": 1}
-    assert labels == ["digital", "scan", "stale-ocr", "scan", "empty", "stale-ocr"]
+    assert pages == 8
+    assert counts == {"digital": 2, "figure": 1, "scan": 2, "stale-ocr": 2, "empty": 1}
+    assert labels == ["digital", "scan", "stale-ocr", "scan", "empty", "stale-ocr",
+                      "figure", "digital"]
 
 
 def mixed_pdf(path, scans: int, digital: int, sideways: tuple[int, ...] = (), stale_ocr: int = 0):
@@ -150,6 +159,60 @@ def test_a_fully_digital_pdf_is_not_given_an_ocr_engine(dirs, monkeypatch):
     assert result.route == "digital" and seen["ocr_images"] is False
 
 
+def figure_pdf(path, digital: int, figures: tuple[int, ...] = (), logos: bool = False):
+    """A born-digital PDF whose pages at the given indices also carry a
+    page-width chart pasted in as a picture. With logos, every page carries a
+    small header image too, as a publisher's template does."""
+    pdf = pdfium.PdfDocument.new()
+    for i in range(digital):
+        page = pdf.new_page(PAGE_W, PAGE_H)
+        if logos:
+            add_image(pdf, page, 450, 806, 96, 21)
+        if i in figures:
+            add_image(pdf, page, 30, 450, 535, 320)
+        add_text(pdf, page, "Born-digital text", 60, 700, "Times-Roman", 11)
+        page.gen_content()
+    pdf.save(path)
+    pdf.close()
+    return path
+
+
+def test_a_table_pasted_in_as_a_picture_is_read(dirs, monkeypatch):
+    """The bug this guards: a page of real text carrying a chart or a table as
+    a flat image was labelled 'digital', so ocr_images stayed off and the only
+    copy of that content -- its pixels -- was never read."""
+    doc = figure_pdf(dirs["INBOX"] / "report.pdf", digital=8, figures=(2,), logos=True)
+    seen = {}
+
+    def fake_digital(client, cfg, path, ocr_images=False):
+        seen["ocr_images"] = ocr_images
+        return "text " * 100, {"texts": []}
+
+    monkeypatch.setattr(ingest, "convert_digital", fake_digital)
+    monkeypatch.setattr(ingest, "convert_ocr", lambda *a: pytest.fail("one figure sent the whole document to force-OCR"))
+
+    result = ingest.process_one(None, config(heading_levels=False), doc, "abc123", osd_workers=1)
+
+    assert result.status == "processed", result.error
+    # force_ocr stays off, so the other seven pages keep their embedded text.
+    assert result.route == "digital+ocr-images"
+    assert seen["ocr_images"] is True
+
+
+def test_a_header_logo_does_not_send_a_document_to_ocr(dirs, monkeypatch):
+    """The counterweight: nearly every publisher stamps a logo on every page,
+    and OCR'ing a whole document over 96x21 points of it would cost time for
+    nothing."""
+    doc = figure_pdf(dirs["INBOX"] / "branded.pdf", digital=8, logos=True)
+    seen = {}
+    monkeypatch.setattr(ingest, "convert_digital",
+                        lambda client, cfg, path, ocr_images=False: (seen.update(ocr_images=ocr_images), "text " * 100, {"texts": []})[1:])
+
+    result = ingest.process_one(None, config(heading_levels=False), doc, "abc123", osd_workers=1)
+
+    assert result.route == "digital" and seen["ocr_images"] is False
+
+
 def test_convert_digital_leaves_pages_with_their_own_text_alone(monkeypatch):
     seen = {}
     monkeypatch.setattr(ingest, "docling_convert",
@@ -182,6 +245,21 @@ def test_a_sideways_digital_page_is_marked_rotated_without_rendering(tmp_path, m
     assert rotated == [3] and out == tmp_path / "work" / "abc123.pdf"
     pdf = pdfium.PdfDocument(out)
     assert [pdf[i].get_rotation() for i in range(3)] == [0, 0, 90]
+    pdf.close()
+
+
+def test_a_sideways_figure_page_is_measured_from_its_text_not_osd(tmp_path, monkeypatch):
+    """A figure page is born-digital -- its text states the angle exactly --
+    so carrying a chart mustn't demote it to a rendered OSD measurement."""
+    monkeypatch.setattr(ingest, "WORK", tmp_path / "work")
+    monkeypatch.setattr(ingest, "detect_orientation", lambda png: pytest.fail("a figure page was sent to OSD"))
+    path = mixed_pdf(tmp_path / "wide.pdf", scans=0, digital=2, sideways=(1,))
+
+    out, rotated = ingest.fix_rotation(path, "abc123", ["digital", "figure"], workers=1)
+
+    assert rotated == [2]
+    pdf = pdfium.PdfDocument(out)
+    assert [pdf[i].get_rotation() for i in range(2)] == [0, 90]
     pdf.close()
 
 

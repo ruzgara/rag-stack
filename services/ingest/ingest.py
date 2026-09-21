@@ -4,9 +4,11 @@ Batch document ingestion for rag-stack.
 
 Pipeline per file in data/inbox (up to DOCLING_LOC_NUM_WORKERS files at once):
   1. PDF triage, per page and without rendering: "digital" (visible text, not
-     covered by an image), "scan" (a page-sized image with no text layer of
-     its own, or a few real lines stamped over it), "stale-ocr" (a page-sized
-     image carrying someone else's invisible OCR text) or "empty".
+     covered by an image), "figure" (visible text plus an image big enough to
+     be a chart or a table picture, whose content is only in its pixels),
+     "scan" (a page-sized image with no text layer of its own, or a few real
+     lines stamped over it), "stale-ocr" (a page-sized image carrying someone
+     else's invisible OCR text) or "empty".
   2. Any stale-ocr page routes the whole file to step 3 (force_ocr has to
      replace that text, and docling-serve takes one option set per file).
      Otherwise: docling-serve converts the embedded text, no OCR -- it is
@@ -90,6 +92,13 @@ TEXT_KEYS = {"text", "orig", "caption"}
 # A page counts as scanned when images cover more than this share of it.
 # Born-digital pages with figures sit well below; scans are ~1.0.
 SCAN_IMAGE_COVER = 0.5
+# A digital page counts as carrying a figure when images cover more than this
+# share of it. A chart or a table pasted in as a picture runs ~0.2-0.4; a
+# header logo or an inline icon is ~0.005, well under.
+FIGURE_IMAGE_COVER = 0.05
+# Page labels whose text is the typesetter's own, so their rotation is read
+# from the text matrices rather than measured by OSD.
+DIGITAL_LABELS = ("digital", "figure")
 # Share of a page's text objects that must agree before it counts as sideways.
 ROTATION_MIN_SHARE = 0.6
 # Resolution pages are rendered at for orientation detection only.
@@ -204,11 +213,14 @@ def append_manifest(result: Result) -> None:
 # -------------------------------------------------------------------- triage --
 
 def page_needs_ocr(page) -> str:
-    """'digital', 'scan', 'stale-ocr' or 'empty', from the page's objects
-    alone. The distinction that matters isn't how much of the page is a scan,
-    it's whether an old OCR text layer needs overwriting: that's the only
-    case that requires force_ocr, since it's the only case where docling
-    would otherwise trust text it shouldn't."""
+    """'digital', 'figure', 'scan', 'stale-ocr' or 'empty', from the page's
+    objects alone. The distinction that matters isn't how much of the page is
+    a scan, it's whether an old OCR text layer needs overwriting: that's the
+    only case that requires force_ocr, since it's the only case where docling
+    would otherwise trust text it shouldn't. 'figure' is a second, weaker
+    signal: the page's own text is fine, but a chart or a table pasted in as
+    a picture carries content no embedded text holds, so the image wants
+    reading even though the page around it doesn't."""
     width, height = page.get_size()
     image_area = 0.0
     visible = invisible = 0
@@ -227,15 +239,15 @@ def page_needs_ocr(page) -> str:
         # not a substitute for reading the image.
         return "stale-ocr" if invisible else "scan"
     if visible:
-        return "digital"
+        return "figure" if image_area / (width * height) > FIGURE_IMAGE_COVER else "digital"
     return "stale-ocr" if invisible else "empty"
 
 
 def triage_pdf(path: Path) -> tuple[int, dict[str, int], list[str]]:
-    """Page count, how many pages are digital / scan / stale-ocr / empty, and
-    the per-page labels in page order (the rotation step needs to know which
-    pages are which)."""
-    counts = {"digital": 0, "scan": 0, "stale-ocr": 0, "empty": 0}
+    """Page count, how many pages are digital / figure / scan / stale-ocr /
+    empty, and the per-page labels in page order (the rotation step needs to
+    know which pages are which)."""
+    counts = {"digital": 0, "figure": 0, "scan": 0, "stale-ocr": 0, "empty": 0}
     labels: list[str] = []
     with PDFIUM_LOCK:
         pdf = pdfium.PdfDocument(path)
@@ -261,9 +273,9 @@ def detect_orientation(png: Path) -> tuple[int, float]:
 
 def fix_rotation(path: Path, sha: str, labels: list[str], workers: int) -> tuple[Path, list[int]]:
     """Mark sideways or upside-down pages rotated, measuring each page the
-    cheap way when it's available. A "digital" page states its angle exactly
-    in its text objects' matrices (free, no rendering). A "scan" or
-    "stale-ocr" page has no reliable text of its own, so it's measured by
+    cheap way when it's available. A "digital" or "figure" page states its
+    angle exactly in its text objects' matrices (free, no rendering). A "scan"
+    or "stale-ocr" page has no reliable text of its own, so it's measured by
     tesseract OSD on a rendered page instead -- run only on those pages, so a
     129-page book with one scanned cover renders 1 page, not 129, while a
     150-page scan with no text layer still gets OSD everywhere. docling never
@@ -273,8 +285,8 @@ def fix_rotation(path: Path, sha: str, labels: list[str], workers: int) -> tuple
     rotated page numbers."""
     osd_indices = [i for i, label in enumerate(labels) if label in ("scan", "stale-ocr")]
 
-    to_rotate: dict[int, int] = {i: a for i, a in text_rotations(path).items() if labels[i] == "digital"}
-    if digital := sum(1 for label in labels if label == "digital"):
+    to_rotate: dict[int, int] = {i: a for i, a in text_rotations(path).items() if labels[i] in DIGITAL_LABELS}
+    if digital := sum(1 for label in labels if label in DIGITAL_LABELS):
         vprint(f"  rotation: {digital} digital page(s) measured from text matrices, "
                f"sideways: {[i + 1 for i in to_rotate] or 'none'}")
 
@@ -520,15 +532,19 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, sha: str, osd_wor
         if suffix in PDF_SUFFIXES:
             pages, counts, labels = triage_pdf(path)
             vprint(f"  sha256={sha}, pages={pages}: {counts['digital']} digital, "
-                   f"{counts['scan']} scan, {counts['stale-ocr']} stale-ocr, {counts['empty']} empty")
+                   f"{counts['figure']} figure, {counts['scan']} scan, "
+                   f"{counts['stale-ocr']} stale-ocr, {counts['empty']} empty")
             # Only a stale OCR layer needs force_ocr (it has to be overwritten,
             # not trusted). A bare scan's own image is read by ocr_images on
             # the digital route -- reading the whole book from pixels because
             # of one scanned cover costs accuracy, not just time: OCR mangles
             # what the embedded text has exactly (currency signs, rating
-            # codes) and loses the real table cells.
+            # codes) and loses the real table cells. A figure page wants the
+            # same treatment for the opposite reason: its text is perfect and
+            # is kept (force_ocr stays off), but a chart or a table pasted in
+            # as a picture is content that only OCR can reach.
             needs_ocr = bool(counts["stale-ocr"])
-            ocr_images = bool(counts["scan"]) and not needs_ocr
+            ocr_images = bool(counts["scan"] or counts["figure"]) and not needs_ocr
         else:
             pages = 1
             labels = []
@@ -553,7 +569,7 @@ def process_one(client: httpx.Client, cfg: Config, path: Path, sha: str, osd_wor
                 # That text is being read from pixels now, so its matrices are
                 # no more trustworthy than the characters were: measure every
                 # page's orientation with OSD instead.
-                labels = ["scan" if label == "digital" else label for label in labels]
+                labels = ["scan" if label in DIGITAL_LABELS else label for label in labels]
 
         if needs_ocr:
             if suffix in PDF_SUFFIXES:

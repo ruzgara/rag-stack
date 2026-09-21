@@ -152,9 +152,13 @@ and run:
 file, `--reprocess` and `--fix-headings` (below) and `-v`/`--verbose`.
 
 There's nothing to configure per file. Each PDF is first triaged page by
-page (instant, nothing is rendered) into one of four labels:
+page (instant, nothing is rendered) into one of five labels:
 
 - **digital**: visible text, not covered by a page-sized image.
+- **figure**: visible text of its own, plus an image covering more than 5% of
+  the page — a chart, a diagram or a table pasted in as a picture, whose
+  content exists only in its pixels. A header logo or an inline icon is
+  ~0.5%, well under.
 - **scan**: a page-sized image with no text layer of its own, or with a few
   real lines stamped over it (a signature block, a page number).
 - **stale-ocr**: a page-sized image carrying someone else's invisible OCR
@@ -169,14 +173,17 @@ stale-ocr pages still pays for full OCR on every page; splitting the PDF and
 merging the resulting DoclingDocuments would fix that, but isn't done here.
 
 Otherwise, Docling converts the embedded text directly — no OCR, exact text,
-~0.1 s/page — and any `scan` pages just have their own images OCR'd with
+~0.1 s/page — and any `scan` or `figure` pages have their images OCR'd with
 **ocrmac** (Apple Vision, `do_ocr=true, force_ocr=false`), leaving pages that
 have real text alone. This is what saves a book with a scanned cover or an
 inserted plate: OCR'ing the whole thing to catch one page would read a `£`
 as `€` and a `Baa2` rating as `Baaz`, and rebuild table cells that the
-embedded text already states exactly. If the embedded text fails the quality
-check (e.g. fonts with no usable character map), the file drops to full OCR
-instead.
+embedded text already states exactly. A `figure` page needs the same pass for
+the opposite reason — its own text is perfect and is kept, but the chart or
+table sitting beside it is content no embedded text holds, and without this
+it reaches the index as a bare `<!-- image -->`. If the embedded text fails
+the quality check (e.g. fonts with no usable character map), the file drops
+to full OCR instead.
 
 The force-OCR route (any stale-ocr page, or embedded text that failed the
 quality check) OCRs every page with ocrmac, replacing any old OCR layer,
@@ -184,8 +191,8 @@ quality check) OCRs every page with ocrmac, replacing any old OCR layer,
 
 Sideways or upside-down pages are marked rotated (lossless — the PDF's page
 rotation flag, nothing is rasterized) before conversion either way, but the
-angle is measured differently per page: a `digital` page states its angle
-exactly in its text objects' matrices, for free. A `scan` or `stale-ocr`
+angle is measured differently per page: a `digital` or `figure` page states
+its angle exactly in its text objects' matrices, for free. A `scan` or `stale-ocr`
 page has no text of its own to measure, so tesseract's orientation
 detection runs on a render of just that page. This means a 129-page book
 with a single scanned cover renders and OSDs one page, not 129, while a
