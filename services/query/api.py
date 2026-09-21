@@ -272,6 +272,7 @@ class UserUpdate(BaseModel):
 class NewGroup(BaseModel):
     name: str
     description: str | None = None
+    type: str = "locked"             # open | locked -- see Accounts.create_group
 
 
 class GrantRequest(BaseModel):
@@ -282,9 +283,28 @@ class GrantRequest(BaseModel):
     effect: str = "allow"
 
 
+class ShareRequest(BaseModel):
+    """Like GrantRequest but scoped to one library (named in the URL) and
+    always an allow -- see Accounts.share_library."""
+    subject_type: str                # user | group
+    subject_id: str
+    permission: str                  # library.read | library.write
+
+
 class NewLibrary(BaseModel):
     name: str
     description: str | None = None
+
+
+class NewWorkspace(BaseModel):
+    name: str
+    description: str | None = None
+
+
+class WorkspaceUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    library_ids: list[str] | None = None
 
 
 def me(user: User) -> dict:
@@ -393,7 +413,7 @@ def admin_list_groups(admin: User = Admin) -> dict:
 @app.post("/api/admin/groups", status_code=201)
 def admin_create_group(body: NewGroup, admin: User = Admin) -> dict:
     try:
-        return state.accounts.create_group(body.name, body.description)
+        return state.accounts.create_group(body.name, body.description, kind=body.type)
     except Invalid as exc:
         raise as_http_error(exc) from None
 
@@ -417,6 +437,33 @@ def admin_add_member(group_id: str, user_id: str, admin: User = Admin) -> None:
 @app.delete("/api/admin/groups/{group_id}/members/{user_id}", status_code=204)
 def admin_remove_member(group_id: str, user_id: str, admin: User = Admin) -> None:
     state.accounts.remove_member(group_id, user_id)
+
+
+@app.get("/api/groups")
+def list_groups(user: User = CurrentUser) -> dict:
+    """Every group, for a self-service join/leave UI -- name, type and
+    member count only, never the member list itself (that stays behind
+    GET /api/admin/groups). Which of these the caller is already in is on
+    GET /api/auth/me instead (User.groups)."""
+    return {"groups": [{"id": g["id"], "name": g["name"], "description": g["description"], "type": g["type"],
+                        "member_count": len(g["members"])} for g in state.accounts.groups()]}
+
+
+@app.post("/api/groups/{group_id}/join", status_code=204)
+def join_group(group_id: str, user: User = CurrentUser) -> None:
+    """Self-service: only works on an open group -- see Accounts.join_group."""
+    try:
+        state.accounts.join_group(group_id, user)
+    except NotFound:
+        raise HTTPException(404, "no such group") from None
+    except Denied as exc:
+        raise as_http_error(exc) from None
+
+
+@app.post("/api/groups/{group_id}/leave", status_code=204)
+def leave_group(group_id: str, user: User = CurrentUser) -> None:
+    """Always allowed, open or locked group -- see Accounts.leave_group."""
+    state.accounts.leave_group(group_id, user)
 
 
 @app.get("/api/admin/grants/{subject_type}/{subject_id}")
@@ -621,6 +668,61 @@ def list_libraries(user: User = CurrentUser) -> dict:
     return {"libraries": libraries}
 
 
+@app.get("/api/libraries/{library_id}")
+def library_detail(library_id: str, user: User = CurrentUser) -> dict:
+    """A library's own documents (name, pages, ingest status/route), for
+    anyone who holds library.read on it -- unlike /api/admin/documents,
+    this isn't admin-only, and unlike /api/documents, it's scoped to the
+    one library instead of every document on the machine."""
+    try:
+        lib = state.accounts.library(library_id)
+    except NotFound:
+        raise HTTPException(404, "no such library") from None
+    try:
+        state.accounts.require(user, "library.read", library_id)
+    except Denied as exc:
+        raise as_http_error(exc) from None
+    manifest = _manifest_documents()
+    docs = [_document_row(manifest[sha]) for sha in lib["documents"] if sha in manifest]
+    return {"id": lib["id"], "name": lib["name"], "description": lib["description"], "owner_id": lib["owner_id"],
+            "created_at": lib["created_at"], "document_count": len(lib["documents"]), "documents": docs}
+
+
+@app.get("/api/libraries/{library_id}/grants")
+def library_grants(library_id: str, user: User = CurrentUser) -> dict:
+    """Who has access to this library, for anyone who holds library.share
+    on it -- the self-service counterpart to
+    GET /api/admin/libraries/{id}/grants, which needs libraries.manage."""
+    try:
+        state.accounts.library(library_id)
+    except NotFound:
+        raise HTTPException(404, "no such library") from None
+    if not state.accounts.allowed(user.id, "library.share", library_id):
+        raise HTTPException(403, f"{user.email} can't share library {library_id}")
+    return {"grants": state.accounts.grants_on_library(library_id)}
+
+
+@app.post("/api/libraries/{library_id}/share", status_code=204)
+def share_library(library_id: str, body: ShareRequest, user: User = CurrentUser) -> None:
+    """Self-service sharing: pass along library.read or library.write on
+    this library, if you hold library.share on it and already hold the
+    permission being passed along yourself. See Accounts.share_library."""
+    try:
+        state.accounts.share_library(library_id, user, body.subject_type, body.subject_id, body.permission)
+    except NotFound:
+        raise HTTPException(404, f"no such {body.subject_type}: {body.subject_id}") from None
+    except (Denied, Invalid) as exc:
+        raise as_http_error(exc) from None
+
+
+@app.delete("/api/libraries/{library_id}/share", status_code=204)
+def unshare_library(library_id: str, body: ShareRequest, user: User = CurrentUser) -> None:
+    try:
+        state.accounts.unshare_library(library_id, user, body.subject_type, body.subject_id, body.permission)
+    except Denied as exc:
+        raise as_http_error(exc) from None
+
+
 @app.get("/api/admin/libraries")
 def admin_list_libraries(admin: User = LibrariesAdmin) -> dict:
     return {"libraries": state.accounts.libraries()}
@@ -629,7 +731,7 @@ def admin_list_libraries(admin: User = LibrariesAdmin) -> dict:
 @app.post("/api/admin/libraries", status_code=201)
 def admin_create_library(body: NewLibrary, admin: User = LibrariesAdmin) -> dict:
     try:
-        return state.accounts.create_library(body.name, body.description)
+        return state.accounts.create_library(body.name, body.description, owner_id=admin.id)
     except Invalid as exc:
         raise as_http_error(exc) from None
 
@@ -640,6 +742,14 @@ def admin_delete_library(library_id: str, admin: User = LibrariesAdmin) -> None:
         state.accounts.delete_library(library_id)
     except NotFound:
         raise HTTPException(404, "no such library") from None
+
+
+@app.get("/api/admin/libraries/{library_id}/grants")
+def admin_library_grants(library_id: str, admin: User = LibrariesAdmin) -> dict:
+    """Who has access to this library -- the reverse of
+    GET /api/admin/grants/{subject_type}/{subject_id}, which goes the other
+    way (a subject's own libraries)."""
+    return {"grants": state.accounts.grants_on_library(library_id)}
 
 
 @app.get("/api/admin/documents")
@@ -665,6 +775,79 @@ def admin_remove_document(library_id: str, doc_sha: str, admin: User = Libraries
     state.accounts.remove_document(library_id, doc_sha)
 
 
+# -------------------------------------------------------------- workspaces --
+# Owned by one person (never admin-gated -- a workspace is only ever yours),
+# holding the libraries and chats it was given. Deleting one is a soft
+# delete (see ChatDB.delete_workspace) that also hides its chats, though
+# neither is actually removed; libraries themselves stay regardless, since
+# they're the global, admin-managed rows from the section above.
+
+
+def _get_workspace(workspace_id: str, user: User) -> dict:
+    try:
+        return state.db.get_workspace(workspace_id, user_id=user.id)
+    except NotFound:
+        raise HTTPException(404, "workspace not found") from None
+
+
+@app.post("/api/workspaces", status_code=201)
+def create_workspace(body: NewWorkspace, user: User = Depends(requires("chat.use"))) -> dict:
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(422, "a workspace needs a name")
+    return state.db.create_workspace(name, body.description, user_id=user.id)
+
+
+@app.get("/api/workspaces")
+def list_workspaces(deleted: bool = False, user: User = CurrentUser) -> dict:
+    """The workspace list; pass `?deleted=true` for the Recently Deleted tray."""
+    return {"workspaces": state.db.list_workspaces(user_id=user.id, deleted=deleted)}
+
+
+@app.get("/api/workspaces/{workspace_id}")
+def get_workspace(workspace_id: str, user: User = CurrentUser) -> dict:
+    return _get_workspace(workspace_id, user)
+
+
+@app.patch("/api/workspaces/{workspace_id}")
+def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = CurrentUser) -> dict:
+    name = body.name.strip() if body.name is not None else None
+    if name == "":
+        raise HTTPException(422, "a workspace needs a name")
+    _check_libraries(user, body.library_ids)
+    try:
+        return state.db.update_workspace(workspace_id, name=name, description=body.description,
+                                         library_ids=body.library_ids, user_id=user.id)
+    except NotFound:
+        raise HTTPException(404, "workspace not found") from None
+
+
+@app.delete("/api/workspaces/{workspace_id}", status_code=204)
+def delete_workspace(workspace_id: str, user: User = CurrentUser) -> None:
+    """Marks the workspace deleted, which also hides its chats -- see
+    ChatDB.delete_workspace. Nothing is actually removed."""
+    try:
+        state.db.delete_workspace(workspace_id, user_id=user.id)
+    except NotFound:
+        raise HTTPException(404, "workspace not found") from None
+
+
+@app.post("/api/workspaces/{workspace_id}/restore")
+def restore_workspace(workspace_id: str, user: User = CurrentUser) -> dict:
+    """Undoes delete_workspace -- its chats, never themselves touched,
+    become reachable again too."""
+    try:
+        return state.db.restore_workspace(workspace_id, user_id=user.id)
+    except NotFound:
+        raise HTTPException(404, "workspace not found") from None
+
+
+@app.get("/api/workspaces/{workspace_id}/conversations")
+def list_workspace_conversations(workspace_id: str, user: User = CurrentUser) -> list[dict]:
+    _get_workspace(workspace_id, user)  # 404 if missing or not this user's
+    return state.db.list_conversations(user_id=user.id, workspace_id=workspace_id)
+
+
 # ------------------------------------------------------------ conversations --
 
 
@@ -672,6 +855,7 @@ class NewConversation(BaseModel):
     title: str | None = None
     preset: str | None = None
     library_ids: list[str] | None = None
+    workspace_id: str | None = None
 
 
 class ConversationUpdate(BaseModel):
@@ -716,13 +900,18 @@ def _get_conversation(conv_id: str, user: User, with_messages: bool = True) -> d
 @app.post("/api/conversations", status_code=201)
 def create_conversation(body: NewConversation, user: User = Depends(requires("chat.use"))) -> dict:
     _check_libraries(user, body.library_ids)
+    if body.workspace_id is not None:
+        _get_workspace(body.workspace_id, user)  # 404 if missing or not this user's
     return state.db.create_conversation(_check_preset(body.preset), body.title, user_id=user.id,
-                                        library_ids=body.library_ids)
+                                        library_ids=body.library_ids, workspace_id=body.workspace_id)
 
 
 @app.get("/api/conversations")
-def list_conversations(user: User = CurrentUser) -> list[dict]:
-    return state.db.list_conversations(user_id=user.id)
+def list_conversations(deleted: bool = False, archived: bool = False, user: User = CurrentUser) -> list[dict]:
+    """The chat list; pass `?deleted=true` for the Recently Deleted tray or
+    `?archived=true` for the Archived list (mutually exclusive -- `deleted`
+    wins if both are set)."""
+    return state.db.list_conversations(user_id=user.id, deleted=deleted, archived=archived)
 
 
 @app.get("/api/conversations/{conv_id}")
@@ -743,10 +932,116 @@ def update_conversation(conv_id: str, body: ConversationUpdate, user: User = Cur
 
 @app.delete("/api/conversations/{conv_id}", status_code=204)
 def delete_conversation(conv_id: str, user: User = CurrentUser) -> None:
+    """Marks the chat deleted -- it moves to the Recently Deleted tray
+    (`GET /api/conversations?deleted=true`) rather than being removed."""
     try:
         state.db.delete_conversation(conv_id, user_id=user.id)
     except NotFound:
         raise HTTPException(404, "conversation not found") from None
+
+
+@app.post("/api/conversations/{conv_id}/restore")
+def restore_conversation(conv_id: str, user: User = CurrentUser) -> dict:
+    try:
+        return state.db.restore_conversation(conv_id, user_id=user.id)
+    except NotFound:
+        raise HTTPException(404, "conversation not found") from None
+
+
+@app.post("/api/conversations/{conv_id}/archive")
+def archive_conversation(conv_id: str, user: User = CurrentUser) -> dict:
+    """Unlike delete, an archived chat stays fully open-able -- it's just
+    out of the normal list (`GET /api/conversations?archived=true` to see
+    it). A deleted chat can't be archived; restore it first."""
+    try:
+        return state.db.archive_conversation(conv_id, user_id=user.id)
+    except NotFound:
+        raise HTTPException(404, "conversation not found") from None
+
+
+@app.post("/api/conversations/{conv_id}/unarchive")
+def unarchive_conversation(conv_id: str, user: User = CurrentUser) -> dict:
+    try:
+        return state.db.unarchive_conversation(conv_id, user_id=user.id)
+    except NotFound:
+        raise HTTPException(404, "conversation not found") from None
+
+
+def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], preset: str, doc_shas,
+                 library_overview, *, first_turn: bool, has_title: bool) -> Iterator[str]:
+    """Runs one turn and streams it as the SSE kinds documented on
+    send_message, storing the answer (or the error) as it finishes. Shared
+    by send_message and retry_message -- they differ only in what happens
+    before this: whether a new user message is stored and a `user` event
+    opens the stream."""
+    tokens: list[str] = []
+    sources: list[dict] = []
+    queries: list[str] = []
+    finished = False
+    try:
+        for ev in state.chat.run_turn(question, history, preset, doc_shas=doc_shas,
+                                      library_overview=library_overview):
+            kind = ev["type"]
+            if kind == "done":
+                r = ev["result"]
+                saved = state.db.add_assistant_message(
+                    conv_id, content=r.answer, model=r.model, preset=r.preset, search_queries=r.search_queries,
+                    sources=[asdict(s) for s in r.sources], cited=set(r.cited), stats=r.stats,
+                    user_id=user.id)
+                finished = True
+                yield sse("done", {"message_id": saved["id"], "answer": r.answer, "model": r.model,
+                                   "preset": r.preset, "search_queries": r.search_queries, "cited": r.cited,
+                                   "invalid_citations": r.invalid_citations, "stats": r.stats,
+                                   "sources": [{**asdict(s), "cited": s.number in r.cited} for s in r.sources]})
+                if first_turn and not has_title:
+                    title = state.chat.generate_title(preset, question, r.answer)
+                    if title:
+                        state.db.update_conversation(conv_id, title=title, user_id=user.id)
+                        yield sse("title", {"title": title})
+                continue
+            if kind == "token":
+                tokens.append(ev["text"])
+            elif kind == "sources":
+                sources.extend(ev["sources"])
+            elif kind == "searching":
+                queries.append(ev["query"])
+            yield sse(kind, {k: v for k, v in ev.items() if k != "type"})
+    except Exception as exc:  # noqa: BLE001 - store and report whatever broke the turn
+        if not finished:
+            state.db.add_assistant_message(
+                conv_id, content="".join(tokens), model=state.chat.cfg.preset(preset).model, preset=preset,
+                search_queries=queries, sources=sources, cited=set(), status="error", error=str(exc),
+                user_id=user.id)
+        yield sse("error", {"error": str(exc)})
+
+
+def _streamed(user_id: str, conv_id: str, gen: Iterator[str]) -> StreamingResponse:
+    """The turn-runs-on-its-own-thread plumbing shared by send_message and
+    retry_message: `gen` runs under the concurrency gate on a background
+    thread and is relayed to the client as it produces SSE lines, so a
+    disconnect only stops the relay -- the turn still finishes and is
+    stored."""
+    events: queue.Queue[str | None] = queue.Queue()
+
+    def produce() -> None:
+        try:
+            with state.gate.admit(user_id, conv_id,
+                                  on_position=lambda n: events.put(sse("queued", {"position": n}))):
+                for item in gen:
+                    events.put(item)
+        except Busy as exc:
+            events.put(sse("error", {"error": str(exc)}))
+        finally:
+            events.put(None)
+
+    threading.Thread(target=produce, daemon=True).start()
+
+    async def relay():
+        while (item := await run_in_threadpool(events.get)) is not None:
+            yield item
+
+    return StreamingResponse(relay(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/conversations/{conv_id}/messages")
@@ -778,75 +1073,50 @@ def send_message(conv_id: str, body: NewMessage, user: User = Depends(requires("
     # not only on the next attach.
     doc_shas = state.accounts.document_scope(user.id, conv["library_ids"])
     library_overview = state.accounts.library_overview(user.id, conv["library_ids"])
+    if conv["workspace_id"]:
+        state.db.touch_workspace(conv["workspace_id"], user_id=user.id)
 
     def stream() -> Iterator[str]:
         history = state.db.history(conv_id, user_id=user.id)
         first_turn = not history
         user_msg = state.db.add_user_message(conv_id, body.content, user_id=user.id)
         yield sse("user", {"id": user_msg["id"]})
-        tokens: list[str] = []
-        sources: list[dict] = []
-        queries: list[str] = []
-        finished = False
-        try:
-            for ev in state.chat.run_turn(body.content, history, preset, doc_shas=doc_shas,
-                                          library_overview=library_overview):
-                kind = ev["type"]
-                if kind == "done":
-                    r = ev["result"]
-                    saved = state.db.add_assistant_message(
-                        conv_id, content=r.answer, model=r.model, preset=r.preset, search_queries=r.search_queries,
-                        sources=[asdict(s) for s in r.sources], cited=set(r.cited), stats=r.stats,
-                        user_id=user.id)
-                    finished = True
-                    yield sse("done", {"message_id": saved["id"], "answer": r.answer, "model": r.model,
-                                       "preset": r.preset, "search_queries": r.search_queries, "cited": r.cited,
-                                       "invalid_citations": r.invalid_citations, "stats": r.stats,
-                                       "sources": [{**asdict(s), "cited": s.number in r.cited} for s in r.sources]})
-                    if first_turn and not conv["title"]:
-                        title = state.chat.generate_title(preset, body.content, r.answer)
-                        if title:
-                            state.db.update_conversation(conv_id, title=title, user_id=user.id)
-                            yield sse("title", {"title": title})
-                    continue
-                if kind == "token":
-                    tokens.append(ev["text"])
-                elif kind == "sources":
-                    sources.extend(ev["sources"])
-                elif kind == "searching":
-                    queries.append(ev["query"])
-                yield sse(kind, {k: v for k, v in ev.items() if k != "type"})
-        except Exception as exc:  # noqa: BLE001 - store and report whatever broke the turn
-            if not finished:
-                state.db.add_assistant_message(
-                    conv_id, content="".join(tokens), model=state.chat.cfg.preset(preset).model, preset=preset,
-                    search_queries=queries, sources=sources, cited=set(), status="error", error=str(exc),
-                    user_id=user.id)
-            yield sse("error", {"error": str(exc)})
+        yield from _stream_turn(conv_id, user, body.content, history, preset, doc_shas, library_overview,
+                                first_turn=first_turn, has_title=bool(conv["title"]))
 
-    # The turn runs on its own thread and feeds a queue. If the client goes
-    # away, only the relay stops; the answer still completes and is stored.
-    events: queue.Queue[str | None] = queue.Queue()
+    return _streamed(user.id, conv_id, stream())
 
-    def produce() -> None:
-        try:
-            with state.gate.admit(user.id, conv_id,
-                                  on_position=lambda n: events.put(sse("queued", {"position": n}))):
-                for item in stream():
-                    events.put(item)
-        except Busy as exc:
-            events.put(sse("error", {"error": str(exc)}))
-        finally:
-            events.put(None)
 
-    threading.Thread(target=produce, daemon=True).start()
+@app.post("/api/conversations/{conv_id}/retry")
+def retry_message(conv_id: str, user: User = Depends(requires("chat.use"))) -> StreamingResponse:
+    """Regenerates the conversation's last answer: deletes it and reruns the
+    turn for the question it was answering (which stays in place -- no new
+    `user` event, since the question isn't new). Streams the same SSE kinds
+    as send_message, minus `user`. 404s if the chat doesn't end in an
+    answer to retry (mid-question, empty, or already retried).
 
-    async def relay():
-        while (item := await run_in_threadpool(events.get)) is not None:
-            yield item
+    The old answer is deleted up front, before the turn is admitted --
+    unlike send_message's new user message, there's no way to check "does
+    this chat end in an answer" without already knowing which answer that
+    is, so on the rare Busy rejection the old answer is gone and the retry
+    itself needs retrying."""
+    conv = _get_conversation(conv_id, user, with_messages=False)
+    preset = _check_preset(conv["preset"])
+    try:
+        question = state.db.prepare_retry(conv_id, user_id=user.id)
+    except NotFound:
+        raise HTTPException(404, "nothing to retry") from None
+    doc_shas = state.accounts.document_scope(user.id, conv["library_ids"])
+    library_overview = state.accounts.library_overview(user.id, conv["library_ids"])
+    if conv["workspace_id"]:
+        state.db.touch_workspace(conv["workspace_id"], user_id=user.id)
 
-    return StreamingResponse(relay(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    def stream() -> Iterator[str]:
+        history = state.db.history(conv_id, user_id=user.id)
+        yield from _stream_turn(conv_id, user, question, history, preset, doc_shas, library_overview,
+                                first_turn=not history, has_title=bool(conv["title"]))
+
+    return _streamed(user.id, conv_id, stream())
 
 
 # ------------------------------------------------------------------ search --
@@ -881,9 +1151,10 @@ def search(body: SearchRequest, user: User = Depends(requires("chat.use"))) -> d
 
 # --------------------------------------------------------------- documents --
 
-@app.get("/api/documents")
-def documents(user: User = CurrentUser) -> dict:
-    """Latest manifest row per document, plus files waiting in the inbox."""
+def _manifest_documents() -> dict[str, dict]:
+    """The latest manifest row per document, by sha256 -- filename, pages,
+    status, route, error, when it was processed. Shared by /api/documents
+    (every document) and a library's own detail view (its documents only)."""
     latest: dict[str, dict] = {}
     if MANIFEST.exists():
         with MANIFEST.open() as f:
@@ -896,12 +1167,45 @@ def documents(user: User = CurrentUser) -> dict:
                 # A failed re-run doesn't undo an earlier success.
                 if prev is None or rec.get("status") == "processed" or prev.get("status") != "processed":
                     latest[rec["sha256"]] = rec
-    docs = [{"sha256": r["sha256"], "filename": r["filename"], "status": r.get("status"), "route": r.get("route"),
-             "pages": r.get("pages"), "chars": r.get("chars"), "error": r.get("error"),
-             "processed_at": r.get("timestamp")} for r in latest.values()]
+    return latest
+
+
+def _document_row(rec: dict) -> dict:
+    return {"sha256": rec["sha256"], "filename": rec["filename"], "status": rec.get("status"),
+            "route": rec.get("route"), "pages": rec.get("pages"), "chars": rec.get("chars"),
+            "error": rec.get("error"), "processed_at": rec.get("timestamp")}
+
+
+@app.get("/api/documents")
+def documents(user: User = CurrentUser) -> dict:
+    """Latest manifest row per document, plus files waiting in the inbox."""
+    docs = [_document_row(r) for r in _manifest_documents().values()]
     docs.sort(key=lambda d: d["processed_at"] or 0, reverse=True)
     inbox = sorted(p.name for p in INBOX.iterdir() if p.is_file() and not p.name.startswith(".")) if INBOX.exists() else []
     return {"documents": docs, "inbox": inbox, "ingest": state.ingest.status()}
+
+
+@app.get("/api/documents/{sha256}/chunks")
+def document_chunks(sha256: str, offset: int = 0, limit: int | None = None, user: User = CurrentUser) -> dict:
+    """One document's chunks, in order, with the document's total chunk
+    count -- the source viewer's prev/next through a citation and the "n of
+    total" it shows alongside. Unlike /api/documents (filenames only), this
+    hands back passage text, so it needs library.read on a library the
+    document belongs to (or admin)."""
+    rec = _manifest_documents().get(sha256)
+    if rec is None:
+        raise HTTPException(404, "no such document")
+    if not state.accounts.can_read_document(user.id, sha256):
+        raise HTTPException(403, f"{user.email} can't read document {sha256}")
+    if offset < 0:
+        raise HTTPException(422, "offset must be >= 0")
+    if limit is not None and not 1 <= limit <= 200:
+        raise HTTPException(422, "limit must be between 1 and 200")
+    try:
+        chunks, total = state.retriever.document_chunks(sha256, offset=offset, limit=limit)
+    except (RuntimeError, httpx.HTTPError) as exc:
+        raise HTTPException(503, str(exc)) from None
+    return {"sha256": sha256, "filename": rec["filename"], "total": total, "chunks": chunks}
 
 
 def _sha256(path: Path) -> str:

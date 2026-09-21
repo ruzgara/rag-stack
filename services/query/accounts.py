@@ -41,8 +41,15 @@ GLOBAL_PERMISSIONS = {
 LIBRARY_PERMISSIONS = {
     "library.read": "search and cite the documents in a library",
     "library.write": "add documents to a library",
+    "library.share": "grant library.read or library.write on this library to others",
 }
 PERMISSIONS = {**GLOBAL_PERMISSIONS, **LIBRARY_PERMISSIONS}
+
+# What a self-service share (Accounts.share_library) may pass on --
+# library.share itself is excluded, so resharing rights stay something an
+# admin hands out deliberately (via the full grants API) rather than
+# something that propagates on its own.
+SHAREABLE_PERMISSIONS = {"library.read", "library.write"}
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MIN_PASSWORD_LENGTH = 10
@@ -189,16 +196,19 @@ class Accounts:
 
     # -------------------------------------------------------------- groups --
 
-    def create_group(self, name: str, description: str | None = None) -> dict:
+    def create_group(self, name: str, description: str | None = None, kind: str = "locked") -> dict:
         name = (name or "").strip()
         if not name:
             raise Invalid("a group needs a name")
-        group = {"id": uuid.uuid4().hex, "name": name, "description": description, "created_at": time.time()}
+        if kind not in ("open", "locked"):
+            raise Invalid(f"a group's type is open or locked, not {kind!r}")
+        group = {"id": uuid.uuid4().hex, "name": name, "description": description, "type": kind,
+                 "created_at": time.time()}
         with self.db._conn() as db:
             if db.execute("SELECT 1 FROM groups WHERE name = ?", (name,)).fetchone():
                 raise Invalid(f"a group called {name!r} already exists")
-            db.execute("INSERT INTO groups (id, name, description, created_at) VALUES (?, ?, ?, ?)",
-                       (group["id"], name, description, group["created_at"]))
+            db.execute("INSERT INTO groups (id, name, description, type, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (group["id"], name, description, kind, group["created_at"]))
         return group
 
     def groups(self) -> list[dict]:
@@ -214,6 +224,9 @@ class Accounts:
             db.execute("DELETE FROM grants WHERE subject_type = 'group' AND subject_id = ?", (group_id,))
 
     def add_member(self, group_id: str, user_id: str) -> None:
+        """The admin path: adds anyone to any group, open or locked, no
+        questions asked (PUT /api/admin/groups/.../members/...). See
+        join_group for the self-service, open-groups-only version."""
         with self.db._conn() as db:
             try:
                 db.execute("INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)",
@@ -225,18 +238,35 @@ class Accounts:
         with self.db._conn() as db:
             db.execute("DELETE FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user_id))
 
+    def join_group(self, group_id: str, user: User) -> None:
+        """Self-service: a user may add themselves to an open group. A
+        locked group still needs an admin -- add_member, not this."""
+        with self.db._conn() as db:
+            row = db.execute("SELECT type FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"no group {group_id}")
+        if row["type"] != "open":
+            raise Denied(f"{user.email} can't join a locked group without an admin")
+        self.add_member(group_id, user.id)
+
+    def leave_group(self, group_id: str, user: User) -> None:
+        """The mirror of join_group: always allowed, open or locked -- a
+        group deciding who it lets in doesn't mean it can hold someone in."""
+        self.remove_member(group_id, user.id)
+
     # ----------------------------------------------------------- libraries --
 
-    def create_library(self, name: str, description: str | None = None) -> dict:
+    def create_library(self, name: str, description: str | None = None, owner_id: str | None = None) -> dict:
         name = (name or "").strip()
         if not name:
             raise Invalid("a library needs a name")
-        library = {"id": uuid.uuid4().hex, "name": name, "description": description, "created_at": time.time()}
+        library = {"id": uuid.uuid4().hex, "name": name, "description": description, "owner_id": owner_id,
+                  "created_at": time.time()}
         with self.db._conn() as db:
             if db.execute("SELECT 1 FROM libraries WHERE name = ?", (name,)).fetchone():
                 raise Invalid(f"a library called {name!r} already exists")
-            db.execute("INSERT INTO libraries (id, name, description, created_at) VALUES (?, ?, ?, ?)",
-                       (library["id"], name, description, library["created_at"]))
+            db.execute("INSERT INTO libraries (id, name, description, owner_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (library["id"], name, description, owner_id, library["created_at"]))
         return library
 
     def libraries(self) -> list[dict]:
@@ -279,6 +309,16 @@ class Accounts:
             return [r["library_id"] for r in db.execute(
                 "SELECT library_id FROM library_documents WHERE doc_sha = ?", (doc_sha,))]
 
+    def can_read_document(self, user_id: str, doc_sha: str) -> bool:
+        """Whether this user may read one document's content (its chunks),
+        as opposed to just knowing it exists via /api/documents: an admin
+        always can, everyone else only through library.read on a library
+        the document belongs to. A document in no library is unreadable by
+        anyone but an admin, same as document_scope leaves it out of every
+        non-admin search."""
+        readable = self.readable_libraries(user_id)
+        return readable is None or bool(readable & set(self.libraries_of(doc_sha)))
+
     # -------------------------------------------------------------- grants --
 
     def grant(self, subject_type: str, subject_id: str, permission: str, library_id: str | None = None,
@@ -307,10 +347,48 @@ class Accounts:
                        "AND library_id IS ?", (subject_type, subject_id, permission, library_id))
 
     def grants_of(self, subject_type: str, subject_id: str) -> list[dict]:
+        """A subject's own grants -- what libraries.manage (rather than an
+        end user's own access) means. See grants_on_library for the reverse:
+        who holds a grant on a given library."""
         with self.db._conn() as db:
             return [dict(r) for r in db.execute(
                 "SELECT permission, library_id, effect FROM grants WHERE subject_type = ? AND subject_id = ? "
                 "ORDER BY permission, library_id", (subject_type, subject_id))]
+
+    def grants_on_library(self, library_id: str) -> list[dict]:
+        """Which users and groups hold a grant on this library -- the
+        library's own "who has access" view, for its management screen.
+        The reverse of grants_of: that finds a subject's libraries, this
+        finds a library's subjects."""
+        with self.db._conn() as db:
+            return [dict(r) for r in db.execute(
+                "SELECT subject_type, subject_id, permission, effect FROM grants WHERE library_id = ? "
+                "ORDER BY subject_type, subject_id, permission", (library_id,))]
+
+    # ---------------------------------------------------- self-service share --
+    # A normal user's version of grant/revoke: scoped to one library, always
+    # an allow (self-service can't deny -- that stays an admin action via
+    # grant/revoke above), and only for library.read/library.write, never
+    # library.share itself. Two guards, not one: the sharer must hold
+    # library.share on this library at all, AND must already hold the exact
+    # permission being passed on -- so sharing can never hand out more
+    # access than the sharer has themselves.
+
+    def share_library(self, library_id: str, sharer: User, subject_type: str, subject_id: str,
+                      permission: str) -> None:
+        if permission not in SHAREABLE_PERMISSIONS:
+            raise Invalid(f"sharing only grants library.read or library.write, not {permission!r}")
+        if not self.allowed(sharer.id, "library.share", library_id):
+            raise Denied(f"{sharer.email} can't share library {library_id}")
+        if not self.allowed(sharer.id, permission, library_id):
+            raise Denied(f"{sharer.email} can't grant {permission} without holding it themselves")
+        self.grant(subject_type, subject_id, permission, library_id, effect="allow")
+
+    def unshare_library(self, library_id: str, sharer: User, subject_type: str, subject_id: str,
+                        permission: str) -> None:
+        if not self.allowed(sharer.id, "library.share", library_id):
+            raise Denied(f"{sharer.email} can't share library {library_id}")
+        self.revoke(subject_type, subject_id, permission, library_id)
 
     # ---------------------------------------------------------- resolution --
 

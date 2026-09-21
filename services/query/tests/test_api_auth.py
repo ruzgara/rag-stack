@@ -145,3 +145,57 @@ def test_a_turn_that_breaks_is_stored_as_an_error_for_that_user(chat, monkeypatc
     assert any("ollama went away" in e for e in events)
     answer = api.state.db.get_conversation(conv["id"], user_id=user.id)["messages"][-1]
     assert (answer["status"], answer["content"]) == ("error", "half an ans")
+
+
+# ------------------------------------------------------------------- retry --
+
+def test_retrying_replaces_the_last_answer_and_keeps_the_question(chat):
+    user = chat.create_user("member@example.com", "hash")
+    conv = api.state.db.create_conversation("everyday", user_id=user.id)
+    drain(api.send_message(conv["id"], api.NewMessage(content="who pays?"), user))
+    first_answer_id = api.state.db.get_conversation(conv["id"], user_id=user.id)["messages"][-1]["id"]
+
+    events = drain(api.retry_message(conv["id"], user))
+
+    assert any(e.startswith("event: done") for e in events), events
+    assert not any(e.startswith("event: user") for e in events)  # the question isn't new
+    stored = api.state.db.get_conversation(conv["id"], user_id=user.id)
+    assert [(m["role"], m["content"]) for m in stored["messages"]] == [
+        ("user", "who pays?"), ("assistant", "Two sources agree [1].")]
+    assert stored["messages"][-1]["id"] != first_answer_id  # a fresh answer, not the old one
+
+
+def test_retrying_a_chat_with_nothing_to_retry_is_404(chat):
+    user = chat.create_user("member@example.com", "hash")
+    conv = api.state.db.create_conversation("everyday", user_id=user.id)  # no messages yet
+
+    with pytest.raises(HTTPException) as exc:
+        api.retry_message(conv["id"], user)
+    assert exc.value.status_code == 404
+
+
+def test_a_failed_turn_can_be_retried(chat, monkeypatch):
+    user = chat.create_user("member@example.com", "hash")
+    conv = api.state.db.create_conversation("everyday", user_id=user.id)
+
+    def explode(self, question, history, preset, **kw):
+        raise RuntimeError("ollama went away")
+
+    monkeypatch.setattr(type(api.state.chat), "run_turn", explode)
+    drain(api.send_message(conv["id"], api.NewMessage(content="who pays?"), user))
+    assert api.state.db.get_conversation(conv["id"], user_id=user.id)["messages"][-1]["status"] == "error"
+
+    monkeypatch.setattr(type(api.state.chat), "run_turn", chat_fixture_run_turn)
+    events = drain(api.retry_message(conv["id"], user))
+
+    assert any(e.startswith("event: done") for e in events), events
+    stored = api.state.db.get_conversation(conv["id"], user_id=user.id)
+    assert [(m["role"], m["content"]) for m in stored["messages"]] == [
+        ("user", "who pays?"), ("assistant", "Two sources agree [1].")]
+    assert stored["messages"][-1]["status"] == "complete"
+
+
+def chat_fixture_run_turn(self, question, history, preset, **kw):
+    yield {"type": "token", "text": "Two sources agree [1]."}
+    yield {"type": "done", "result": TurnResult(answer="Two sources agree [1].", model="m", preset="everyday",
+                                                search_queries=["q"], sources=[], cited=[1], stats={})}

@@ -134,6 +134,65 @@ def test_a_membership_in_a_group_that_does_not_exist_is_refused(acc):
         acc.add_member("no-such-group", created.id)
 
 
+def test_a_group_defaults_to_locked(acc):
+    group = acc.create_group("Analysts")
+    assert group["type"] == "locked"
+    assert acc.groups()[0]["type"] == "locked"
+
+
+def test_a_groups_type_is_open_or_locked(acc):
+    with pytest.raises(Invalid, match="open or locked"):
+        acc.create_group("Analysts", kind="public")
+
+
+# --------------------------------------------------------- self-service join --
+
+def test_a_user_can_join_an_open_group_themselves(acc):
+    joiner = user(acc, "joiner@example.com")
+    group = acc.create_group("Everyone", kind="open")
+
+    acc.join_group(group["id"], joiner)
+
+    assert acc.user(joiner.id).groups == ["Everyone"]
+
+
+def test_a_user_cannot_join_a_locked_group_themselves(acc):
+    joiner = user(acc, "joiner@example.com")
+    group = acc.create_group("Analysts", kind="locked")
+
+    with pytest.raises(Denied):
+        acc.join_group(group["id"], joiner)
+    assert acc.user(joiner.id).groups == []
+
+
+def test_joining_an_unknown_group_is_not_found(acc):
+    joiner = user(acc, "joiner@example.com")
+    with pytest.raises(NotFound):
+        acc.join_group("no-such-group", joiner)
+
+
+def test_a_user_can_leave_any_group_they_are_in(acc):
+    member = user(acc, "member@example.com")
+    open_group = acc.create_group("Everyone", kind="open")
+    locked_group = acc.create_group("Analysts", kind="locked")
+    acc.add_member(open_group["id"], member.id)
+    acc.add_member(locked_group["id"], member.id)  # admin put them there
+
+    acc.leave_group(open_group["id"], member)
+    acc.leave_group(locked_group["id"], member)  # leaving a locked group needs no admin either
+
+    assert acc.user(member.id).groups == []
+
+
+def test_admins_can_still_add_anyone_to_a_locked_group(acc):
+    """add_member (the admin path) is unaffected by type -- only the
+    self-service join_group checks it."""
+    created = user(acc)
+    group = acc.create_group("Analysts", kind="locked")
+    acc.add_member(group["id"], created.id)
+    assert acc.user(created.id).groups == ["Analysts"]
+
+
 # ------------------------------------------------------------ permissions --
 
 def test_a_user_with_no_grants_can_do_nothing(acc):
@@ -214,6 +273,103 @@ def test_granting_the_same_permission_twice_updates_it_rather_than_duplicating(a
     assert acc.grants_of("user", created.id) == [{"permission": "chat.use", "library_id": None, "effect": "deny"}]
 
 
+def test_a_librarys_grants_can_be_found_the_other_way_round(acc, library):
+    """grants_on_library is the reverse of grants_of: given a subject you can
+    already list its libraries, this lists a library's subjects."""
+    reader = user(acc, "reader@example.com")
+    writer = user(acc, "writer@example.com")
+    group = acc.create_group("Analysts")
+    acc.grant("user", reader.id, "library.read", library)
+    acc.grant("user", writer.id, "library.write", library)
+    acc.grant("group", group["id"], "library.read", library)
+    acc.grant("user", reader.id, "chat.use")  # global, not this library -- excluded
+
+    grants = acc.grants_on_library(library)
+    assert {(g["subject_type"], g["subject_id"], g["permission"], g["effect"]) for g in grants} == {
+        ("group", group["id"], "library.read", "allow"),
+        ("user", reader.id, "library.read", "allow"),
+        ("user", writer.id, "library.write", "allow"),
+    }
+    assert acc.grants_on_library("no-such-library") == []
+
+
+# ------------------------------------------------------- self-service share --
+
+def test_sharing_requires_library_share(acc, library):
+    sharer = user(acc, "sharer@example.com")
+    target = user(acc, "target@example.com")
+    acc.grant("user", sharer.id, "library.read", library)  # holds read, but not share
+
+    with pytest.raises(Denied):
+        acc.share_library(library, sharer, "user", target.id, "library.read")
+    assert acc.grants_of("user", target.id) == []
+
+
+def test_sharing_cannot_pass_on_more_than_the_sharer_holds(acc, library):
+    sharer = user(acc, "sharer@example.com")
+    target = user(acc, "target@example.com")
+    acc.grant("user", sharer.id, "library.share", library)  # can share, but has no write itself
+
+    with pytest.raises(Denied):
+        acc.share_library(library, sharer, "user", target.id, "library.write")
+    assert acc.grants_of("user", target.id) == []
+
+
+def test_sharing_cannot_pass_on_library_share_itself(acc, library):
+    sharer = user(acc, "sharer@example.com")
+    target = user(acc, "target@example.com")
+    acc.grant("user", sharer.id, "library.share", library)
+    acc.grant("user", sharer.id, "library.read", library)
+
+    with pytest.raises(Invalid):
+        acc.share_library(library, sharer, "user", target.id, "library.share")
+
+
+def test_a_user_who_can_share_passes_on_only_what_they_hold(acc, library):
+    sharer = user(acc, "sharer@example.com")
+    target = user(acc, "target@example.com")
+    acc.grant("user", sharer.id, "library.share", library)
+    acc.grant("user", sharer.id, "library.read", library)
+
+    acc.share_library(library, sharer, "user", target.id, "library.read")
+
+    assert acc.grants_of("user", target.id) == [
+        {"permission": "library.read", "library_id": library, "effect": "allow"}]
+
+
+def test_unsharing_removes_the_grant(acc, library):
+    sharer = user(acc, "sharer@example.com")
+    target = user(acc, "target@example.com")
+    acc.grant("user", sharer.id, "library.share", library)
+    acc.grant("user", sharer.id, "library.read", library)
+    acc.share_library(library, sharer, "user", target.id, "library.read")
+
+    acc.unshare_library(library, sharer, "user", target.id, "library.read")
+
+    assert acc.grants_of("user", target.id) == []
+
+
+def test_unsharing_also_requires_library_share(acc, library):
+    sharer = user(acc, "sharer@example.com")
+    target = user(acc, "target@example.com")
+    acc.grant("user", sharer.id, "library.read", library)  # no library.share
+    acc.grant("user", target.id, "library.read", library)
+
+    with pytest.raises(Denied):
+        acc.unshare_library(library, sharer, "user", target.id, "library.read")
+    assert acc.grants_of("user", target.id) != []  # untouched
+
+
+def test_an_admin_can_always_share_without_explicit_grants(acc, library):
+    admin = user(acc, "admin@example.com", is_admin=True)
+    target = user(acc, "target@example.com")
+
+    acc.share_library(library, admin, "user", target.id, "library.write")
+
+    assert acc.grants_of("user", target.id) == [
+        {"permission": "library.write", "library_id": library, "effect": "allow"}]
+
+
 def test_an_admin_has_everything_without_any_grants(acc, library):
     admin = user(acc, "admin@example.com", is_admin=True)
     assert acc.allowed(admin.id, "users.manage")
@@ -267,6 +423,28 @@ def test_a_library_is_created_and_listed_with_its_document_count(acc):
     lib = acc.create_library("Project finance", "bond and infrastructure filings")
     assert acc.libraries() == [{**lib, "document_count": 0}]
     assert acc.library(lib["id"])["documents"] == []
+
+
+def test_a_library_records_who_created_it(acc):
+    creator = user(acc, "creator@example.com")
+    lib = acc.create_library("Project finance", owner_id=creator.id)
+    assert lib["owner_id"] == creator.id
+    assert acc.libraries()[0]["owner_id"] == creator.id
+    assert acc.library(lib["id"])["owner_id"] == creator.id
+
+
+def test_a_library_made_without_an_acting_user_has_no_owner(acc):
+    lib = acc.create_library("Project finance")
+    assert lib["owner_id"] is None
+
+
+def test_deleting_the_owner_keeps_the_library_but_clears_the_owner(acc):
+    creator = user(acc, "creator@example.com")
+    lib = acc.create_library("Project finance", owner_id=creator.id)
+
+    acc.delete_user(creator.id)
+
+    assert acc.library(lib["id"])["owner_id"] is None
 
 
 def test_a_library_name_is_unique_and_not_blank(acc):

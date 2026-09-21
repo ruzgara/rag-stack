@@ -23,15 +23,29 @@ from typing import Iterator
 
 LOCAL_USER = "local"
 
-SCHEMA_VERSION = 4
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
-    id          TEXT PRIMARY KEY,
-    user_id     TEXT NOT NULL,
-    title       TEXT,
-    preset      TEXT NOT NULL,
-    created_at  REAL NOT NULL,
-    updated_at  REAL NOT NULL
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    title        TEXT,
+    preset       TEXT NOT NULL,
+    -- Which workspace this chat belongs to; null for one predating
+    -- workspaces, or created without one. Deleting a workspace hides its
+    -- chats with it (see ChatDB.list_conversations) -- a chat only makes
+    -- sense inside its workspace.
+    workspace_id TEXT REFERENCES workspaces (id) ON DELETE CASCADE,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    -- Soft delete, same shape as workspaces.deleted: set instead of
+    -- removing the row, so nothing about the chat is actually lost.
+    -- updated_at doubles as the deleted-at time, same as workspaces'
+    -- last_used_at -- restoring bumps it again.
+    deleted      INTEGER NOT NULL DEFAULT 0,
+    -- Archived: hidden from the normal chat list like a delete, but still
+    -- fully open-able and repliable -- unlike deleted, this never blocks
+    -- get_conversation. Independent of deleted; archiving or unarchiving
+    -- also bumps updated_at, same double-duty as above.
+    archived     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS conversations_user ON conversations (user_id, updated_at DESC);
 
@@ -98,6 +112,10 @@ CREATE TABLE IF NOT EXISTS groups (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
     description TEXT,
+    -- 'locked' (the default): only an admin can add a member. 'open': a
+    -- user may add themselves (Accounts.join_group) -- an admin can still
+    -- add anyone to either kind.
+    type        TEXT NOT NULL DEFAULT 'locked' CHECK (type IN ('open', 'locked')),
     created_at  REAL NOT NULL
 );
 
@@ -113,6 +131,12 @@ CREATE TABLE IF NOT EXISTS libraries (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
     description TEXT,
+    -- Who created it -- metadata only (a "Mine" tag), not an authorization
+    -- source: read/write/share still come entirely from grants, an owner
+    -- included. Null for one made without an acting user (ragctl). Set
+    -- null rather than cascading on delete: the library outlives whoever
+    -- happened to create it.
+    owner_id    TEXT REFERENCES users (id) ON DELETE SET NULL,
     created_at  REAL NOT NULL
 );
 
@@ -129,6 +153,11 @@ CREATE TABLE IF NOT EXISTS grants (
     created_at   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS grants_subject ON grants (subject_type, subject_id);
+-- The reverse lookup: which subjects hold a grant on a given library (a
+-- library's "who has access" view -- accounts.grants_on_library). Only
+-- library grants have a non-null library_id, which is exactly what this
+-- is for; the global ones are found through grants_subject instead.
+CREATE INDEX IF NOT EXISTS grants_library ON grants (library_id, subject_type, subject_id);
 -- One grant per subject, permission and library. IFNULL because SQLite counts
 -- NULLs as distinct in a unique index, which would let the global permissions
 -- (library_id IS NULL) be granted twice with opposite effects.
@@ -156,25 +185,46 @@ CREATE TABLE IF NOT EXISTS conversation_libraries (
 );
 """
 
-# Schema changes since version 1, applied in order to an existing database.
-# The CREATE TABLE above covers a fresh one; this covers yours.
-MIGRATIONS: dict[int, str] = {
-    2: """
-    CREATE TABLE IF NOT EXISTS uploads (
-        id          TEXT PRIMARY KEY,
-        user_id     TEXT NOT NULL,
-        filename    TEXT NOT NULL,
-        bytes       INTEGER NOT NULL,
-        created_at  REAL NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS uploads_user ON uploads (user_id, created_at DESC);
-    """,
-    3: ACCOUNTS_SCHEMA,
-    4: LIBRARIES_SCHEMA,
-}
+# A workspace is owned by one user and holds libraries and chats: chats
+# belong to at most one workspace (conversations.workspace_id, added below)
+# and cascade with it, since a chat only makes sense inside its workspace.
+# Libraries are a many-to-many attachment, same shape as conversation_libraries
+# -- a library itself stays a global, admin-managed row (accounts.py).
+WORKSPACES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workspaces (
+    id            TEXT PRIMARY KEY,
+    owner_id      TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    description   TEXT,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    -- Bumped whenever a turn runs in one of this workspace's conversations
+    -- (see touch_workspace) -- drives "most recently used" ordering. Starts
+    -- equal to created_at, so a never-used workspace still sorts sanely.
+    -- Also doubles as the deleted-at time: delete_workspace touches it too,
+    -- so there's no separate timestamp for that.
+    last_used_at  REAL NOT NULL DEFAULT 0,
+    -- Soft delete: set instead of removing the row, so its conversations
+    -- (which cascade on a real DELETE) stay put. Excluded from every read
+    -- path below; nothing purges these yet.
+    deleted       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS workspaces_owner ON workspaces (owner_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS workspaces_last_used ON workspaces (owner_id, last_used_at DESC);
 
-# A fresh database gets everything in one go.
-SCHEMA += ACCOUNTS_SCHEMA + LIBRARIES_SCHEMA
+CREATE TABLE IF NOT EXISTS workspace_libraries (
+    workspace_id TEXT NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE,
+    library_id   TEXT NOT NULL REFERENCES libraries (id) ON DELETE CASCADE,
+    added_at     REAL NOT NULL,
+    PRIMARY KEY (workspace_id, library_id)
+);
+"""
+
+# Everything in one go -- no migrations. This system has never shipped
+# outside dev, so there's no installed base to carry forward; when the
+# schema changes, it changes here and dev databases get dropped and
+# recreated (see ragctl / data/chat.db).
+SCHEMA += ACCOUNTS_SCHEMA + LIBRARIES_SCHEMA + WORKSPACES_SCHEMA
 
 
 class NotFound(Exception):
@@ -187,14 +237,7 @@ class ChatDB:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as db:
             db.execute("PRAGMA journal_mode=WAL")  # readers don't block the writer
-            was = db.execute("PRAGMA user_version").fetchone()[0]
             db.executescript(SCHEMA)
-            # An empty database is at the current version once SCHEMA has run;
-            # an older one gets each migration above its version, in order.
-            if was:
-                for version in sorted(v for v in MIGRATIONS if v > was):
-                    db.executescript(MIGRATIONS[version])
-            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -213,16 +256,121 @@ class ChatDB:
         with self._conn() as db:
             db.execute("SELECT 1")
 
+    # --------------------------------------------------------- workspaces --
+
+    def create_workspace(self, name: str, description: str | None = None, *, user_id: str) -> dict:
+        now = time.time()
+        ws = {"id": uuid.uuid4().hex, "name": name, "description": description,
+              "created_at": now, "updated_at": now, "last_used_at": now}
+        with self._conn() as db:
+            db.execute(
+                "INSERT INTO workspaces (id, owner_id, name, description, created_at, updated_at, last_used_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ws["id"], user_id, name, description, now, now, now),
+            )
+        ws["library_ids"] = []
+        return ws
+
+    def list_workspaces(self, user_id: str, deleted: bool = False) -> list[dict]:
+        """`deleted=False` (the default) is the normal workspace list.
+        `deleted=True` is the Recently Deleted tray, for restore_workspace."""
+        with self._conn() as db:
+            rows = db.execute(
+                """SELECT w.id, w.name, w.description, w.created_at, w.updated_at, w.last_used_at,
+                          COUNT(c.id) AS conversation_count
+                   FROM workspaces w LEFT JOIN conversations c ON c.workspace_id = w.id
+                   WHERE w.owner_id = ? AND w.deleted = ?
+                   GROUP BY w.id ORDER BY w.last_used_at DESC""",
+                (user_id, int(deleted)),
+            ).fetchall()
+            libs: dict[str, list[str]] = {}
+            for r in db.execute(
+                """SELECT wl.workspace_id, wl.library_id FROM workspace_libraries wl
+                   JOIN workspaces w ON w.id = wl.workspace_id WHERE w.owner_id = ?""", (user_id,)):
+                libs.setdefault(r["workspace_id"], []).append(r["library_id"])
+        return [{**dict(r), "library_ids": libs.get(r["id"], [])} for r in rows]
+
+    def get_workspace(self, workspace_id: str, user_id: str) -> dict:
+        with self._conn() as db:
+            row = db.execute(
+                "SELECT id, name, description, created_at, updated_at, last_used_at FROM workspaces "
+                "WHERE id = ? AND owner_id = ? AND NOT deleted",
+                (workspace_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise NotFound(workspace_id)
+            ws = dict(row)
+            ws["library_ids"] = [r["library_id"] for r in db.execute(
+                "SELECT library_id FROM workspace_libraries WHERE workspace_id = ?", (workspace_id,))]
+        return ws
+
+    def touch_workspace(self, workspace_id: str, user_id: str) -> None:
+        """Bumps last_used_at -- called when a turn runs in one of this
+        workspace's conversations, so the switcher can sort by actual use
+        rather than by edits to the workspace's own name/libraries."""
+        with self._conn() as db:
+            db.execute("UPDATE workspaces SET last_used_at = ? WHERE id = ? AND owner_id = ? AND NOT deleted",
+                       (time.time(), workspace_id, user_id))
+
+    def update_workspace(self, workspace_id: str, *, name: str | None = None, description: str | None = None,
+                         library_ids: list[str] | None = None, user_id: str) -> dict:
+        self.get_workspace(workspace_id, user_id)  # raises NotFound
+        now = time.time()
+        with self._conn() as db:
+            if name is not None:
+                db.execute("UPDATE workspaces SET name = ?, updated_at = ? WHERE id = ?", (name, now, workspace_id))
+            if description is not None:
+                db.execute("UPDATE workspaces SET description = ?, updated_at = ? WHERE id = ?",
+                           (description, now, workspace_id))
+            if library_ids is not None:
+                db.execute("DELETE FROM workspace_libraries WHERE workspace_id = ?", (workspace_id,))
+                db.executemany(
+                    "INSERT INTO workspace_libraries (workspace_id, library_id, added_at) VALUES (?, ?, ?)",
+                    [(workspace_id, lib_id, now) for lib_id in library_ids])
+        return self.get_workspace(workspace_id, user_id)
+
+    def delete_workspace(self, workspace_id: str, user_id: str) -> None:
+        """Marks the workspace deleted rather than removing the row -- a soft
+        delete, so its conversations (which would cascade on a real DELETE)
+        stay in place, merely inaccessible while the workspace is deleted
+        (list_conversations/get_conversation hide them via the join on
+        workspaces.deleted -- nothing about a chat itself changes here).
+        Bumps last_used_at too, so it doubles as the deleted-at time -- no
+        separate timestamp column for that."""
+        with self._conn() as db:
+            if db.execute(
+                "UPDATE workspaces SET deleted = 1, last_used_at = ? WHERE id = ? AND owner_id = ? AND NOT deleted",
+                (time.time(), workspace_id, user_id)).rowcount == 0:
+                raise NotFound(workspace_id)
+
+    def restore_workspace(self, workspace_id: str, user_id: str) -> dict:
+        """The other half of delete_workspace -- its conversations were
+        never touched, so restoring just makes both visible again."""
+        with self._conn() as db:
+            if db.execute(
+                "UPDATE workspaces SET deleted = 0, last_used_at = ? WHERE id = ? AND owner_id = ? AND deleted",
+                (time.time(), workspace_id, user_id)).rowcount == 0:
+                raise NotFound(workspace_id)
+        return self.get_workspace(workspace_id, user_id)
+
     # ------------------------------------------------------- conversations --
 
     def create_conversation(self, preset: str, title: str | None = None, *, user_id: str,
-                            library_ids: list[str] | None = None) -> dict:
+                            library_ids: list[str] | None = None, workspace_id: str | None = None) -> dict:
         now = time.time()
-        conv = {"id": uuid.uuid4().hex, "title": title, "preset": preset, "created_at": now, "updated_at": now}
+        conv = {"id": uuid.uuid4().hex, "title": title, "preset": preset, "workspace_id": workspace_id,
+                "created_at": now, "updated_at": now, "deleted": 0, "archived": 0}
         with self._conn() as db:
+            # A chat placed in a workspace starts with that workspace's
+            # libraries unless the caller named its own -- otherwise a
+            # workspace's libraries would be a table nothing ever reads.
+            if library_ids is None and workspace_id is not None:
+                library_ids = [r["library_id"] for r in db.execute(
+                    "SELECT library_id FROM workspace_libraries WHERE workspace_id = ?", (workspace_id,))]
             db.execute(
-                "INSERT INTO conversations (id, user_id, title, preset, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (conv["id"], user_id, title, preset, now, now),
+                "INSERT INTO conversations (id, user_id, title, preset, workspace_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (conv["id"], user_id, title, preset, workspace_id, now, now),
             )
             if library_ids:
                 db.executemany("INSERT INTO conversation_libraries (conversation_id, library_id) VALUES (?, ?)",
@@ -230,13 +378,35 @@ class ChatDB:
         conv["library_ids"] = library_ids or []
         return conv
 
-    def list_conversations(self, user_id: str) -> list[dict]:
+    def list_conversations(self, user_id: str, workspace_id: str | None = None, deleted: bool = False,
+                           archived: bool = False) -> list[dict]:
+        """`deleted=False, archived=False` (the default) is the normal chat
+        list: this chat's own delete or archive, or its workspace's delete,
+        all hide it. `archived=True` is the Archived list (still excludes
+        deleted chats and deleted workspaces). `deleted=True` is the
+        Recently Deleted tray and ignores `archived` entirely -- only this
+        chat's own delete puts it there; a chat merely hidden because its
+        workspace was deleted isn't something the user asked to delete, so
+        it doesn't show up to restore this way (restoring the workspace
+        brings it back instead)."""
         with self._conn() as db:
+            params: tuple = (user_id,)
+            if deleted:
+                where = "c.user_id = ? AND c.deleted"
+            else:
+                where = ("c.user_id = ? AND NOT c.deleted AND c.archived = ? "
+                        "AND (c.workspace_id IS NULL OR NOT w.deleted)")
+                params += (int(archived),)
+            if workspace_id is not None:
+                where += " AND c.workspace_id = ?"
+                params += (workspace_id,)
             rows = db.execute(
-                """SELECT c.id, c.title, c.preset, c.created_at, c.updated_at, COUNT(m.id) AS message_count
+                f"""SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.archived,
+                          COUNT(m.id) AS message_count
                    FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id
-                   WHERE c.user_id = ? GROUP BY c.id ORDER BY c.updated_at DESC""",
-                (user_id,),
+                        LEFT JOIN workspaces w ON w.id = c.workspace_id
+                   WHERE {where} GROUP BY c.id ORDER BY c.updated_at DESC""",
+                params,
             ).fetchall()
             # A second, un-joined query rather than a second join: joining
             # conversation_libraries alongside messages would multiply rows
@@ -250,8 +420,13 @@ class ChatDB:
 
     def get_conversation(self, conv_id: str, user_id: str, with_messages: bool = True) -> dict:
         with self._conn() as db:
+            # Same deleted/soft-deleted-workspace exclusion as
+            # list_conversations(deleted=False).
             row = db.execute(
-                "SELECT id, title, preset, created_at, updated_at FROM conversations WHERE id = ? AND user_id = ?",
+                """SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.archived
+                   FROM conversations c LEFT JOIN workspaces w ON w.id = c.workspace_id
+                   WHERE c.id = ? AND c.user_id = ? AND NOT c.deleted
+                         AND (c.workspace_id IS NULL OR NOT w.deleted)""",
                 (conv_id, user_id),
             ).fetchone()
             if row is None:
@@ -289,9 +464,43 @@ class ChatDB:
         return self.get_conversation(conv_id, user_id, with_messages=False)
 
     def delete_conversation(self, conv_id: str, user_id: str) -> None:
+        """Marks the chat deleted rather than removing it -- see the
+        `deleted` column comment. Bumps updated_at, which doubles as the
+        deleted-at time."""
         with self._conn() as db:
-            if db.execute("DELETE FROM conversations WHERE id = ? AND user_id = ?", (conv_id, user_id)).rowcount == 0:
+            if db.execute(
+                "UPDATE conversations SET deleted = 1, updated_at = ? WHERE id = ? AND user_id = ? AND NOT deleted",
+                (time.time(), conv_id, user_id)).rowcount == 0:
                 raise NotFound(conv_id)
+
+    def restore_conversation(self, conv_id: str, user_id: str) -> dict:
+        with self._conn() as db:
+            if db.execute(
+                "UPDATE conversations SET deleted = 0, updated_at = ? WHERE id = ? AND user_id = ? AND deleted",
+                (time.time(), conv_id, user_id)).rowcount == 0:
+                raise NotFound(conv_id)
+        return self.get_conversation(conv_id, user_id, with_messages=False)
+
+    def archive_conversation(self, conv_id: str, user_id: str) -> dict:
+        """Archiving hides a chat from the normal list without touching
+        `deleted` -- it's still fully open-able and repliable, just out of
+        the way. A deleted chat can't be archived; restore it first."""
+        with self._conn() as db:
+            if db.execute(
+                "UPDATE conversations SET archived = 1, updated_at = ? "
+                "WHERE id = ? AND user_id = ? AND NOT deleted AND NOT archived",
+                (time.time(), conv_id, user_id)).rowcount == 0:
+                raise NotFound(conv_id)
+        return self.get_conversation(conv_id, user_id, with_messages=False)
+
+    def unarchive_conversation(self, conv_id: str, user_id: str) -> dict:
+        with self._conn() as db:
+            if db.execute(
+                "UPDATE conversations SET archived = 0, updated_at = ? "
+                "WHERE id = ? AND user_id = ? AND NOT deleted AND archived",
+                (time.time(), conv_id, user_id)).rowcount == 0:
+                raise NotFound(conv_id)
+        return self.get_conversation(conv_id, user_id, with_messages=False)
 
     # ------------------------------------------------------------ messages --
 
@@ -351,6 +560,24 @@ class ChatDB:
             )
             db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conv_id))
         return {"id": msg_id, "created_at": now}
+
+    def prepare_retry(self, conv_id: str, user_id: str) -> str:
+        """Deletes the conversation's last message, if it's an answer, so a
+        fresh one can replace it -- the question it was answering stays in
+        place (message_sources cascades with the deleted answer). Returns
+        that question's content, for the caller to rerun the turn with.
+
+        Raises NotFound if the chat doesn't end in an answer: there's
+        nothing to retry mid-question, on a chat with no messages yet, or
+        on one that already ends in a still-unanswered question."""
+        with self._conn() as db:
+            rows = db.execute(
+                "SELECT id, role, content FROM messages WHERE conversation_id = ? AND user_id = ? "
+                "ORDER BY created_at DESC LIMIT 2", (conv_id, user_id)).fetchall()
+            if len(rows) < 2 or rows[0]["role"] != "assistant" or rows[1]["role"] != "user":
+                raise NotFound(conv_id)
+            db.execute("DELETE FROM messages WHERE id = ?", (rows[0]["id"],))
+            return rows[1]["content"]
 
     # ------------------------------------------------------------- uploads --
 

@@ -100,7 +100,7 @@
     <p class="hint">A group hands a permission to a team; a single user can still be lifted out of it with a grant of their own.</p>
     <div class="row"><button class="primary" id="newGroup">+ New group</button></div>
     <h3>Groups</h3>
-    <table><thead><tr><th>Name</th><th>Members</th><th>Grants</th><th></th></tr></thead><tbody id="groupRows"></tbody></table>
+    <table><thead><tr><th>Name</th><th>Type</th><th>Members</th><th>Grants</th><th></th></tr></thead><tbody id="groupRows"></tbody></table>
   </section>
 
   <section class="panel" id="tab-libraries">
@@ -347,6 +347,7 @@ function renderGroups() {
     const members = (g.members || []).map(id => cache.users.find(u => u.id === id)?.email || id);
     return `<tr data-id="${g.id}">
       <td>${esc(g.name)}<div class="small">${esc(g.id)}</div></td>
+      <td class="small">${g.type === "open" ? "Open" : "Locked"}</td>
       <td class="small">${esc(members.join(", ")) || "—"}</td>
       <td>${grantTags("group", g.id)}</td>
       <td class="actions">
@@ -354,7 +355,7 @@ function renderGroups() {
         <button class="small" data-act="grant">Grant</button>
         <button class="small danger" data-act="delete">Delete</button>
       </td></tr>`;
-  }).join("") || '<tr><td colspan="4" class="small">No groups.</td></tr>';
+  }).join("") || '<tr><td colspan="5" class="small">No groups.</td></tr>';
 }
 
 function renderLibraries() {
@@ -419,10 +420,14 @@ $("#userRows").onclick = guard(async e => {
 $("#newGroup").onclick = guard(async () => {
   const form = await ask("New group", [
     {name: "name", label: "Name", required: true},
-    {name: "description", label: "Description (optional)"}], "Create");
+    {name: "description", label: "Description (optional)"},
+    {name: "type", label: "Type", type: "select", value: "locked", options: [
+      {value: "locked", label: "Locked (an admin adds members)"},
+      {value: "open", label: "Open (anyone can join themselves)"}]}], "Create");
   if (!form) return;
-  await api("/api/admin/groups", {method: "POST", body: {name: form.name, description: form.description || null}});
-  toast(`Created group ${form.name}.`);
+  await api("/api/admin/groups", {method: "POST",
+    body: {name: form.name, description: form.description || null, type: form.type}});
+  toast(`Created ${form.type} group ${form.name}.`);
   await loadAccounts();
 });
 

@@ -309,6 +309,31 @@ class Retriever:
             for rank, p in enumerate(points, start=1)
         ]
 
+    def document_chunks(self, doc_sha: str, offset: int = 0, limit: int | None = None) -> tuple[list[dict], int]:
+        """One document's chunks, in document order, for the source viewer's
+        prev/next navigation -- `total` is its full chunk count regardless
+        of `offset`/`limit` (limit=None returns the rest from offset), read
+        off the same scroll rather than a second round trip."""
+        body: dict = {
+            "filter": {"must": [{"key": "doc_sha", "match": {"value": doc_sha}}]},
+            "limit": 1000,
+            "with_payload": ["chunk_index", "headings", "pages", "text"],
+        }
+        points: list[dict] = []
+        while True:
+            result = self._qdrant("POST", f"/collections/{self.cfg.collection}/points/scroll", body)
+            points.extend(result["points"])
+            next_offset = result.get("next_page_offset")
+            if not next_offset:
+                break
+            body["offset"] = next_offset
+        points.sort(key=lambda p: p["payload"]["chunk_index"])
+        total = len(points)
+        page = points[offset:offset + limit] if limit is not None else points[offset:]
+        chunks = [{"chunk_index": p["payload"]["chunk_index"], "headings": p["payload"].get("headings") or [],
+                   "pages": p["payload"].get("pages") or [], "text": p["payload"]["text"]} for p in page]
+        return chunks, total
+
     @property
     def reranker(self):
         """Loaded on first use: importing torch and moving the model to the

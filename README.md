@@ -378,7 +378,10 @@ answers in a few seconds but rarely searches beyond the automatic search.
 
 | Endpoint | |
 |---|---|
-| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?}`), list |
+| `POST /api/workspaces` · `GET /api/workspaces` | create (`{name, description?}`), list your own workspaces |
+| `GET` · `PATCH` · `DELETE /api/workspaces/{id}` | open, rename / change `description` / change `library_ids`, delete (also deletes the chats in it) |
+| `GET /api/workspaces/{id}/conversations` | chats in this workspace |
+| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?, workspace_id?}`), list |
 | `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete |
 | `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error` |
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |

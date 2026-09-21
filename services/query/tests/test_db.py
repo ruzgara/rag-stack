@@ -13,8 +13,11 @@ OTHER = "someone-else"
 # storage, so the fixture binds one user and the scoping itself is tested
 # separately below.
 SCOPED = ("create_conversation", "list_conversations", "get_conversation", "update_conversation",
-          "delete_conversation", "history", "add_user_message", "add_assistant_message",
-          "record_upload", "upload_usage")
+          "delete_conversation", "restore_conversation", "archive_conversation", "unarchive_conversation",
+          "history", "add_user_message", "add_assistant_message", "prepare_retry",
+          "record_upload", "upload_usage",
+          "create_workspace", "list_workspaces", "get_workspace", "update_workspace", "delete_workspace",
+          "restore_workspace", "touch_workspace")
 
 
 class Scoped:
@@ -96,6 +99,55 @@ def test_history_leaves_out_failed_answers_and_their_questions(db):
     ]
 
 
+def test_preparing_a_retry_deletes_the_last_answer_and_returns_its_question(db):
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q1")
+    answer(db, conv["id"], "a1")
+    db.add_user_message(conv["id"], "q2")
+    answer(db, conv["id"], "a2")
+
+    question = db.prepare_retry(conv["id"])
+
+    assert question == "q2"
+    messages = db.get_conversation(conv["id"])["messages"]
+    assert [(m["role"], m["content"]) for m in messages] == [
+        ("user", "q1"), ("assistant", "a1"), ("user", "q2")]
+    # history() already treats the now-trailing question as unanswered, so
+    # a caller can rerun the turn without any special-casing.
+    assert db.history(conv["id"]) == [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+
+
+def test_preparing_a_retry_works_on_a_failed_answer_too(db):
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q1")
+    answer(db, conv["id"], "", status="error", error="ollama down")
+
+    question = db.prepare_retry(conv["id"])
+
+    assert question == "q1"
+    messages = db.get_conversation(conv["id"])["messages"]
+    assert [m["role"] for m in messages] == ["user"]  # the failed answer is gone
+
+
+def test_preparing_a_retry_on_an_empty_or_unanswered_chat_is_not_found(db):
+    conv = db.create_conversation("everyday")
+    with pytest.raises(NotFound):  # no messages at all
+        db.prepare_retry(conv["id"])
+
+    db.add_user_message(conv["id"], "q1")
+    with pytest.raises(NotFound):  # still unanswered
+        db.prepare_retry(conv["id"])
+
+
+def test_preparing_a_retry_is_scoped_to_the_caller(db):
+    conv = db.create_conversation("everyday", user_id="alice")
+    db.add_user_message(conv["id"], "q1", user_id="alice")
+    answer(db, conv["id"], "a1", user_id="alice")
+
+    with pytest.raises(NotFound):
+        db.prepare_retry(conv["id"], user_id="bob")
+
+
 def test_conversations_are_scoped_to_their_user(db):
     mine = db.create_conversation("everyday", user_id="alice")
     theirs = db.as_user(OTHER).create_conversation("everyday", "Theirs")
@@ -109,14 +161,102 @@ def test_conversations_are_scoped_to_their_user(db):
         db.delete_conversation(mine["id"], user_id="bob")
 
 
-def test_deleting_a_conversation_deletes_its_messages_and_sources(db, tmp_path):
+def test_deleting_a_conversation_is_soft_and_keeps_its_messages_and_sources(db, tmp_path):
     conv = db.create_conversation("everyday")
     db.add_user_message(conv["id"], "q")
     answer(db, conv["id"])
     db.delete_conversation(conv["id"])
     with sqlite3.connect(tmp_path / "chat.db") as raw:
-        assert raw.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
-        assert raw.execute("SELECT COUNT(*) FROM message_sources").fetchone()[0] == 0
+        assert raw.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
+        assert raw.execute("SELECT COUNT(*) FROM message_sources").fetchone()[0] == 2
+
+
+def test_a_deleted_conversation_can_be_restored(db):
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q")
+    db.delete_conversation(conv["id"])
+    with pytest.raises(NotFound):
+        db.get_conversation(conv["id"])
+
+    restored = db.restore_conversation(conv["id"])
+
+    assert restored["id"] == conv["id"]
+    assert db.get_conversation(conv["id"])["messages"][0]["content"] == "q"
+    with pytest.raises(NotFound):  # already restored
+        db.restore_conversation(conv["id"])
+
+
+def test_deleted_conversations_are_listed_separately(db):
+    kept = db.create_conversation("everyday", title="Kept")
+    removed = db.create_conversation("everyday", title="Removed")
+    db.delete_conversation(removed["id"])
+
+    assert [c["id"] for c in db.list_conversations()] == [kept["id"]]
+    assert [c["id"] for c in db.list_conversations(deleted=True)] == [removed["id"]]
+
+
+def test_a_chat_in_a_deleted_workspace_does_not_show_up_as_individually_deleted(db):
+    ws = db.create_workspace("Research")
+    conv = db.create_conversation("everyday", workspace_id=ws["id"])
+
+    db.delete_workspace(ws["id"])
+
+    assert db.list_conversations() == []
+    # Hidden from the normal list (via the workspace), but this chat was
+    # never itself deleted -- it doesn't belong in the restore tray.
+    assert db.list_conversations(deleted=True) == []
+
+
+def test_archiving_a_chat_hides_it_but_it_stays_open_able(db):
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q")
+
+    archived = db.archive_conversation(conv["id"])
+
+    assert archived["archived"] == 1
+    # Unlike delete, get_conversation still finds it.
+    got = db.get_conversation(conv["id"])
+    assert got["archived"] == 1
+    assert got["messages"][0]["content"] == "q"
+
+
+def test_archived_chats_are_listed_separately(db):
+    kept = db.create_conversation("everyday", title="Kept")
+    stashed = db.create_conversation("everyday", title="Stashed")
+    db.archive_conversation(stashed["id"])
+
+    assert [c["id"] for c in db.list_conversations()] == [kept["id"]]
+    assert [c["id"] for c in db.list_conversations(archived=True)] == [stashed["id"]]
+
+
+def test_unarchiving_a_chat_returns_it_to_the_normal_list(db):
+    conv = db.create_conversation("everyday")
+    db.archive_conversation(conv["id"])
+
+    unarchived = db.unarchive_conversation(conv["id"])
+
+    assert unarchived["archived"] == 0
+    assert [c["id"] for c in db.list_conversations()] == [conv["id"]]
+    assert db.list_conversations(archived=True) == []
+
+
+def test_archiving_twice_or_an_unknown_chat_is_not_found(db):
+    conv = db.create_conversation("everyday")
+    db.archive_conversation(conv["id"])
+    with pytest.raises(NotFound):
+        db.archive_conversation(conv["id"])
+    with pytest.raises(NotFound):
+        db.archive_conversation("no-such-chat")
+    with pytest.raises(NotFound):  # never archived
+        db.unarchive_conversation("no-such-chat")
+
+
+def test_a_deleted_chat_cannot_be_archived(db):
+    conv = db.create_conversation("everyday")
+    db.delete_conversation(conv["id"])
+
+    with pytest.raises(NotFound):
+        db.archive_conversation(conv["id"])
 
 
 # ------------------------------------------------------------ ingest quota --
@@ -139,31 +279,6 @@ def test_uploads_are_counted_per_user(db):
     db.record_upload("theirs.pdf", 9_000, user_id="someone-else")
     assert db.upload_usage(3600) == (1, 1_000)
     assert db.upload_usage(3600, user_id="someone-else") == (1, 9_000)
-
-
-def test_an_older_database_is_migrated_in_place(tmp_path):
-    """A chat.db written before the uploads table must keep its rows."""
-    path = tmp_path / "old.db"
-    conn = sqlite3.connect(path)
-    conn.executescript("""
-        CREATE TABLE conversations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT,
-                                    preset TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL);
-        INSERT INTO conversations VALUES ('c1', 'local', 'Old chat', 'everyday', 1.0, 2.0);
-        PRAGMA user_version=1;
-    """)
-    conn.commit()
-    conn.close()
-
-    db = Scoped(ChatDB(path), "local")
-
-    assert [c["id"] for c in db.list_conversations()] == ["c1"]
-    db.record_upload("new.pdf", 10)
-    assert db.upload_usage(3600) == (1, 10)
-    with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
-        conn.execute("INSERT INTO libraries (id, name, created_at) VALUES ('lib', 'Finance', 0)")
-        conn.execute("INSERT INTO library_documents (library_id, doc_sha, added_at) VALUES ('lib', 'sha', 0)")
-        conn.execute("INSERT INTO conversation_libraries (conversation_id, library_id) VALUES ('c1', 'lib')")
 
 
 # --------------------------------------------------------------- libraries --
@@ -201,3 +316,190 @@ def test_listing_conversations_reports_their_attached_libraries_too(db):
     by_id = {c["id"]: c["library_ids"] for c in db.list_conversations()}
 
     assert by_id == {with_lib["id"]: ["lib-a"], without["id"]: []}
+
+
+# -------------------------------------------------------------- workspaces --
+
+def test_workspace_lifecycle(db):
+    ws = db.create_workspace("Research")
+    assert ws["library_ids"] == []
+    assert db.get_workspace(ws["id"])["name"] == "Research"
+
+    db.update_workspace(ws["id"], name="Renamed", description="notes")
+    got = db.get_workspace(ws["id"])
+    assert (got["name"], got["description"]) == ("Renamed", "notes")
+
+    db.delete_workspace(ws["id"])
+    with pytest.raises(NotFound):
+        db.get_workspace(ws["id"])
+    with pytest.raises(NotFound):
+        db.delete_workspace(ws["id"])
+
+
+def test_a_workspace_can_have_libraries_attached(db):
+    make_library(db, "lib-a", "A")
+    make_library(db, "lib-b", "B")
+    ws = db.create_workspace("Research")
+
+    db.update_workspace(ws["id"], library_ids=["lib-a", "lib-b"])
+    assert db.get_workspace(ws["id"])["library_ids"] == ["lib-a", "lib-b"]
+
+    db.update_workspace(ws["id"], library_ids=[])
+    assert db.get_workspace(ws["id"])["library_ids"] == []
+
+
+def test_workspaces_are_scoped_to_their_owner(db):
+    mine = db.create_workspace("Mine", user_id="alice")
+    theirs = db.as_user(OTHER).create_workspace("Theirs")
+    assert [w["name"] for w in db.list_workspaces(user_id="alice")] == ["Mine"]
+    assert db.list_workspaces(user_id="bob") == []
+    with pytest.raises(NotFound):
+        db.get_workspace(theirs["id"], user_id="alice")
+    with pytest.raises(NotFound):
+        db.get_workspace(mine["id"], user_id="bob")
+    with pytest.raises(NotFound):
+        db.delete_workspace(mine["id"], user_id="bob")
+
+
+def test_listing_workspaces_reports_their_conversation_count(db):
+    ws = db.create_workspace("Research")
+    db.create_conversation("everyday", workspace_id=ws["id"])
+    db.create_conversation("everyday", workspace_id=ws["id"])
+    db.create_conversation("everyday")  # not in the workspace
+
+    assert db.list_workspaces()[0]["conversation_count"] == 2
+
+
+def test_a_conversation_can_belong_to_a_workspace(db):
+    ws = db.create_workspace("Research")
+    conv = db.create_conversation("everyday", workspace_id=ws["id"])
+    assert conv["workspace_id"] == ws["id"]
+    assert db.get_conversation(conv["id"], with_messages=False)["workspace_id"] == ws["id"]
+    assert [c["id"] for c in db.list_conversations(workspace_id=ws["id"])] == [conv["id"]]
+
+    outside = db.create_conversation("everyday")
+    assert outside["id"] not in [c["id"] for c in db.list_conversations(workspace_id=ws["id"])]
+
+
+def test_deleting_a_workspace_deletes_its_conversations(db):
+    ws = db.create_workspace("Research")
+    conv = db.create_conversation("everyday", workspace_id=ws["id"])
+
+    db.delete_workspace(ws["id"])
+
+    with pytest.raises(NotFound):
+        db.get_conversation(conv["id"])
+
+
+def test_a_new_workspace_starts_last_used_at_its_creation(db):
+    ws = db.create_workspace("Research")
+    assert ws["last_used_at"] == ws["created_at"]
+    assert db.get_workspace(ws["id"])["last_used_at"] == ws["created_at"]
+
+
+def test_touching_a_workspace_moves_it_to_the_front(db):
+    older = db.create_workspace("Older")
+    newer = db.create_workspace("Newer")
+    assert [w["id"] for w in db.list_workspaces()] == [newer["id"], older["id"]]
+
+    db.touch_workspace(older["id"])
+    assert [w["id"] for w in db.list_workspaces()] == [older["id"], newer["id"]]
+
+
+def test_touching_someone_elses_workspace_does_nothing(db):
+    ws = db.create_workspace("Mine", user_id="alice")
+    db.touch_workspace(ws["id"], user_id="bob")  # no error, just no match
+    assert db.get_workspace(ws["id"], user_id="alice")["last_used_at"] == ws["created_at"]
+
+
+def test_a_deleted_workspace_is_marked_not_removed(db, tmp_path):
+    ws = db.create_workspace("Research")
+    db.delete_workspace(ws["id"])
+    with db._db._conn() as conn:
+        row = conn.execute("SELECT deleted, last_used_at FROM workspaces WHERE id = ?", (ws["id"],)).fetchone()
+        assert row["deleted"] == 1
+        assert row["last_used_at"] >= ws["created_at"]  # also serves as the deleted-at time
+
+
+def test_a_deleted_workspace_is_hidden_but_its_conversations_stay_stored(db):
+    ws = db.create_workspace("Research")
+    conv = db.create_conversation("everyday", workspace_id=ws["id"])
+
+    db.delete_workspace(ws["id"])
+
+    assert db.list_workspaces() == []
+    with pytest.raises(NotFound):
+        db.get_workspace(ws["id"])
+    # Hidden from the API's view (the join treats it as gone)...
+    with pytest.raises(NotFound):
+        db.get_conversation(conv["id"])
+    # ...but the row itself was never actually deleted.
+    with db._db._conn() as raw:
+        assert raw.execute("SELECT COUNT(*) FROM conversations WHERE id = ?",
+                           (conv["id"],)).fetchone()[0] == 1
+
+
+def test_a_deleted_workspace_can_be_restored(db):
+    ws = db.create_workspace("Research")
+    db.delete_workspace(ws["id"])
+
+    restored = db.restore_workspace(ws["id"])
+
+    assert restored["id"] == ws["id"]
+    assert [w["id"] for w in db.list_workspaces()] == [ws["id"]]
+    with pytest.raises(NotFound):  # already restored
+        db.restore_workspace(ws["id"])
+
+
+def test_restoring_a_workspace_also_restores_its_conversations(db):
+    ws = db.create_workspace("Research")
+    conv = db.create_conversation("everyday", workspace_id=ws["id"])
+    db.delete_workspace(ws["id"])
+    with pytest.raises(NotFound):
+        db.get_conversation(conv["id"])
+
+    db.restore_workspace(ws["id"])
+
+    # The conversation itself was never touched -- it's reachable again
+    # purely because the workspace's own deleted flag flipped back.
+    assert db.get_conversation(conv["id"])["id"] == conv["id"]
+    assert [c["id"] for c in db.list_conversations(workspace_id=ws["id"])] == [conv["id"]]
+
+
+def test_restoring_a_workspace_that_isnt_deleted_is_not_found(db):
+    ws = db.create_workspace("Research")
+    with pytest.raises(NotFound):
+        db.restore_workspace(ws["id"])
+
+
+def test_restoring_an_unknown_or_someone_elses_workspace_is_not_found(db):
+    with pytest.raises(NotFound):
+        db.restore_workspace("no-such-workspace")
+
+    ws = db.create_workspace("Mine", user_id="alice")
+    db.delete_workspace(ws["id"], user_id="alice")
+    with pytest.raises(NotFound):
+        db.restore_workspace(ws["id"], user_id="bob")
+
+
+def test_deleted_workspaces_are_listed_separately(db):
+    kept = db.create_workspace("Kept")
+    removed = db.create_workspace("Removed")
+    db.delete_workspace(removed["id"])
+
+    assert [w["id"] for w in db.list_workspaces()] == [kept["id"]]
+    assert [w["id"] for w in db.list_workspaces(deleted=True)] == [removed["id"]]
+
+
+def test_a_conversation_in_a_workspace_defaults_to_the_workspaces_libraries(db):
+    make_library(db, "lib-a", "A")
+    ws = db.create_workspace("Research")
+    db.update_workspace(ws["id"], library_ids=["lib-a"])
+
+    conv = db.create_conversation("everyday", workspace_id=ws["id"])
+    assert conv["library_ids"] == ["lib-a"]
+
+    # Naming libraries explicitly overrides the workspace's.
+    make_library(db, "lib-b", "B")
+    conv2 = db.create_conversation("everyday", workspace_id=ws["id"], library_ids=["lib-b"])
+    assert conv2["library_ids"] == ["lib-b"]

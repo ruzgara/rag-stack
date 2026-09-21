@@ -81,7 +81,8 @@ def test_a_library_permission_names_the_library_it_applies_to(service, admin):
 
 def test_an_admin_is_reported_as_holding_everything(service, admin):
     effective = users_by_email(admin)["admin@example.com"]["effective"]
-    assert set(effective) == {"users.manage", "libraries.manage", "chat.use", "library.read", "library.write"}
+    assert set(effective) == {"users.manage", "libraries.manage", "chat.use", "library.read", "library.write",
+                              "library.share"}
 
 
 def test_a_disabled_user_holds_nothing_whatever_was_granted(service, admin):

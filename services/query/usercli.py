@@ -14,7 +14,8 @@ Run through ragctl:
   ragctl user passwd alice@example.com           change a password
   ragctl user disable alice@example.com          keep the history, refuse logins
   ragctl user delete alice@example.com
-  ragctl user group add Analysts                 groups
+  ragctl user group add Analysts                 groups (locked: admin-only membership)
+  ragctl user group add Everyone --type open     open: users can join themselves
   ragctl user group list
   ragctl user member add Analysts alice@example.com
   ragctl user grant Analysts chat.use            grant to a group or a user
@@ -149,10 +150,10 @@ def cmd_delete(acc: Accounts, args) -> None:
 def cmd_group(acc: Accounts, args) -> None:
     if args.action == "add":
         try:
-            group = acc.create_group(args.name)
+            group = acc.create_group(args.name, kind=args.type)
         except Invalid as exc:
             sys.exit(str(exc))
-        print(f"created group {group['name']} id={group['id']}")
+        print(f"created {group['type']} group {group['name']} id={group['id']}")
     elif args.action == "delete":
         _, group_id = subject_of(acc, args.name)
         acc.delete_group(group_id)
@@ -160,7 +161,7 @@ def cmd_group(acc: Accounts, args) -> None:
     else:
         for group in acc.groups():
             grants = acc.grants_of("group", group["id"])
-            print(f"{group['name']}  id={group['id']}  members={len(group['members'])}")
+            print(f"{group['name']}  id={group['id']}  type={group['type']}  members={len(group['members'])}")
             for grant in grants:
                 where = f" on {grant['library_id']}" if grant["library_id"] else ""
                 print(f"    {grant['effect']:5s} {grant['permission']}{where}")
@@ -306,6 +307,8 @@ def main() -> None:
     group = subs.add_parser("group", help="add, delete or list groups")
     group.add_argument("action", choices=["add", "delete", "list"])
     group.add_argument("name", nargs="?", default=None)
+    group.add_argument("--type", choices=["open", "locked"], default="locked",
+                       help="add only: open groups are self-joinable; locked ones need an admin (default)")
     group.set_defaults(run=cmd_group)
 
     mem = subs.add_parser("member", help="add or remove a group member")
