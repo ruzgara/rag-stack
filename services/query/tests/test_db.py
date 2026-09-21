@@ -78,6 +78,38 @@ def test_a_new_conversation_starts_read_and_opening_it_bumps_last_read_at(db):
     assert opened["last_read_at"] == db.list_conversations()[0]["last_read_at"]
 
 
+def test_finishing_a_turn_counts_as_reading_it(db):
+    """A chat you're actively watching stream must not turn up unread the
+    moment the answer lands -- the answer is to your own turn, and it lands
+    after the open that started it bumped last_read_at."""
+    conv = db.create_conversation("everyday")
+    db.get_conversation(conv["id"])  # open it, as the client does before sending
+    db.add_user_message(conv["id"], "who are the parties?")
+
+    answer(db, conv["id"])
+
+    listed = db.list_conversations()[0]
+    assert listed["last_read_at"] >= listed["last_message_at"]
+
+
+def test_archiving_restoring_and_unarchiving_do_not_make_a_chat_unread(db):
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q")
+    answer(db, conv["id"])
+    db.get_conversation(conv["id"])  # catch up: read the answer above
+    read_at = db.list_conversations()[0]["last_read_at"]
+
+    db.archive_conversation(conv["id"])
+    db.unarchive_conversation(conv["id"])
+    listed = db.list_conversations()[0]
+    assert listed["last_read_at"] == read_at  # unaffected...
+    assert listed["updated_at"] > listed["last_message_at"]  # ...even though updated_at moved
+
+    db.delete_conversation(conv["id"])
+    restored = db.restore_conversation(conv["id"])
+    assert restored["last_read_at"] == read_at
+
+
 def test_messages_and_sources_round_trip(db):
     conv = db.create_conversation("everyday")
     db.add_user_message(conv["id"], "who are the parties?")

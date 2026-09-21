@@ -37,10 +37,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
     -- When this user last opened the chat (get_conversation with_messages,
-    -- i.e. actually viewing it -- not every touch). Starts equal to
+    -- i.e. actually viewing it) or finished a turn in it themselves (they
+    -- watched it stream, so it's not unread either). Starts equal to
     -- created_at, same reasoning as workspaces.last_used_at: a chat you
-    -- just created isn't "unread". Compare against updated_at to tell if a
-    -- chat has activity the user hasn't seen yet.
+    -- just created isn't "unread". Compare against the last message's
+    -- created_at (list_conversations/get_conversation compute this as
+    -- last_message_at), not updated_at -- that also moves on delete,
+    -- archive, restore and unarchive, none of which are something to read.
     last_read_at REAL NOT NULL,
     -- Soft delete, same shape as workspaces.deleted: set instead of
     -- removing the row, so nothing about the chat is actually lost.
@@ -426,7 +429,12 @@ class ChatDB:
                 params += (workspace_id,)
             rows = db.execute(
                 f"""SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.last_read_at,
-                          c.archived, COUNT(m.id) AS message_count
+                          c.archived, COUNT(m.id) AS message_count,
+                          -- What "unread" actually compares against: only new
+                          -- messages count as activity, not a delete/archive/
+                          -- restore, which also bump updated_at (see their
+                          -- own methods below) but aren't something to read.
+                          COALESCE(MAX(m.created_at), c.created_at) AS last_message_at
                    FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id
                         LEFT JOIN workspaces w ON w.id = c.workspace_id
                    WHERE {where} GROUP BY c.id ORDER BY c.updated_at DESC""",
@@ -459,7 +467,9 @@ class ChatDB:
             # list_conversations(deleted=False).
             row = db.execute(
                 """SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.last_read_at,
-                          c.archived
+                          c.archived,
+                          COALESCE((SELECT MAX(created_at) FROM messages WHERE conversation_id = c.id), c.created_at)
+                              AS last_message_at
                    FROM conversations c LEFT JOIN workspaces w ON w.id = c.workspace_id
                    WHERE c.id = ? AND c.user_id = ? AND NOT c.deleted
                          AND (c.workspace_id IS NULL OR NOT w.deleted)""",
@@ -597,7 +607,13 @@ class ChatDB:
                   s["doc_sha"], s["filename"], s["chunk_index"], json.dumps(s["pages"]), json.dumps(s["headings"]),
                   s["text"], s.get("rerank_score")) for s in sources],
             )
-            db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conv_id))
+            # A chat has one owner, and this is the answer to their own turn
+            # -- they watched it stream, so it counts as read, not just as
+            # activity. Without this, the chat you're actively watching
+            # would show up unread the moment the answer finishes, since it
+            # lands after last_read_at was last bumped (on open).
+            db.execute("UPDATE conversations SET updated_at = ?, last_read_at = ? WHERE id = ?",
+                      (now, now, conv_id))
         return {"id": msg_id, "created_at": now}
 
     def prepare_retry(self, conv_id: str, user_id: str) -> str:
