@@ -27,16 +27,12 @@ def acc(tmp_path, monkeypatch):
 
 @pytest.fixture
 def member(acc):
-    user = acc.create_user("member@example.com", display_name="Member")
-    acc.grant("user", user.id, "chat.use")
-    return user
+    return acc.create_user("member@example.com", display_name="Member")
 
 
 @pytest.fixture
 def other_member(acc):
-    user = acc.create_user("other@example.com", display_name="Other")
-    acc.grant("user", user.id, "chat.use")
-    return user
+    return acc.create_user("other@example.com", display_name="Other")
 
 
 def test_deleting_a_chat_moves_it_to_the_deleted_list(member):

@@ -145,8 +145,7 @@ def test_an_upload_with_a_library_id_is_assigned_by_its_future_sha(inbox, user):
     """The sha is computed here, before ingest ever runs, so the assignment
     is already in place by the time embedding makes the document
     searchable -- no filename matching, no waiting on ingest."""
-    lib = api.state.accounts.create_library("Project finance")
-    api.state.accounts.grant("user", user.id, "library.write", lib["id"])
+    lib = api.state.accounts.create_library("Project finance", owner_id=user.id)
     size = 1_000
 
     api.upload(user=user, library_id=lib["id"], files=[pdf("book.pdf", size=size)])
@@ -166,9 +165,9 @@ def test_an_upload_to_a_library_without_write_is_refused(inbox, user):
 
 
 def test_an_upload_to_an_unknown_library_is_404(inbox, user):
-    """An admin clears the permission check unconditionally, so this is
-    where a bad id actually gets checked -- for a member, library.write on
-    an id that was never granted is a 403 before it gets this far."""
+    """An admin clears the write check unconditionally, so this is where a
+    bad id actually gets checked -- for a member, write access to an id
+    they were never given is a 403 before it gets this far."""
     admin = api.state.accounts.create_user("admin@example.com", display_name="Admin", is_admin=True)
 
     with pytest.raises(HTTPException) as exc:

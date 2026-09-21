@@ -1,6 +1,6 @@
 """
-The library endpoints: admin CRUD, document assignment, and the checks that
-keep a conversation from attaching a library its owner can't read. Endpoint
+The library endpoints: self-service CRUD by ownership, document assignment
+guarded by read-before-write, and the sharing (access-list) surface. Endpoint
 functions are called directly, like test_api_uploads.py and test_api_auth.py.
 """
 
@@ -36,61 +36,12 @@ def admin(acc):
 
 @pytest.fixture
 def member(acc):
-    user = acc.create_user("member@example.com", display_name="Member")
-    acc.grant("user", user.id, "chat.use")
-    return user
+    return acc.create_user("member@example.com", display_name="Member")
 
 
-# ----------------------------------------------------------- admin library CRUD --
+# --------------------------------------------------------------- creation --
 
-def test_an_admin_creates_lists_and_deletes_a_library(admin):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    assert api.admin_list_libraries(admin=admin)["libraries"] == [{**lib, "document_count": 0}]
-
-    api.admin_delete_library(lib["id"], admin=admin)
-    assert api.admin_list_libraries(admin=admin)["libraries"] == []
-
-
-def test_a_library_created_via_the_api_is_owned_by_the_creating_admin(admin):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    assert lib["owner_id"] == admin.id
-
-
-def test_deleting_an_unknown_library_is_404(admin):
-    with pytest.raises(HTTPException) as exc:
-        api.admin_delete_library("no-such-library", admin=admin)
-    assert exc.value.status_code == 404
-
-
-def test_a_non_admin_cannot_manage_libraries(acc, member):
-    with pytest.raises(HTTPException) as exc:
-        api.requires("libraries.manage")(member)
-    assert exc.value.status_code == 403
-
-
-def test_documents_can_be_assigned_to_and_removed_from_a_library(admin):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-
-    api.admin_add_document(lib["id"], "sha-1", admin=admin)
-    assert api.admin_list_libraries(admin=admin)["libraries"][0]["document_count"] == 1
-
-    api.admin_remove_document(lib["id"], "sha-1", admin=admin)
-    assert api.admin_list_libraries(admin=admin)["libraries"][0]["document_count"] == 0
-
-
-def test_a_librarys_grants_are_listed_the_other_way_round(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    assert api.admin_library_grants(lib["id"], admin=admin)["grants"] == []
-
-    acc.grant("user", member.id, "library.read", lib["id"])
-
-    assert api.admin_library_grants(lib["id"], admin=admin)["grants"] == [
-        {"subject_type": "user", "subject_id": member.id, "permission": "library.read", "effect": "allow"}]
-
-
-# --------------------------------------------------------- self-service creation --
-
-def test_a_plain_member_can_create_a_library(acc, member):
+def test_any_signed_in_user_creates_a_library_and_becomes_its_owner(member):
     lib = api.create_library(api.NewLibrary(name="Project finance", description="filings"), user=member)
 
     assert lib["owner_id"] == member.id
@@ -104,14 +55,10 @@ def test_a_member_created_library_appears_in_their_own_list_and_is_usable(acc, m
 
     detail = api.library_detail(lib["id"], user=member)
     assert detail["id"] == lib["id"]
+    assert detail["role"] == "owner"
 
-    assert acc.allowed(member.id, "library.write", lib["id"])
-    assert acc.allowed(member.id, "library.share", lib["id"])
-
-    target = acc.create_user("target@example.com", display_name="Target")
-    api.share_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,
-                                                   permission="library.read"), user=member)
-    assert acc.allowed(target.id, "library.read", lib["id"])
+    assert acc.can_write(member.id, lib["id"])
+    assert acc.can_manage(member.id, lib["id"])
 
 
 def test_another_user_cannot_see_a_library_they_did_not_create_or_receive(acc, member):
@@ -124,51 +71,74 @@ def test_another_user_cannot_see_a_library_they_did_not_create_or_receive(acc, m
     assert exc.value.status_code == 403
 
 
-def test_a_blank_library_name_is_rejected_for_self_service_creation(member):
+def test_a_blank_library_name_is_rejected(member):
     with pytest.raises(HTTPException) as exc:
         api.create_library(api.NewLibrary(name="   "), user=member)
     assert exc.value.status_code == 400
 
 
-def test_the_admin_endpoint_still_grants_nothing_automatically(acc, admin):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    assert acc.grants_of("user", admin.id) == []
-    assert api.list_libraries(user=admin)["libraries"][0]["id"] == lib["id"]  # sees it only as an admin
+def test_an_admin_created_library_has_the_admin_as_owner(admin):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=admin)
+    assert lib["owner_id"] == admin.id
 
 
 # --------------------------------------------------------- listing for a user --
 
 def test_an_admin_sees_every_library_a_member_sees_only_readable_ones(acc, admin, member):
-    readable = api.admin_create_library(api.NewLibrary(name="Readable"), admin=admin)
-    other = api.admin_create_library(api.NewLibrary(name="Other"), admin=admin)
-    acc.grant("user", member.id, "library.read", readable["id"])
+    readable = api.create_library(api.NewLibrary(name="Readable"), user=admin)
+    other = api.create_library(api.NewLibrary(name="Other"), user=admin)
+    acc.set_library_access(readable["id"], "user", member.id, "read")
 
     assert {l["id"] for l in api.list_libraries(user=admin)["libraries"]} == {readable["id"], other["id"]}
     assert {l["id"] for l in api.list_libraries(user=member)["libraries"]} == {readable["id"]}
 
 
+def test_list_libraries_reports_role_source_and_owner_name(acc, admin, member):
+    owned = api.create_library(api.NewLibrary(name="Owned"), user=member)
+    shared_direct = api.create_library(api.NewLibrary(name="Shared direct"), user=admin)
+    shared_group = api.create_library(api.NewLibrary(name="Shared via group"), user=admin)
+    admin_only = api.create_library(api.NewLibrary(name="Admin only"), user=admin)
+    group = acc.create_group("Analysts")
+    acc.add_member(group["id"], member.id)
+    acc.set_library_access(shared_direct["id"], "user", member.id, "write")
+    acc.set_library_access(shared_group["id"], "group", group["id"], "read")
+
+    by_name = {l["name"]: l for l in api.list_libraries(user=member)["libraries"]}
+
+    assert by_name["Owned"]["role"] == "owner" and by_name["Owned"]["source"] == "owner"
+    assert by_name["Owned"]["owner_name"] == "Member"
+    assert by_name["Shared direct"]["role"] == "write" and by_name["Shared direct"]["source"] == "user"
+    assert by_name["Shared via group"]["role"] == "read" and by_name["Shared via group"]["source"] == "group"
+    assert "Admin only" not in by_name  # not shared, not owned -- a member never sees it
+
+    admin_listing = {l["name"]: l for l in api.list_libraries(user=admin)["libraries"]}
+    assert admin_listing["Owned"]["role"] == "owner" and admin_listing["Owned"]["source"] == "admin"
+    assert admin_listing["Admin only"]["role"] == "owner" and admin_listing["Admin only"]["source"] == "owner"
+
+
 # ------------------------------------------------------------- library detail --
 
-def test_a_member_with_library_read_sees_its_documents(acc, admin, member, tmp_path, monkeypatch):
+def test_a_member_with_read_access_sees_its_documents(acc, admin, member, tmp_path, monkeypatch):
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text(
         '{"sha256": "sha-1", "filename": "10-K.pdf", "status": "processed", "route": "docling", '
         '"pages": 42, "chars": 90000, "timestamp": 100}\n')
     monkeypatch.setattr(api, "MANIFEST", manifest)
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    api.admin_add_document(lib["id"], "sha-1", admin=admin)
-    acc.grant("user", member.id, "library.read", lib["id"])
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=admin)
+    acc.add_document(lib["id"], "sha-1")
+    acc.set_library_access(lib["id"], "user", member.id, "read")
 
     detail = api.library_detail(lib["id"], user=member)
 
     assert detail["document_count"] == 1
+    assert detail["role"] == "read"
     assert detail["documents"] == [{"sha256": "sha-1", "filename": "10-K.pdf", "status": "processed",
                                     "route": "docling", "pages": 42, "chars": 90000, "error": None,
                                     "processed_at": 100}]
 
 
-def test_a_member_without_library_read_cannot_see_its_detail(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
+def test_a_member_without_access_cannot_see_its_detail(acc, admin, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=admin)
 
     with pytest.raises(HTTPException) as exc:
         api.library_detail(lib["id"], user=member)
@@ -181,93 +151,209 @@ def test_an_unknown_librarys_detail_is_404(member):
     assert exc.value.status_code == 404
 
 
-# ------------------------------------------------------------- self-service share --
+# ------------------------------------------------------------- rename / delete --
 
-def test_a_user_with_share_and_read_can_share_read_with_another(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    target = acc.create_user("target@example.com", display_name="Target")
-    acc.grant("user", member.id, "library.share", lib["id"])
-    acc.grant("user", member.id, "library.read", lib["id"])
+def test_the_owner_can_rename_and_delete_their_library(member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
 
-    api.share_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,
-                                                   permission="library.read"), user=member)
+    updated = api.update_library(lib["id"], api.LibraryUpdate(name="Renamed"), user=member)
+    assert updated["name"] == "Renamed"
 
-    assert acc.grants_of("user", target.id) == [
-        {"permission": "library.read", "library_id": lib["id"], "effect": "allow"}]
+    api.delete_library(lib["id"], user=member)
+    assert api.list_libraries(user=member)["libraries"] == []
 
 
-def test_sharing_without_library_share_is_403(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    target = acc.create_user("target@example.com", display_name="Target")
-    acc.grant("user", member.id, "library.read", lib["id"])  # no library.share
+def test_an_admin_can_rename_and_delete_any_library(acc, admin, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
+
+    api.update_library(lib["id"], api.LibraryUpdate(name="Renamed"), user=admin)
+    api.delete_library(lib["id"], user=admin)
+
+    assert acc.libraries() == []
+
+
+def test_a_writer_who_is_not_the_owner_cannot_rename_or_delete(acc, member):
+    owner = acc.create_user("owner@example.com", display_name="Owner")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=owner)
+    acc.set_library_access(lib["id"], "user", member.id, "write")
 
     with pytest.raises(HTTPException) as exc:
-        api.share_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,
-                                                       permission="library.read"), user=member)
+        api.update_library(lib["id"], api.LibraryUpdate(name="Renamed"), user=member)
+    assert exc.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc:
+        api.delete_library(lib["id"], user=member)
     assert exc.value.status_code == 403
 
 
-def test_sharing_more_than_you_hold_is_403(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    target = acc.create_user("target@example.com", display_name="Target")
-    acc.grant("user", member.id, "library.share", lib["id"])  # no library.write
-
+def test_deleting_an_unknown_library_is_404_for_an_admin(admin):
+    """An admin clears the manage check unconditionally, so this is where a
+    bad id actually gets checked -- for a member, an id they were never
+    given access to is a 403 before it gets this far."""
     with pytest.raises(HTTPException) as exc:
-        api.share_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,
-                                                       permission="library.write"), user=member)
+        api.delete_library("no-such-library", user=admin)
+    assert exc.value.status_code == 404
+
+
+def test_deleting_an_unknown_library_is_403_for_a_non_admin(member):
+    with pytest.raises(HTTPException) as exc:
+        api.delete_library("no-such-library", user=member)
     assert exc.value.status_code == 403
 
 
-def test_sharing_library_share_itself_is_rejected(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
+# ------------------------------------------------------------------- access --
+
+def test_the_owner_can_share_read_and_write(acc, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
     target = acc.create_user("target@example.com", display_name="Target")
-    acc.grant("user", member.id, "library.share", lib["id"])
-    acc.grant("user", member.id, "library.read", lib["id"])
+
+    api.put_library_access(lib["id"], api.AccessRequest(subject_type="user", subject_id=target.id, role="read"),
+                           user=member)
+
+    assert acc.library_role(target.id, lib["id"]) == "read"
+    access = api.get_library_access(lib["id"], user=member)
+    assert access["owner"] == {"id": member.id, "name": "Member"}
+    assert access["access"] == [{"subject_type": "user", "subject_id": target.id, "name": "Target", "role": "read"}]
+
+
+def test_an_admin_can_share_a_library_they_do_not_own(acc, admin, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
+    target = acc.create_user("target@example.com", display_name="Target")
+
+    api.put_library_access(lib["id"], api.AccessRequest(subject_type="user", subject_id=target.id, role="write"),
+                           user=admin)
+
+    assert acc.library_role(target.id, lib["id"]) == "write"
+
+
+def test_a_reader_cannot_share_manage_or_see_the_access_list(acc, member):
+    owner = acc.create_user("owner@example.com", display_name="Owner")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=owner)
+    acc.set_library_access(lib["id"], "user", member.id, "read")
+    target = acc.create_user("target@example.com", display_name="Target")
 
     with pytest.raises(HTTPException) as exc:
-        api.share_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,
-                                                       permission="library.share"), user=member)
+        api.put_library_access(lib["id"], api.AccessRequest(subject_type="user", subject_id=target.id, role="read"),
+                               user=member)
+    assert exc.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc:
+        api.get_library_access(lib["id"], user=member)
+    assert exc.value.status_code == 403
+
+
+def test_a_writer_who_is_not_the_owner_cannot_share_either(acc, member):
+    owner = acc.create_user("owner@example.com", display_name="Owner")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=owner)
+    acc.set_library_access(lib["id"], "user", member.id, "write")
+    target = acc.create_user("target@example.com", display_name="Target")
+
+    with pytest.raises(HTTPException) as exc:
+        api.put_library_access(lib["id"], api.AccessRequest(subject_type="user", subject_id=target.id, role="read"),
+                               user=member)
+    assert exc.value.status_code == 403
+
+
+def test_the_owner_cannot_be_added_to_the_access_list(member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
+
+    with pytest.raises(HTTPException) as exc:
+        api.put_library_access(lib["id"], api.AccessRequest(subject_type="user", subject_id=member.id, role="read"),
+                               user=member)
     assert exc.value.status_code == 400
 
 
-def test_unsharing_removes_access(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
+def test_removing_access_revokes_it(acc, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
     target = acc.create_user("target@example.com", display_name="Target")
-    acc.grant("user", member.id, "library.share", lib["id"])
-    acc.grant("user", member.id, "library.read", lib["id"])
-    api.share_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,
-                                                   permission="library.read"), user=member)
+    api.put_library_access(lib["id"], api.AccessRequest(subject_type="user", subject_id=target.id, role="read"),
+                           user=member)
 
-    api.unshare_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,
-                                                     permission="library.read"), user=member)
+    api.delete_library_access(lib["id"], "user", target.id, user=member)
 
-    assert acc.grants_of("user", target.id) == []
+    assert acc.library_role(target.id, lib["id"]) is None
 
 
-def test_a_user_who_can_share_sees_who_has_access(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    acc.grant("user", member.id, "library.share", lib["id"])
-    acc.grant("user", member.id, "library.read", lib["id"])
-
-    grants = api.library_grants(lib["id"], user=member)["grants"]
-
-    assert {(g["subject_type"], g["subject_id"], g["permission"]) for g in grants} == {
-        ("user", member.id, "library.share"), ("user", member.id, "library.read")}
-
-
-def test_a_user_without_library_share_cannot_list_grants(acc, admin, member):
-    lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    acc.grant("user", member.id, "library.read", lib["id"])
+def test_removing_access_is_not_owner_only_but_still_needs_manage(acc, member):
+    owner = acc.create_user("owner@example.com", display_name="Owner")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=owner)
+    target = acc.create_user("target@example.com", display_name="Target")
+    acc.set_library_access(lib["id"], "user", target.id, "read")
 
     with pytest.raises(HTTPException) as exc:
-        api.library_grants(lib["id"], user=member)
+        api.delete_library_access(lib["id"], "user", target.id, user=member)
+    assert exc.value.status_code == 403
+
+
+# --------------------------------------------------------- document assignment --
+
+def test_a_writer_can_add_a_document_they_can_already_read(acc, member):
+    reader_lib = api.create_library(api.NewLibrary(name="Source"), user=member)
+    acc.add_document(reader_lib["id"], "sha-1")
+    target_lib = api.create_library(api.NewLibrary(name="Target"), user=member)
+
+    api.add_document(target_lib["id"], "sha-1", user=member)
+
+    assert sorted(acc.libraries_of("sha-1")) == sorted([reader_lib["id"], target_lib["id"]])
+
+
+def test_a_writer_cannot_add_a_document_they_cannot_read(acc, member):
+    """The rule that stops a writer pulling any indexed document into a
+    library they control and reading it from there."""
+    other_owner = acc.create_user("other@example.com", display_name="Other")
+    off_limits = api.create_library(api.NewLibrary(name="Off limits"), user=other_owner)
+    acc.add_document(off_limits["id"], "sha-1")
+    target_lib = api.create_library(api.NewLibrary(name="Target"), user=member)
+
+    with pytest.raises(HTTPException) as exc:
+        api.add_document(target_lib["id"], "sha-1", user=member)
+    assert exc.value.status_code == 403
+    assert acc.libraries_of("sha-1") == [off_limits["id"]]
+
+
+def test_an_admin_can_add_any_document(acc, admin, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
+
+    api.add_document(lib["id"], "sha-never-indexed", user=admin)
+
+    assert acc.libraries_of("sha-never-indexed") == [lib["id"]]
+
+
+def test_a_reader_cannot_add_documents(acc, member):
+    owner = acc.create_user("owner@example.com", display_name="Owner")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=owner)
+    acc.set_library_access(lib["id"], "user", member.id, "read")
+
+    with pytest.raises(HTTPException) as exc:
+        api.add_document(lib["id"], "sha-1", user=member)
+    assert exc.value.status_code == 403
+
+
+def test_a_writer_can_remove_a_document_without_needing_to_read_it_elsewhere(acc, member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
+    acc.add_document(lib["id"], "sha-1")
+
+    api.remove_document(lib["id"], "sha-1", user=member)
+
+    assert acc.libraries_of("sha-1") == []
+
+
+def test_a_reader_cannot_remove_documents(acc, member):
+    owner = acc.create_user("owner@example.com", display_name="Owner")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=owner)
+    acc.add_document(lib["id"], "sha-1")
+    acc.set_library_access(lib["id"], "user", member.id, "read")
+
+    with pytest.raises(HTTPException) as exc:
+        api.remove_document(lib["id"], "sha-1", user=member)
     assert exc.value.status_code == 403
 
 
 # -------------------------------------------------- attaching to a conversation --
 
 def test_a_conversation_can_only_attach_a_readable_library(acc, member):
-    lib = acc.create_library("Off limits")
+    other_owner = acc.create_user("other@example.com", display_name="Other")
+    lib = api.create_library(api.NewLibrary(name="Off limits"), user=other_owner)
 
     with pytest.raises(HTTPException) as exc:
         api.create_conversation(api.NewConversation(preset="everyday", library_ids=[lib["id"]]), user=member)
@@ -280,9 +366,8 @@ def test_a_conversation_cannot_attach_an_unknown_library(member):
     assert exc.value.status_code == 404
 
 
-def test_a_conversation_attaches_a_readable_library(acc, member):
-    lib = acc.create_library("Project finance")
-    acc.grant("user", member.id, "library.read", lib["id"])
+def test_a_conversation_attaches_a_readable_library(member):
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
 
     conv = api.create_conversation(api.NewConversation(preset="everyday", library_ids=[lib["id"]]), user=member)
 
@@ -292,7 +377,8 @@ def test_a_conversation_attaches_a_readable_library(acc, member):
 
 def test_updating_a_conversations_libraries_is_checked_the_same_way(acc, member):
     conv = api.create_conversation(api.NewConversation(preset="everyday"), user=member)
-    lib = acc.create_library("Off limits")
+    other_owner = acc.create_user("other@example.com", display_name="Other")
+    lib = api.create_library(api.NewLibrary(name="Off limits"), user=other_owner)
 
     with pytest.raises(HTTPException) as exc:
         api.update_conversation(conv["id"], api.ConversationUpdate(library_ids=[lib["id"]]), user=member)
@@ -311,13 +397,12 @@ def qdrant(monkeypatch):
     return fake
 
 
-def test_a_member_with_library_read_can_read_a_documents_chunks(acc, member, qdrant, tmp_path, monkeypatch):
+def test_a_member_with_read_access_can_read_a_documents_chunks(acc, member, qdrant, tmp_path, monkeypatch):
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('{"sha256": "sha-1", "filename": "10-K.pdf", "status": "processed"}\n')
     monkeypatch.setattr(api, "MANIFEST", manifest)
-    lib = acc.create_library("Project finance")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
     acc.add_document(lib["id"], "sha-1")
-    acc.grant("user", member.id, "library.read", lib["id"])
     qdrant.points = [
         point("p2", 1, ["Loans"], "second chunk", doc_sha="sha-1"),
         point("p1", 0, ["Intro"], "first chunk", doc_sha="sha-1"),
@@ -336,9 +421,8 @@ def test_document_chunks_can_be_paged(acc, member, qdrant, tmp_path, monkeypatch
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('{"sha256": "sha-1", "filename": "10-K.pdf", "status": "processed"}\n')
     monkeypatch.setattr(api, "MANIFEST", manifest)
-    lib = acc.create_library("Project finance")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
     acc.add_document(lib["id"], "sha-1")
-    acc.grant("user", member.id, "library.read", lib["id"])
     qdrant.points = [point(f"p{i}", i, [], f"chunk {i}", doc_sha="sha-1") for i in range(3)]
 
     result = api.document_chunks("sha-1", offset=1, limit=1, user=member)
@@ -347,11 +431,11 @@ def test_document_chunks_can_be_paged(acc, member, qdrant, tmp_path, monkeypatch
     assert [c["chunk_index"] for c in result["chunks"]] == [1]
 
 
-def test_a_member_without_library_read_cannot_read_a_documents_chunks(acc, member, qdrant, tmp_path, monkeypatch):
+def test_a_member_without_access_cannot_read_a_documents_chunks(acc, admin, member, qdrant, tmp_path, monkeypatch):
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('{"sha256": "sha-1", "filename": "10-K.pdf", "status": "processed"}\n')
     monkeypatch.setattr(api, "MANIFEST", manifest)
-    lib = acc.create_library("Project finance")
+    lib = api.create_library(api.NewLibrary(name="Project finance"), user=admin)
     acc.add_document(lib["id"], "sha-1")
 
     with pytest.raises(HTTPException) as exc:

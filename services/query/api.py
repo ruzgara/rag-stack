@@ -8,9 +8,11 @@ Native API (for the rag-stack UI) under /api, OpenAI-compatible API under /v1
 
 It binds to 127.0.0.1. Every endpoint except /api/health identifies its
 caller -- a signed session cookie, a proxy header, or QUERY_API_KEY as the
-service account -- and checks the caller's permissions (see accounts.py).
-Admins additionally get /api/admin/system, which edits .env and reloads the
-service; the admin UI for all of it is served at /admin.
+service account -- and, where it matters, checks what that caller may do
+(see accounts.py: library ownership and sharing, and users.is_admin for
+everything else). Admins additionally get /api/admin/system, which edits
+.env and reloads the service; the admin UI for all of it is served at
+/admin.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from chat import ChatConfig, ChatError, ChatService
-from accounts import Accounts, Denied, Invalid, PERMISSIONS, User
+from accounts import Accounts, Denied, Invalid, User
 from auth import SESSION_MAX_AGE, Auth, as_http_error, hash_password, session_secret, verify_password
 import settings
 from db import ChatDB, NotFound, WorkspaceLibraries
@@ -209,32 +211,28 @@ def current_user(request: Request) -> User:
     return user
 
 
-def requires(permission: str):
-    """A dependency that also checks one global capability."""
-
-    def dependency(user: User = Depends(current_user)) -> User:
-        try:
-            state.accounts.require(user, permission)
-        except Denied as exc:
-            raise as_http_error(exc) from None
-        return user
-
-    return dependency
+def admin(user: User = Depends(current_user)) -> User:
+    """The only admin concept there is: users.is_admin. No partial admins --
+    users.manage and libraries.manage are gone, so this one dependency
+    covers every admin-only route."""
+    if not user.is_admin:
+        raise HTTPException(403, "only an admin can do this")
+    return user
 
 
 def superuser(user: User = Depends(current_user)) -> User:
-    """Only a real admin, never a grant. The system endpoints edit .env, and
-    .env can set QUERY_AUTH_MODE=proxy -- after which anyone able to set a
-    header is anyone they like. A delegable permission would make that a
-    permission an admin could hand out by accident."""
+    """Same check as `admin`, kept as its own dependency for the system
+    endpoints: they edit .env, and .env can set QUERY_AUTH_MODE=proxy --
+    after which anyone able to set a header is anyone they like. There's
+    only one kind of admin now, but the distinct name and message keep that
+    reasoning attached to the routes it's about."""
     if not user.is_admin:
         raise HTTPException(403, "only an admin can change the system configuration")
     return user
 
 
 CurrentUser = Depends(current_user)
-Admin = Depends(requires("users.manage"))
-LibrariesAdmin = Depends(requires("libraries.manage"))
+Admin = Depends(admin)
 Superuser = Depends(superuser)
 
 
@@ -275,24 +273,21 @@ class NewGroup(BaseModel):
     type: str = "locked"             # open | locked -- see Accounts.create_group
 
 
-class GrantRequest(BaseModel):
+class AccessRequest(BaseModel):
+    """Who gets a role on a library, named in the URL -- see
+    Accounts.set_library_access."""
     subject_type: str                # user | group
     subject_id: str
-    permission: str
-    library_id: str | None = None
-    effect: str = "allow"
-
-
-class ShareRequest(BaseModel):
-    """Like GrantRequest but scoped to one library (named in the URL) and
-    always an allow -- see Accounts.share_library."""
-    subject_type: str                # user | group
-    subject_id: str
-    permission: str                  # library.read | library.write
+    role: str                        # read | write
 
 
 class NewLibrary(BaseModel):
     name: str
+    description: str | None = None
+
+
+class LibraryUpdate(BaseModel):
+    name: str | None = None
     description: str | None = None
 
 
@@ -308,10 +303,10 @@ class WorkspaceUpdate(BaseModel):
 
 
 def me(user: User) -> dict:
-    """The caller and what they may do -- what a UI needs to render itself."""
-    permissions = {name: sorted(str(v) for v in libs) for name, libs in
-                   state.accounts.effective_permissions(user.id).items()}
-    return {"user": user.public(), "permissions": permissions, "auth_mode": state.auth.mode}
+    """The caller, for a UI to render itself around. What they may do on any
+    given library isn't here -- it's per library (GET /api/libraries'
+    `role`), not a global map -- user.is_admin is the only global fact."""
+    return {"user": user.public(), "auth_mode": state.auth.mode}
 
 
 @app.post("/api/auth/login")
@@ -349,22 +344,9 @@ def change_password(body: PasswordChange, user: User = CurrentUser) -> None:
 
 @app.get("/api/admin/users")
 def admin_list_users(admin: User = Admin) -> dict:
-    """Users, with their permissions already resolved.
-
-    `effective` is what each user may actually do -- their own grants and
-    their groups', with the precedence rules applied. It is resolved here,
-    by the same accounts.effective_permissions() `ragctl user list` calls,
-    rather than left for the UI to work out from the raw grants: a second
-    implementation of "deny beats allow, own beats group" in JavaScript would
-    eventually disagree with this one, and the disagreement would show an
-    admin a permission nobody has.
-    """
-    return {"users": [{**u.public(),
-                       "effective": {name: sorted(str(v) for v in libs)
-                                     for name, libs in state.accounts.effective_permissions(u.id).items()}}
-                      for u in state.accounts.users()],
-            "permissions": {name: {"describes": text, "scope": "library" if name.startswith("library.") else "global"}
-                            for name, text in PERMISSIONS.items()}}
+    """Every user. What each may do on a given library is per library now
+    (GET /api/libraries' `role`), not a global map to resolve here."""
+    return {"users": [u.public() for u in state.accounts.users()]}
 
 
 @app.post("/api/admin/users", status_code=201)
@@ -464,24 +446,6 @@ def join_group(group_id: str, user: User = CurrentUser) -> None:
 def leave_group(group_id: str, user: User = CurrentUser) -> None:
     """Always allowed, open or locked group -- see Accounts.leave_group."""
     state.accounts.leave_group(group_id, user)
-
-
-@app.get("/api/admin/grants/{subject_type}/{subject_id}")
-def admin_list_grants(subject_type: str, subject_id: str, admin: User = Admin) -> dict:
-    return {"grants": state.accounts.grants_of(subject_type, subject_id)}
-
-
-@app.post("/api/admin/grants", status_code=204)
-def admin_grant(body: GrantRequest, admin: User = Admin) -> None:
-    try:
-        state.accounts.grant(body.subject_type, body.subject_id, body.permission, body.library_id, body.effect)
-    except (Invalid, NotFound) as exc:
-        raise (HTTPException(404, str(exc)) if isinstance(exc, NotFound) else as_http_error(exc)) from None
-
-
-@app.delete("/api/admin/grants", status_code=204)
-def admin_revoke(body: GrantRequest, admin: User = Admin) -> None:
-    state.accounts.revoke(body.subject_type, body.subject_id, body.permission, body.library_id)
 
 
 # ----------------------------------------------------------------- system --
@@ -657,27 +621,43 @@ def admin_restart(admin: User = Superuser) -> dict:
 
 # -------------------------------------------------------------- libraries --
 
+def _owner_name(owner_id: str | None) -> str | None:
+    """The owner's display name (or email), for a UI to show without a
+    second round trip -- None if the library has none (never owned, or its
+    owner was deleted)."""
+    if owner_id is None:
+        return None
+    try:
+        owner = state.accounts.user(owner_id)
+    except NotFound:
+        return None
+    return owner.display_name or owner.email
+
+
 @app.get("/api/libraries")
 def list_libraries(user: User = CurrentUser) -> dict:
-    """Libraries this user may attach to a chat and search -- every library
-    for an admin, otherwise only the ones they hold library.read on."""
+    """Libraries this user can read -- every library for an admin, otherwise
+    the ones they own plus the ones shared with them, directly or via a
+    group. Each row carries `role` (what they may do with it) and `source`
+    (why they can see it): "owner", "admin", "user" or "group"."""
     readable = state.accounts.readable_libraries(user.id)
     libraries = state.accounts.libraries()
     if readable is not None:
         libraries = [lib for lib in libraries if lib["id"] in readable]
-    return {"libraries": libraries}
+    out = []
+    for lib in libraries:
+        role, source = state.accounts.library_role_source(user.id, lib["id"])
+        out.append({**lib, "role": role, "source": source, "owner_name": _owner_name(lib["owner_id"])})
+    return {"libraries": out}
 
 
 @app.post("/api/libraries", status_code=201)
 def create_library(body: NewLibrary, user: User = CurrentUser) -> dict:
-    """Self-service creation: any signed-in user may start a library, not
-    just an admin -- they become its owner and pick up library.read,
-    library.write and library.share on it at once (Accounts.create_owned_library),
-    so it's usable right away instead of invisible until someone grants
-    access to it. Compare POST /api/admin/libraries, which needs
-    libraries.manage and grants nothing automatically."""
+    """Self-service creation: any signed-in user may start a library -- they
+    become its owner, which is full access on its own (Accounts.library_role),
+    with no separate grant step needed."""
     try:
-        return state.accounts.create_owned_library(body.name, body.description, user)
+        return state.accounts.create_library(body.name, body.description, owner_id=user.id)
     except Invalid as exc:
         raise as_http_error(exc) from None
 
@@ -685,108 +665,112 @@ def create_library(body: NewLibrary, user: User = CurrentUser) -> dict:
 @app.get("/api/libraries/{library_id}")
 def library_detail(library_id: str, user: User = CurrentUser) -> dict:
     """A library's own documents (name, pages, ingest status/route), for
-    anyone who holds library.read on it -- unlike /api/admin/documents,
-    this isn't admin-only, and unlike /api/documents, it's scoped to the
-    one library instead of every document on the machine."""
+    anyone who can read it -- unlike /api/admin/documents, this isn't
+    admin-only, and unlike /api/documents, it's scoped to the one library
+    instead of every document on the machine."""
     try:
         lib = state.accounts.library(library_id)
     except NotFound:
         raise HTTPException(404, "no such library") from None
-    try:
-        state.accounts.require(user, "library.read", library_id)
-    except Denied as exc:
-        raise as_http_error(exc) from None
+    role, _source = state.accounts.library_role_source(user.id, library_id)
+    if role is None:
+        raise HTTPException(403, f"{user.email} can't read library {library_id}")
     manifest = _manifest_documents()
     docs = [_document_row(manifest[sha]) for sha in lib["documents"] if sha in manifest]
     return {"id": lib["id"], "name": lib["name"], "description": lib["description"], "owner_id": lib["owner_id"],
-            "created_at": lib["created_at"], "document_count": len(lib["documents"]), "documents": docs}
+            "owner_name": _owner_name(lib["owner_id"]), "created_at": lib["created_at"], "role": role,
+            "document_count": len(lib["documents"]), "documents": docs}
 
 
-@app.get("/api/libraries/{library_id}/grants")
-def library_grants(library_id: str, user: User = CurrentUser) -> dict:
-    """Who has access to this library, for anyone who holds library.share
-    on it -- the self-service counterpart to
-    GET /api/admin/libraries/{id}/grants, which needs libraries.manage."""
+@app.patch("/api/libraries/{library_id}")
+def update_library(library_id: str, body: LibraryUpdate, user: User = CurrentUser) -> dict:
+    if not state.accounts.can_manage(user.id, library_id):
+        raise HTTPException(403, f"{user.email} can't manage library {library_id}")
     try:
-        state.accounts.library(library_id)
+        return state.accounts.update_library(library_id, name=body.name, description=body.description)
     except NotFound:
         raise HTTPException(404, "no such library") from None
-    if not state.accounts.allowed(user.id, "library.share", library_id):
-        raise HTTPException(403, f"{user.email} can't share library {library_id}")
-    return {"grants": state.accounts.grants_on_library(library_id)}
-
-
-@app.post("/api/libraries/{library_id}/share", status_code=204)
-def share_library(library_id: str, body: ShareRequest, user: User = CurrentUser) -> None:
-    """Self-service sharing: pass along library.read or library.write on
-    this library, if you hold library.share on it and already hold the
-    permission being passed along yourself. See Accounts.share_library."""
-    try:
-        state.accounts.share_library(library_id, user, body.subject_type, body.subject_id, body.permission)
-    except NotFound:
-        raise HTTPException(404, f"no such {body.subject_type}: {body.subject_id}") from None
-    except (Denied, Invalid) as exc:
-        raise as_http_error(exc) from None
-
-
-@app.delete("/api/libraries/{library_id}/share", status_code=204)
-def unshare_library(library_id: str, body: ShareRequest, user: User = CurrentUser) -> None:
-    try:
-        state.accounts.unshare_library(library_id, user, body.subject_type, body.subject_id, body.permission)
-    except Denied as exc:
-        raise as_http_error(exc) from None
-
-
-@app.get("/api/admin/libraries")
-def admin_list_libraries(admin: User = LibrariesAdmin) -> dict:
-    return {"libraries": state.accounts.libraries()}
-
-
-@app.post("/api/admin/libraries", status_code=201)
-def admin_create_library(body: NewLibrary, admin: User = LibrariesAdmin) -> dict:
-    try:
-        return state.accounts.create_library(body.name, body.description, owner_id=admin.id)
     except Invalid as exc:
         raise as_http_error(exc) from None
 
 
-@app.delete("/api/admin/libraries/{library_id}", status_code=204)
-def admin_delete_library(library_id: str, admin: User = LibrariesAdmin) -> None:
+@app.delete("/api/libraries/{library_id}", status_code=204)
+def delete_library(library_id: str, user: User = CurrentUser) -> None:
+    if not state.accounts.can_manage(user.id, library_id):
+        raise HTTPException(403, f"{user.email} can't manage library {library_id}")
     try:
         state.accounts.delete_library(library_id)
     except NotFound:
         raise HTTPException(404, "no such library") from None
 
 
-@app.get("/api/admin/libraries/{library_id}/grants")
-def admin_library_grants(library_id: str, admin: User = LibrariesAdmin) -> dict:
-    """Who has access to this library -- the reverse of
-    GET /api/admin/grants/{subject_type}/{subject_id}, which goes the other
-    way (a subject's own libraries)."""
-    return {"grants": state.accounts.grants_on_library(library_id)}
-
-
-@app.get("/api/admin/documents")
-def admin_list_documents(admin: User = LibrariesAdmin) -> dict:
-    """Every indexed document, unfiltered, for assigning into libraries."""
-    docs = state.chat.library.documents(sections=0)
-    return {"documents": [
-        {"sha256": d.sha256, "filename": d.filename, "pages": d.pages, "chunks": d.chunks,
-         "libraries": state.accounts.libraries_of(d.sha256)}
-        for d in docs]}
-
-
-@app.put("/api/admin/libraries/{library_id}/documents/{doc_sha}", status_code=204)
-def admin_add_document(library_id: str, doc_sha: str, admin: User = LibrariesAdmin) -> None:
+@app.put("/api/libraries/{library_id}/documents/{doc_sha}", status_code=204)
+def add_document(library_id: str, doc_sha: str, user: User = CurrentUser) -> None:
+    """Assigns an already-indexed document into a library. Requires write on
+    the library -- and, so a writer can't pull a document they have no
+    business seeing into their own library and read it from there, that the
+    caller can already read that document elsewhere (admin, or through
+    another library it's already in)."""
+    if not state.accounts.can_write(user.id, library_id):
+        raise HTTPException(403, f"{user.email} can't add documents to library {library_id}")
+    if not (user.is_admin or state.accounts.can_read_document(user.id, doc_sha)):
+        raise HTTPException(403, f"{user.email} can't read document {doc_sha}")
     try:
         state.accounts.add_document(library_id, doc_sha)
     except NotFound:
         raise HTTPException(404, "no such library") from None
 
 
-@app.delete("/api/admin/libraries/{library_id}/documents/{doc_sha}", status_code=204)
-def admin_remove_document(library_id: str, doc_sha: str, admin: User = LibrariesAdmin) -> None:
+@app.delete("/api/libraries/{library_id}/documents/{doc_sha}", status_code=204)
+def remove_document(library_id: str, doc_sha: str, user: User = CurrentUser) -> None:
+    if not state.accounts.can_write(user.id, library_id):
+        raise HTTPException(403, f"{user.email} can't remove documents from library {library_id}")
     state.accounts.remove_document(library_id, doc_sha)
+
+
+@app.get("/api/libraries/{library_id}/access")
+def get_library_access(library_id: str, user: User = CurrentUser) -> dict:
+    """Who has access to this library, for its owner (or an admin) to
+    manage. `owner` is null for a library nobody owns any more."""
+    try:
+        lib = state.accounts.library(library_id)
+    except NotFound:
+        raise HTTPException(404, "no such library") from None
+    if not state.accounts.can_manage(user.id, library_id):
+        raise HTTPException(403, f"{user.email} can't manage library {library_id}")
+    owner = None
+    if lib["owner_id"]:
+        owner = {"id": lib["owner_id"], "name": _owner_name(lib["owner_id"])}
+    return {"owner": owner, "access": state.accounts.library_access(library_id)}
+
+
+@app.put("/api/libraries/{library_id}/access", status_code=204)
+def put_library_access(library_id: str, body: AccessRequest, user: User = CurrentUser) -> None:
+    if not state.accounts.can_manage(user.id, library_id):
+        raise HTTPException(403, f"{user.email} can't manage library {library_id}")
+    try:
+        state.accounts.set_library_access(library_id, body.subject_type, body.subject_id, body.role)
+    except NotFound as exc:
+        raise HTTPException(404, str(exc)) from None
+    except Invalid as exc:
+        raise as_http_error(exc) from None
+
+
+@app.delete("/api/libraries/{library_id}/access/{subject_type}/{subject_id}", status_code=204)
+def delete_library_access(library_id: str, subject_type: str, subject_id: str, user: User = CurrentUser) -> None:
+    if not state.accounts.can_manage(user.id, library_id):
+        raise HTTPException(403, f"{user.email} can't manage library {library_id}")
+    state.accounts.remove_library_access(library_id, subject_type, subject_id)
+
+
+@app.get("/api/admin/documents")
+def admin_list_documents(admin: User = Admin) -> dict:
+    """Every indexed document, unfiltered, for assigning into libraries."""
+    docs = state.chat.library.documents(sections=0)
+    return {"documents": [
+        {"sha256": d.sha256, "filename": d.filename, "pages": d.pages, "chunks": d.chunks,
+         "libraries": state.accounts.libraries_of(d.sha256)}
+        for d in docs]}
 
 
 # -------------------------------------------------------------- workspaces --
@@ -807,7 +791,7 @@ def _get_workspace(workspace_id: str, user: User) -> dict:
 
 
 @app.post("/api/workspaces", status_code=201)
-def create_workspace(body: NewWorkspace, user: User = Depends(requires("chat.use"))) -> dict:
+def create_workspace(body: NewWorkspace, user: User = CurrentUser) -> dict:
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(422, "a workspace needs a name")
@@ -903,7 +887,7 @@ def _check_libraries(user: User, library_ids: list[str] | None) -> None:
         raise HTTPException(404, f"no such library: {', '.join(sorted(unknown))}")
     readable = state.accounts.readable_libraries(user.id)
     if readable is not None and not set(library_ids) <= readable:
-        raise HTTPException(403, "you don't have library.read on one of these libraries")
+        raise HTTPException(403, "you can't read one of these libraries")
 
 
 def _get_conversation(conv_id: str, user: User, with_messages: bool = True) -> dict:
@@ -914,7 +898,7 @@ def _get_conversation(conv_id: str, user: User, with_messages: bool = True) -> d
 
 
 @app.post("/api/conversations", status_code=201)
-def create_conversation(body: NewConversation, user: User = Depends(requires("chat.use"))) -> dict:
+def create_conversation(body: NewConversation, user: User = CurrentUser) -> dict:
     """A chat inside a workspace takes no `library_ids`: it always searches
     whatever the workspace holds at the time of each turn."""
     _check_libraries(user, body.library_ids)
@@ -1068,7 +1052,7 @@ def _streamed(user_id: str, conv_id: str, gen: Iterator[str]) -> StreamingRespon
 
 
 @app.post("/api/conversations/{conv_id}/messages")
-def send_message(conv_id: str, body: NewMessage, user: User = Depends(requires("chat.use"))) -> StreamingResponse:
+def send_message(conv_id: str, body: NewMessage, user: User = CurrentUser) -> StreamingResponse:
     """Streams server-sent events:
       queued    {position}: the machine is busy; this turn is waiting in line
       user      the stored question {id}
@@ -1092,7 +1076,7 @@ def send_message(conv_id: str, body: NewMessage, user: User = Depends(requires("
     conv = _get_conversation(conv_id, user, with_messages=False)
     preset = _check_preset(body.preset or conv["preset"])
     # Recomputed on every turn, not trusted from when the conversation
-    # attached these libraries: a revoked library.read stops applying here,
+    # attached these libraries: losing read access stops applying here,
     # not only on the next attach.
     doc_shas = state.accounts.document_scope(user.id, conv["library_ids"])
     library_overview = state.accounts.library_overview(user.id, conv["library_ids"])
@@ -1111,7 +1095,7 @@ def send_message(conv_id: str, body: NewMessage, user: User = Depends(requires("
 
 
 @app.post("/api/conversations/{conv_id}/retry")
-def retry_message(conv_id: str, user: User = Depends(requires("chat.use"))) -> StreamingResponse:
+def retry_message(conv_id: str, user: User = CurrentUser) -> StreamingResponse:
     """Regenerates the conversation's last answer: deletes it and reruns the
     turn for the question it was answering (which stays in place -- no new
     `user` event, since the question isn't new). Streams the same SSE kinds
@@ -1152,7 +1136,7 @@ class SearchRequest(BaseModel):
 
 
 @app.post("/api/search")
-def search(body: SearchRequest, user: User = Depends(requires("chat.use"))) -> dict:
+def search(body: SearchRequest, user: User = CurrentUser) -> dict:
     t0 = time.monotonic()
     _check_libraries(user, body.library_ids)
     doc_shas = state.accounts.document_scope(user.id, body.library_ids)
@@ -1213,7 +1197,7 @@ def document_chunks(sha256: str, offset: int = 0, limit: int | None = None, user
     """One document's chunks, in order, with the document's total chunk
     count -- the source viewer's prev/next through a citation and the "n of
     total" it shows alongside. Unlike /api/documents (filenames only), this
-    hands back passage text, so it needs library.read on a library the
+    hands back passage text, so it needs read access to a library the
     document belongs to (or admin)."""
     rec = _manifest_documents().get(sha256)
     if rec is None:
@@ -1252,13 +1236,11 @@ def upload(files: list[UploadFile] = File(...), library_id: Annotated[str | None
     `library_id`, if given, assigns every saved file to that library by the
     sha256 it will be ingested under -- computed here, before ingest ever
     runs, so the assignment is already in place by the time embedding makes
-    the document searchable. Requires library.write on it."""
+    the document searchable. Requires write on it."""
     INBOX.mkdir(parents=True, exist_ok=True)
     if library_id:
-        try:
-            state.accounts.require(user, "library.write", library_id)
-        except Denied as exc:
-            raise as_http_error(exc) from None
+        if not state.accounts.can_write(user.id, library_id):
+            raise HTTPException(403, f"{user.email} can't add documents to library {library_id}")
         if library_id not in {lib["id"] for lib in state.accounts.libraries()}:
             raise HTTPException(404, "no such library")
     limits = state.uploads.for_user(user.is_admin)

@@ -495,7 +495,7 @@ cmd_health() {
 cmd_clean() {
     load_env
     if [[ "${1:-}" != "--yes" ]]; then
-        die "This deletes data/{inbox,work,processed,failed,markdown,docling,manifest.jsonl}, the Qdrant collection, all chat history and all accounts (users, groups, grants). Re-run as: ragctl clean --yes"
+        die "This deletes data/{inbox,work,processed,failed,markdown,docling,manifest.jsonl}, the Qdrant collection, all chat history and all accounts (users, groups, libraries, access). Re-run as: ragctl clean --yes"
     fi
 
     echo "== Local ingest data =="
@@ -521,8 +521,8 @@ cmd_clean() {
         # Everything goes, including accounts -- this is a full reset. The
         # next login has to be `ragctl user add ... --admin` again.
         sqlite3 "$DATA_DIR/chat.db" \
-            "PRAGMA foreign_keys=ON; DELETE FROM conversations; DELETE FROM uploads; DELETE FROM grants; DELETE FROM group_members; DELETE FROM groups; DELETE FROM libraries; DELETE FROM users;" \
-            && ok "Deleted all conversations, uploads, users, groups and grants" \
+            "PRAGMA foreign_keys=ON; DELETE FROM conversations; DELETE FROM uploads; DELETE FROM library_access; DELETE FROM group_members; DELETE FROM groups; DELETE FROM libraries; DELETE FROM users;" \
+            && ok "Deleted all conversations, uploads, users, groups, libraries and access" \
             || warn "Could not clear data/chat.db"
     else
         info "No chat history yet"
@@ -580,9 +580,9 @@ Usage: ./ragctl <command> [args]
   embed [--recreate] [--show-chunks [--doc SHA] [--full]]
                          Chunk, embed and index converted docs into Qdrant
                          (--show-chunks prints the chunking without embedding)
-  user <add|list|passwd|disable|admin|delete|group|member|grant|revoke|permissions>
-                         Accounts, groups and permissions. Create the first
-                         admin with: ragctl user add you@example.com --admin
+  user <add|list|passwd|disable|admin|delete|group|member|library>
+                         Accounts, groups and libraries (ownership + sharing).
+                         Create the first admin with: ragctl user add you@example.com --admin
   search "question" [--fused] [--json] [-v]
                          Hybrid search + GPU reranking over the index
                          (settings: RAG_* and RERANKER_* in .env)

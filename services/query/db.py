@@ -125,44 +125,40 @@ CREATE TABLE IF NOT EXISTS group_members (
     PRIMARY KEY (group_id, user_id)
 );
 
--- A named collection of documents. Created here so grants can point at one;
--- membership and retrieval filtering come later.
+-- A named collection of documents. Created here so library_access can point
+-- at one; membership and retrieval filtering come later.
 CREATE TABLE IF NOT EXISTS libraries (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
     description TEXT,
-    -- Who created it -- metadata only (a "Mine" tag), not an authorization
-    -- source: read/write/share still come entirely from grants, an owner
-    -- included. Null for one made without an acting user (ragctl). Set
-    -- null rather than cascading on delete: the library outlives whoever
-    -- happened to create it.
+    -- Who created it -- an authorization source, not just metadata: the
+    -- owner has full access (accounts.library_role) without a row in
+    -- library_access. Null for one made without an acting user (ragctl) or
+    -- whose owner was deleted. Set null rather than cascading on delete: the
+    -- library outlives whoever happened to create it, manageable afterwards
+    -- only by an admin.
     owner_id    TEXT REFERENCES users (id) ON DELETE SET NULL,
     created_at  REAL NOT NULL
 );
 
--- One row per granted (or refused) permission. library_id is null for the
--- global capabilities. A user's own grant beats its groups'; within either,
--- deny beats allow. See accounts.effective_permissions.
-CREATE TABLE IF NOT EXISTS grants (
-    id           TEXT PRIMARY KEY,
+-- Sharing: one row says a subject (a user or a group) holds read or write on
+-- one library, on top of whatever the owner already has. There is no deny --
+-- access is additive, and the highest role across a user's own row and its
+-- groups' wins (accounts.library_role).
+CREATE TABLE IF NOT EXISTS library_access (
+    library_id   TEXT NOT NULL REFERENCES libraries (id) ON DELETE CASCADE,
     subject_type TEXT NOT NULL CHECK (subject_type IN ('user', 'group')),
     subject_id   TEXT NOT NULL,
-    permission   TEXT NOT NULL,
-    library_id   TEXT REFERENCES libraries (id) ON DELETE CASCADE,
-    effect       TEXT NOT NULL CHECK (effect IN ('allow', 'deny')),
-    created_at   REAL NOT NULL
+    role         TEXT NOT NULL CHECK (role IN ('read', 'write')),
+    created_at   REAL NOT NULL,
+    PRIMARY KEY (library_id, subject_type, subject_id)
 );
-CREATE INDEX IF NOT EXISTS grants_subject ON grants (subject_type, subject_id);
--- The reverse lookup: which subjects hold a grant on a given library (a
--- library's "who has access" view -- accounts.grants_on_library). Only
--- library grants have a non-null library_id, which is exactly what this
--- is for; the global ones are found through grants_subject instead.
-CREATE INDEX IF NOT EXISTS grants_library ON grants (library_id, subject_type, subject_id);
--- One grant per subject, permission and library. IFNULL because SQLite counts
--- NULLs as distinct in a unique index, which would let the global permissions
--- (library_id IS NULL) be granted twice with opposite effects.
-CREATE UNIQUE INDEX IF NOT EXISTS grants_unique
-    ON grants (subject_type, subject_id, permission, IFNULL(library_id, ''));
+-- The reverse lookup: which libraries a subject (user or its groups) has
+-- access to -- accounts.library_role and readable_libraries. subject_id is
+-- polymorphic (a user or group id), so there's no foreign key here; deleting
+-- a user or group must delete its rows explicitly (Accounts.delete_user,
+-- delete_group).
+CREATE INDEX IF NOT EXISTS library_access_subject ON library_access (subject_type, subject_id);
 """
 
 # Which indexed document (by sha256, from the ingest manifest -- no

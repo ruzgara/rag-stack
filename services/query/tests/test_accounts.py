@@ -1,7 +1,6 @@
 """
-Users, groups and the permission precedence rules. The precedence is the part
-worth testing hardest: it decides who can read what, and a mistake there is
-silent.
+Users, groups and the ownership/sharing model for libraries: who owns what,
+who a library has been shared with, and how the two combine (library_role).
 """
 
 from __future__ import annotations
@@ -14,15 +13,6 @@ from db import LOCAL_USER, ChatDB, NotFound
 @pytest.fixture
 def acc(tmp_path):
     return Accounts(ChatDB(tmp_path / "chat.db"))
-
-
-@pytest.fixture
-def library(acc):
-    """A library id to hang per-library grants on (the libraries table exists
-    before the endpoints that manage it)."""
-    with acc.db._conn() as db:
-        db.execute("INSERT INTO libraries (id, name, created_at) VALUES ('lib-1', 'Project finance', 0)")
-    return "lib-1"
 
 
 def user(acc: Accounts, email: str = "member@example.com", **kw) -> User:
@@ -101,14 +91,15 @@ def test_disabling_a_user_also_invalidates_their_sessions(acc):
     assert updated.disabled and updated.session_epoch == created.session_epoch + 1
 
 
-def test_deleting_a_user_keeps_their_conversations_but_drops_their_grants(acc):
+def test_deleting_a_user_keeps_their_conversations_but_drops_their_library_access(acc):
     created = user(acc)
-    acc.grant("user", created.id, "chat.use")
+    lib = acc.create_library("Project finance")
+    acc.set_library_access(lib["id"], "user", created.id, "read")
     conv = acc.db.create_conversation("everyday", user_id=created.id)
 
     acc.delete_user(created.id)
 
-    assert acc.grants_of("user", created.id) == []
+    assert acc.library_access(lib["id"]) == []
     assert [c["id"] for c in acc.db.list_conversations(user_id=created.id)] == [conv["id"]]
 
 
@@ -129,16 +120,17 @@ def test_a_group_name_is_unique_and_not_blank(acc):
         acc.create_group("   ")
 
 
-def test_deleting_a_group_removes_its_memberships_and_grants(acc):
+def test_deleting_a_group_removes_its_memberships_and_access(acc):
     created = user(acc)
     group = acc.create_group("Analysts")
     acc.add_member(group["id"], created.id)
-    acc.grant("group", group["id"], "chat.use")
+    lib = acc.create_library("Project finance")
+    acc.set_library_access(lib["id"], "group", group["id"], "read")
 
     acc.delete_group(group["id"])
 
     assert acc.user(created.id).groups == []
-    assert acc.grants_of("group", group["id"]) == []
+    assert acc.library_access(lib["id"]) == []
 
 
 def test_a_membership_in_a_group_that_does_not_exist_is_refused(acc):
@@ -206,230 +198,6 @@ def test_admins_can_still_add_anyone_to_a_locked_group(acc):
     assert acc.user(created.id).groups == ["Analysts"]
 
 
-# ------------------------------------------------------------ permissions --
-
-def test_a_user_with_no_grants_can_do_nothing(acc):
-    created = user(acc)
-    assert acc.effective_permissions(created.id) == {}
-    assert not acc.allowed(created.id, "chat.use")
-    with pytest.raises(Denied, match="doesn't have chat.use"):
-        acc.require(created, "chat.use")
-
-
-def test_a_direct_grant_is_enough(acc):
-    created = user(acc)
-    acc.grant("user", created.id, "chat.use")
-    assert acc.allowed(created.id, "chat.use")
-
-
-def test_a_group_grant_reaches_its_members(acc):
-    created = user(acc)
-    group = acc.create_group("Analysts")
-    acc.add_member(group["id"], created.id)
-    acc.grant("group", group["id"], "chat.use")
-
-    assert acc.allowed(created.id, "chat.use")
-
-    acc.remove_member(group["id"], created.id)
-    assert not acc.allowed(created.id, "chat.use")
-
-
-def test_a_user_deny_overrides_a_group_allow(acc):
-    """The point of per-user overrides: lift one person out of a team grant."""
-    created = user(acc)
-    group = acc.create_group("Analysts")
-    acc.add_member(group["id"], created.id)
-    acc.grant("group", group["id"], "chat.use")
-    acc.grant("user", created.id, "chat.use", effect="deny")
-
-    assert not acc.allowed(created.id, "chat.use")
-
-
-def test_a_user_allow_overrides_a_group_deny(acc):
-    created = user(acc)
-    group = acc.create_group("Contractors")
-    acc.add_member(group["id"], created.id)
-    acc.grant("group", group["id"], "chat.use", effect="deny")
-    acc.grant("user", created.id, "chat.use")
-
-    assert acc.allowed(created.id, "chat.use")
-
-
-def test_between_two_groups_a_deny_wins(acc):
-    created = user(acc)
-    for name, effect in (("Analysts", "allow"), ("Suspended", "deny")):
-        group = acc.create_group(name)
-        acc.add_member(group["id"], created.id)
-        acc.grant("group", group["id"], "chat.use", effect=effect)
-
-    assert not acc.allowed(created.id, "chat.use")
-
-
-def test_revoking_is_not_denying(acc):
-    """Removing a user's deny lets the group's allow through again."""
-    created = user(acc)
-    group = acc.create_group("Analysts")
-    acc.add_member(group["id"], created.id)
-    acc.grant("group", group["id"], "chat.use")
-    acc.grant("user", created.id, "chat.use", effect="deny")
-
-    acc.revoke("user", created.id, "chat.use")
-
-    assert acc.allowed(created.id, "chat.use")
-
-
-def test_granting_the_same_permission_twice_updates_it_rather_than_duplicating(acc):
-    created = user(acc)
-    acc.grant("user", created.id, "chat.use")
-    acc.grant("user", created.id, "chat.use", effect="deny")
-
-    assert acc.grants_of("user", created.id) == [{"permission": "chat.use", "library_id": None, "effect": "deny"}]
-
-
-def test_a_librarys_grants_can_be_found_the_other_way_round(acc, library):
-    """grants_on_library is the reverse of grants_of: given a subject you can
-    already list its libraries, this lists a library's subjects."""
-    reader = user(acc, "reader@example.com")
-    writer = user(acc, "writer@example.com")
-    group = acc.create_group("Analysts")
-    acc.grant("user", reader.id, "library.read", library)
-    acc.grant("user", writer.id, "library.write", library)
-    acc.grant("group", group["id"], "library.read", library)
-    acc.grant("user", reader.id, "chat.use")  # global, not this library -- excluded
-
-    grants = acc.grants_on_library(library)
-    assert {(g["subject_type"], g["subject_id"], g["permission"], g["effect"]) for g in grants} == {
-        ("group", group["id"], "library.read", "allow"),
-        ("user", reader.id, "library.read", "allow"),
-        ("user", writer.id, "library.write", "allow"),
-    }
-    assert acc.grants_on_library("no-such-library") == []
-
-
-# ------------------------------------------------------- self-service share --
-
-def test_sharing_requires_library_share(acc, library):
-    sharer = user(acc, "sharer@example.com")
-    target = user(acc, "target@example.com")
-    acc.grant("user", sharer.id, "library.read", library)  # holds read, but not share
-
-    with pytest.raises(Denied):
-        acc.share_library(library, sharer, "user", target.id, "library.read")
-    assert acc.grants_of("user", target.id) == []
-
-
-def test_sharing_cannot_pass_on_more_than_the_sharer_holds(acc, library):
-    sharer = user(acc, "sharer@example.com")
-    target = user(acc, "target@example.com")
-    acc.grant("user", sharer.id, "library.share", library)  # can share, but has no write itself
-
-    with pytest.raises(Denied):
-        acc.share_library(library, sharer, "user", target.id, "library.write")
-    assert acc.grants_of("user", target.id) == []
-
-
-def test_sharing_cannot_pass_on_library_share_itself(acc, library):
-    sharer = user(acc, "sharer@example.com")
-    target = user(acc, "target@example.com")
-    acc.grant("user", sharer.id, "library.share", library)
-    acc.grant("user", sharer.id, "library.read", library)
-
-    with pytest.raises(Invalid):
-        acc.share_library(library, sharer, "user", target.id, "library.share")
-
-
-def test_a_user_who_can_share_passes_on_only_what_they_hold(acc, library):
-    sharer = user(acc, "sharer@example.com")
-    target = user(acc, "target@example.com")
-    acc.grant("user", sharer.id, "library.share", library)
-    acc.grant("user", sharer.id, "library.read", library)
-
-    acc.share_library(library, sharer, "user", target.id, "library.read")
-
-    assert acc.grants_of("user", target.id) == [
-        {"permission": "library.read", "library_id": library, "effect": "allow"}]
-
-
-def test_unsharing_removes_the_grant(acc, library):
-    sharer = user(acc, "sharer@example.com")
-    target = user(acc, "target@example.com")
-    acc.grant("user", sharer.id, "library.share", library)
-    acc.grant("user", sharer.id, "library.read", library)
-    acc.share_library(library, sharer, "user", target.id, "library.read")
-
-    acc.unshare_library(library, sharer, "user", target.id, "library.read")
-
-    assert acc.grants_of("user", target.id) == []
-
-
-def test_unsharing_also_requires_library_share(acc, library):
-    sharer = user(acc, "sharer@example.com")
-    target = user(acc, "target@example.com")
-    acc.grant("user", sharer.id, "library.read", library)  # no library.share
-    acc.grant("user", target.id, "library.read", library)
-
-    with pytest.raises(Denied):
-        acc.unshare_library(library, sharer, "user", target.id, "library.read")
-    assert acc.grants_of("user", target.id) != []  # untouched
-
-
-def test_an_admin_can_always_share_without_explicit_grants(acc, library):
-    admin = user(acc, "admin@example.com", is_admin=True)
-    target = user(acc, "target@example.com")
-
-    acc.share_library(library, admin, "user", target.id, "library.write")
-
-    assert acc.grants_of("user", target.id) == [
-        {"permission": "library.write", "library_id": library, "effect": "allow"}]
-
-
-def test_an_admin_has_everything_without_any_grants(acc, library):
-    admin = user(acc, "admin@example.com", is_admin=True)
-    assert acc.allowed(admin.id, "users.manage")
-    assert acc.allowed(admin.id, "library.read", library)
-    assert acc.readable_libraries(admin.id) is None  # all of them, now and later
-
-
-def test_a_disabled_user_loses_every_permission(acc):
-    created = user(acc)
-    acc.grant("user", created.id, "chat.use")
-    acc.update_user(created.id, disabled=True)
-
-    assert acc.effective_permissions(created.id) == {}
-
-
-def test_library_permissions_are_per_library(acc, library):
-    created = user(acc)
-    acc.grant("user", created.id, "library.read", library)
-
-    assert acc.allowed(created.id, "library.read", library)
-    assert not acc.allowed(created.id, "library.read", "another-library")
-    assert acc.readable_libraries(created.id) == {library}
-
-
-def test_a_typo_in_a_permission_name_is_refused(acc):
-    created = user(acc)
-    with pytest.raises(Invalid, match="unknown permission"):
-        acc.grant("user", created.id, "chat.uses")
-
-
-def test_a_global_permission_cannot_name_a_library_and_a_library_one_must(acc, library):
-    created = user(acc)
-    with pytest.raises(Invalid, match="global permission"):
-        acc.grant("user", created.id, "chat.use", library)
-    with pytest.raises(Invalid, match="has to name a library"):
-        acc.grant("user", created.id, "library.read")
-
-
-def test_a_grant_for_a_subject_that_does_not_exist_is_refused(acc):
-    with pytest.raises(NotFound):
-        acc.grant("user", "nobody", "chat.use")
-    with pytest.raises(Invalid, match="user or a group"):
-        acc.grant("robot", "nobody", "chat.use")
-    with pytest.raises(Invalid, match="allows or denies"):
-        acc.grant("user", "nobody", "chat.use", effect="maybe")
-
-
 # ---------------------------------------------------------------- libraries --
 
 def test_a_library_is_created_and_listed_with_its_document_count(acc):
@@ -468,26 +236,32 @@ def test_a_library_name_is_unique_and_not_blank(acc):
         acc.create_library("   ")
 
 
-def test_create_owned_library_grants_the_owner_full_access(acc):
+def test_the_owner_alone_has_full_access_no_row_needed(acc):
     owner = user(acc, "owner@example.com")
-    lib = acc.create_owned_library("Project finance", "bond and infrastructure filings", owner)
+    lib = acc.create_library("Project finance", "bond and infrastructure filings", owner_id=owner.id)
 
-    assert lib["owner_id"] == owner.id
-    assert acc.grants_of("user", owner.id) == [
-        {"permission": "library.read", "library_id": lib["id"], "effect": "allow"},
-        {"permission": "library.share", "library_id": lib["id"], "effect": "allow"},
-        {"permission": "library.write", "library_id": lib["id"], "effect": "allow"},
-    ]
+    assert acc.library_role(owner.id, lib["id"]) == "owner"
+    assert acc.library_access(lib["id"]) == []
     assert acc.readable_libraries(owner.id) == {lib["id"]}
 
 
-def test_create_owned_library_rejects_a_blank_or_duplicate_name(acc):
-    owner = user(acc, "owner@example.com")
-    acc.create_owned_library("Project finance", None, owner)
+def test_updating_a_library_renames_it_and_checks_uniqueness(acc):
+    lib = acc.create_library("Project finance")
+    acc.create_library("Other")
+
+    updated = acc.update_library(lib["id"], name="Renamed", description="new description")
+    assert updated["name"] == "Renamed"
+    assert updated["description"] == "new description"
+
     with pytest.raises(Invalid, match="already exists"):
-        acc.create_owned_library("Project finance", None, owner)
+        acc.update_library(lib["id"], name="Other")
     with pytest.raises(Invalid, match="needs a name"):
-        acc.create_owned_library("   ", None, owner)
+        acc.update_library(lib["id"], name="   ")
+
+
+def test_updating_an_unknown_library_is_not_found(acc):
+    with pytest.raises(NotFound):
+        acc.update_library("no-such-library", name="New name")
 
 
 def test_a_missing_library_is_not_found(acc):
@@ -521,15 +295,14 @@ def test_a_document_lists_every_library_it_belongs_to(acc):
     assert acc.libraries_of("sha-2") == []
 
 
-def test_deleting_a_library_drops_its_grants_and_document_memberships(acc):
+def test_deleting_a_library_drops_its_access_list_and_document_memberships(acc):
     lib = acc.create_library("Project finance")
     created = user(acc)
-    acc.grant("user", created.id, "library.read", lib["id"])
+    acc.set_library_access(lib["id"], "user", created.id, "read")
     acc.add_document(lib["id"], "sha-1")
 
     acc.delete_library(lib["id"])
 
-    assert acc.grants_of("user", created.id) == []
     assert acc.libraries() == []
     with pytest.raises(NotFound):
         acc.library(lib["id"])
@@ -543,6 +316,175 @@ def test_deleting_a_library_detaches_it_from_conversations(acc):
     acc.delete_library(lib["id"])
 
     assert acc.db.get_conversation(conv["id"], user_id=created.id, with_messages=False)["library_ids"] == []
+
+
+# ------------------------------------------------------------ library_role --
+
+def test_a_user_with_no_access_has_no_role(acc):
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    assert acc.library_role(created.id, lib["id"]) is None
+    assert not acc.can_read(created.id, lib["id"])
+    assert not acc.can_write(created.id, lib["id"])
+    assert not acc.can_manage(created.id, lib["id"])
+
+
+def test_a_direct_read_row_is_enough_to_read_but_not_write(acc):
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    acc.set_library_access(lib["id"], "user", created.id, "read")
+
+    assert acc.library_role(created.id, lib["id"]) == "read"
+    assert acc.can_read(created.id, lib["id"])
+    assert not acc.can_write(created.id, lib["id"])
+    assert not acc.can_manage(created.id, lib["id"])
+
+
+def test_a_direct_write_row_can_read_and_write_but_not_manage(acc):
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    acc.set_library_access(lib["id"], "user", created.id, "write")
+
+    assert acc.library_role(created.id, lib["id"]) == "write"
+    assert acc.can_read(created.id, lib["id"])
+    assert acc.can_write(created.id, lib["id"])
+    assert not acc.can_manage(created.id, lib["id"])
+
+
+def test_a_group_row_reaches_its_members(acc):
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    group = acc.create_group("Analysts")
+    acc.add_member(group["id"], created.id)
+    acc.set_library_access(lib["id"], "group", group["id"], "read")
+
+    assert acc.library_role(created.id, lib["id"]) == "read"
+
+    acc.remove_member(group["id"], created.id)
+    assert acc.library_role(created.id, lib["id"]) is None
+
+
+def test_the_highest_role_wins_across_user_and_group_rows(acc):
+    """Read through one group, write through another (or directly): the
+    answer is write, not whichever row happens to be found first."""
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    read_group = acc.create_group("Readers")
+    write_group = acc.create_group("Writers")
+    acc.add_member(read_group["id"], created.id)
+    acc.add_member(write_group["id"], created.id)
+    acc.set_library_access(lib["id"], "group", read_group["id"], "read")
+    acc.set_library_access(lib["id"], "group", write_group["id"], "write")
+
+    assert acc.library_role(created.id, lib["id"]) == "write"
+
+
+def test_a_direct_read_row_does_not_downgrade_a_groups_write(acc):
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    group = acc.create_group("Writers")
+    acc.add_member(group["id"], created.id)
+    acc.set_library_access(lib["id"], "user", created.id, "read")
+    acc.set_library_access(lib["id"], "group", group["id"], "write")
+
+    assert acc.library_role(created.id, lib["id"]) == "write"
+
+
+def test_the_owner_outranks_any_row(acc):
+    owner = user(acc, "owner@example.com")
+    lib = acc.create_library("Project finance", owner_id=owner.id)
+    assert acc.library_role(owner.id, lib["id"]) == "owner"
+    assert acc.can_manage(owner.id, lib["id"])
+
+
+def test_an_admin_is_owner_of_every_library_without_any_row(acc):
+    admin = user(acc, "admin@example.com", is_admin=True)
+    lib = acc.create_library("Project finance")
+    assert acc.library_role(admin.id, lib["id"]) == "owner"
+    assert acc.can_manage(admin.id, lib["id"])
+    assert acc.readable_libraries(admin.id) is None  # all of them, now and later
+
+
+def test_a_disabled_user_has_no_role_anywhere(acc):
+    created = user(acc)
+    lib = acc.create_library("Project finance", owner_id=created.id)
+    acc.update_user(created.id, disabled=True)
+
+    assert acc.library_role(created.id, lib["id"]) is None
+    assert acc.readable_libraries(created.id) == set()
+
+
+def test_library_role_on_an_unknown_library_is_none_for_a_normal_user(acc):
+    created = user(acc)
+    assert acc.library_role(created.id, "no-such-library") is None
+
+
+def test_readable_libraries_is_owned_plus_shared(acc):
+    owner = user(acc, "owner@example.com")
+    owned = acc.create_library("Owned", owner_id=owner.id)
+    shared = acc.create_library("Shared")
+    acc.create_library("Locked")  # no access -- must not appear
+    acc.set_library_access(shared["id"], "user", owner.id, "read")
+
+    assert acc.readable_libraries(owner.id) == {owned["id"], shared["id"]}
+
+
+# ---------------------------------------------------------------- sharing --
+
+def test_setting_access_validates_role_and_subject(acc):
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    with pytest.raises(Invalid, match="a role is read or write"):
+        acc.set_library_access(lib["id"], "user", created.id, "admin")
+    with pytest.raises(Invalid, match="a subject is a user or a group"):
+        acc.set_library_access(lib["id"], "robot", created.id, "read")
+    with pytest.raises(NotFound):
+        acc.set_library_access(lib["id"], "user", "nobody", "read")
+    with pytest.raises(NotFound):
+        acc.set_library_access("no-such-library", "user", created.id, "read")
+
+
+def test_the_owner_cannot_be_added_to_their_own_access_list(acc):
+    owner = user(acc, "owner@example.com")
+    lib = acc.create_library("Project finance", owner_id=owner.id)
+    with pytest.raises(Invalid, match="owner already has"):
+        acc.set_library_access(lib["id"], "user", owner.id, "read")
+
+
+def test_sharing_twice_updates_the_role_rather_than_duplicating(acc):
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    acc.set_library_access(lib["id"], "user", created.id, "read")
+    acc.set_library_access(lib["id"], "user", created.id, "write")
+
+    assert acc.library_access(lib["id"]) == [
+        {"subject_type": "user", "subject_id": created.id, "name": created.display_name, "role": "write"}]
+
+
+def test_library_access_reports_a_users_name_and_a_groups_name(acc):
+    lib = acc.create_library("Project finance")
+    reader = user(acc, "reader@example.com")
+    group = acc.create_group("Analysts")
+    acc.set_library_access(lib["id"], "user", reader.id, "read")
+    acc.set_library_access(lib["id"], "group", group["id"], "write")
+
+    access = {(a["subject_type"], a["subject_id"]): a for a in acc.library_access(lib["id"])}
+    assert access[("user", reader.id)] == {"subject_type": "user", "subject_id": reader.id,
+                                            "name": "Test User", "role": "read"}
+    assert access[("group", group["id"])] == {"subject_type": "group", "subject_id": group["id"],
+                                               "name": "Analysts", "role": "write"}
+
+
+def test_removing_access_is_quiet_even_if_there_was_none(acc):
+    lib = acc.create_library("Project finance")
+    created = user(acc)
+    acc.remove_library_access(lib["id"], "user", created.id)  # no error
+    acc.set_library_access(lib["id"], "user", created.id, "read")
+
+    acc.remove_library_access(lib["id"], "user", created.id)
+
+    assert acc.library_access(lib["id"]) == []
+    assert acc.library_role(created.id, lib["id"]) is None
 
 
 # -------------------------------------------------------------- doc scope --
@@ -574,8 +516,8 @@ def test_document_scope_defaults_to_every_readable_library(acc):
     a, b = acc.create_library("A"), acc.create_library("B")
     acc.add_document(a["id"], "sha-a")
     acc.add_document(b["id"], "sha-b")
-    acc.grant("user", created.id, "library.read", a["id"])
-    acc.grant("user", created.id, "library.read", b["id"])
+    acc.set_library_access(a["id"], "user", created.id, "read")
+    acc.set_library_access(b["id"], "user", created.id, "read")
 
     assert acc.document_scope(created.id) == {"sha-a", "sha-b"}
 
@@ -585,37 +527,53 @@ def test_document_scope_narrows_to_the_selected_libraries(acc):
     a, b = acc.create_library("A"), acc.create_library("B")
     acc.add_document(a["id"], "sha-a")
     acc.add_document(b["id"], "sha-b")
-    acc.grant("user", created.id, "library.read", a["id"])
-    acc.grant("user", created.id, "library.read", b["id"])
+    acc.set_library_access(a["id"], "user", created.id, "read")
+    acc.set_library_access(b["id"], "user", created.id, "read")
 
     assert acc.document_scope(created.id, [a["id"]]) == {"sha-a"}
 
 
 def test_document_scope_ignores_a_selected_library_the_user_cannot_read(acc):
-    """Selecting a library you can't read isn't a way around the grant --
-    it's the same as selecting nothing from it."""
+    """Selecting a library you can't read isn't a way around access -- it's
+    the same as selecting nothing from it."""
     created = user(acc)
     readable, other = acc.create_library("Readable"), acc.create_library("Other")
     acc.add_document(readable["id"], "sha-r")
     acc.add_document(other["id"], "sha-o")
-    acc.grant("user", created.id, "library.read", readable["id"])
+    acc.set_library_access(readable["id"], "user", created.id, "read")
 
     assert acc.document_scope(created.id, [readable["id"], other["id"]]) == {"sha-r"}
 
 
-def test_document_scope_is_recomputed_from_current_grants(acc):
+def test_document_scope_is_recomputed_from_current_access(acc):
     """A conversation's attached libraries are only ever a starting point --
-    a revoked library.read stops applying on the very next call, with
-    nothing to invalidate."""
+    losing read access stops applying on the very next call, with nothing
+    to invalidate."""
     created = user(acc)
     lib = acc.create_library("Project finance")
     acc.add_document(lib["id"], "sha-1")
-    acc.grant("user", created.id, "library.read", lib["id"])
+    acc.set_library_access(lib["id"], "user", created.id, "read")
     assert acc.document_scope(created.id, [lib["id"]]) == {"sha-1"}
 
-    acc.revoke("user", created.id, "library.read", lib["id"])
+    acc.remove_library_access(lib["id"], "user", created.id)
 
     assert acc.document_scope(created.id, [lib["id"]]) == set()
+
+
+def test_can_read_document_follows_library_access(acc):
+    created = user(acc)
+    lib = acc.create_library("Project finance")
+    acc.add_document(lib["id"], "sha-1")
+
+    assert not acc.can_read_document(created.id, "sha-1")
+
+    acc.set_library_access(lib["id"], "user", created.id, "read")
+    assert acc.can_read_document(created.id, "sha-1")
+
+
+def test_an_admin_can_read_any_document(acc):
+    admin = user(acc, "admin@example.com", is_admin=True)
+    assert acc.can_read_document(admin.id, "sha-unassigned")
 
 
 # ----------------------------------------------------------- overview --
@@ -623,10 +581,10 @@ def test_document_scope_is_recomputed_from_current_grants(acc):
 def test_library_overview_omits_libraries_the_user_cannot_read(acc):
     created = user(acc)
     attached, readable_only = acc.create_library("Attached"), acc.create_library("Readable only")
-    acc.create_library("Locked")  # no grant -- must not appear at all
+    acc.create_library("Locked")  # no access -- must not appear at all
     acc.add_document(attached["id"], "sha-a")
-    acc.grant("user", created.id, "library.read", attached["id"])
-    acc.grant("user", created.id, "library.read", readable_only["id"])
+    acc.set_library_access(attached["id"], "user", created.id, "read")
+    acc.set_library_access(readable_only["id"], "user", created.id, "read")
 
     overview = {o["name"]: o for o in acc.library_overview(created.id, [attached["id"]])}
 
@@ -638,8 +596,8 @@ def test_library_overview_omits_libraries_the_user_cannot_read(acc):
 def test_library_overview_with_nothing_selected_is_in_scope_for_every_readable_library(acc):
     created = user(acc)
     readable = acc.create_library("Readable")
-    acc.create_library("Locked")  # no grant -- must not appear at all
-    acc.grant("user", created.id, "library.read", readable["id"])
+    acc.create_library("Locked")  # no access -- must not appear at all
+    acc.set_library_access(readable["id"], "user", created.id, "read")
 
     overview = {o["name"]: o for o in acc.library_overview(created.id)}
 

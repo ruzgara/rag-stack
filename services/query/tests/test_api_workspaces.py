@@ -27,16 +27,12 @@ def acc(tmp_path, monkeypatch):
 
 @pytest.fixture
 def member(acc):
-    user = acc.create_user("member@example.com", display_name="Member")
-    acc.grant("user", user.id, "chat.use")
-    return user
+    return acc.create_user("member@example.com", display_name="Member")
 
 
 @pytest.fixture
 def other_member(acc):
-    user = acc.create_user("other@example.com", display_name="Other")
-    acc.grant("user", user.id, "chat.use")
-    return user
+    return acc.create_user("other@example.com", display_name="Other")
 
 
 # --------------------------------------------------------------------- CRUD --
@@ -121,7 +117,7 @@ def test_a_workspace_can_only_attach_a_readable_library(acc, member):
 
 def test_a_workspace_attaches_a_readable_library(acc, member):
     lib = acc.create_library("Project finance")
-    acc.grant("user", member.id, "library.read", lib["id"])
+    acc.set_library_access(lib["id"], "user", member.id, "read")
     ws = api.create_workspace(api.NewWorkspace(name="Research"), user=member)
 
     updated = api.update_workspace(ws["id"], api.WorkspaceUpdate(library_ids=[lib["id"]]), user=member)
@@ -142,7 +138,7 @@ def test_a_conversation_can_be_created_inside_a_workspace(member):
 
 def test_a_library_added_to_a_workspace_reaches_its_existing_chats(acc, member):
     lib = acc.create_library("Project finance")
-    acc.grant("user", member.id, "library.read", lib["id"])
+    acc.set_library_access(lib["id"], "user", member.id, "read")
     ws = api.create_workspace(api.NewWorkspace(name="Research"), user=member)
     conv = api.create_conversation(api.NewConversation(preset="everyday", workspace_id=ws["id"]), user=member)
     assert conv["library_ids"] == []
@@ -154,7 +150,7 @@ def test_a_library_added_to_a_workspace_reaches_its_existing_chats(acc, member):
 
 def test_a_chat_in_a_workspace_rejects_its_own_libraries(acc, member):
     lib = acc.create_library("Project finance")
-    acc.grant("user", member.id, "library.read", lib["id"])
+    acc.set_library_access(lib["id"], "user", member.id, "read")
     ws = api.create_workspace(api.NewWorkspace(name="Research"), user=member)
 
     with pytest.raises(HTTPException) as exc:

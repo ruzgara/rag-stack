@@ -10,7 +10,7 @@ ends up in shell history and in `ps`.
 Run through ragctl:
   ragctl user add alice@example.com --admin      create a user (prompts)
   ragctl user add bob@example.com --password-stdin  ...or scripted, from stdin
-  ragctl user list                               users, with groups and grants
+  ragctl user list                               users, with their groups
   ragctl user passwd alice@example.com           change a password
   ragctl user disable alice@example.com          keep the history, refuse logins
   ragctl user delete alice@example.com
@@ -18,15 +18,13 @@ Run through ragctl:
   ragctl user group add Everyone --type open     open: users can join themselves
   ragctl user group list
   ragctl user member add Analysts alice@example.com
-  ragctl user grant Analysts chat.use            grant to a group or a user
-  ragctl user grant alice@example.com library.read --library <id> --deny
-  ragctl user revoke Analysts chat.use
-  ragctl user permissions                        what the names mean
-  ragctl user library add "Project finance"      libraries: named document collections
+  ragctl user library add "Project finance" --owner alice@example.com   libraries: named document collections
   ragctl user library list
   ragctl user library documents                  every indexed document, to find a sha
   ragctl user library add-doc "Project finance" infra-finance.pdf
   ragctl user library remove-doc "Project finance" infra-finance.pdf
+  ragctl user library share "Project finance" alice@example.com write   read or write, a user or a group
+  ragctl user library unshare "Project finance" alice@example.com
   ragctl user library delete "Project finance"
 """
 
@@ -37,7 +35,7 @@ import getpass
 import sys
 from pathlib import Path
 
-from accounts import PERMISSIONS, Accounts, Invalid
+from accounts import Accounts, Invalid
 from auth import hash_password
 from db import ChatDB, NotFound
 
@@ -96,9 +94,6 @@ def cmd_add(acc: Accounts, args) -> None:
     except Invalid as exc:
         sys.exit(str(exc))
     print(f"created {user.email}{' (admin)' if user.is_admin else ''} id={user.id}")
-    if not args.admin and not user.is_admin:
-        print("note: no permissions yet. `ragctl user grant "
-              f"{user.email} chat.use` lets them ask questions.")
 
 
 def cmd_list(acc: Accounts, args) -> None:
@@ -114,10 +109,6 @@ def cmd_list(acc: Accounts, args) -> None:
             print(f"    groups  {', '.join(user.groups)}")
         if not user.password_hash:
             print("    login   no password (proxy mode, or not set yet)")
-        granted = acc.effective_permissions(user.id)
-        shown = ", ".join(f"{name}{'' if libs == {None} else ' ' + str(sorted(str(x) for x in libs))}"
-                          for name, libs in sorted(granted.items())) or "none"
-        print(f"    allowed {shown}")
 
 
 def cmd_passwd(acc: Accounts, args) -> None:
@@ -160,11 +151,7 @@ def cmd_group(acc: Accounts, args) -> None:
         print(f"deleted group {args.name}")
     else:
         for group in acc.groups():
-            grants = acc.grants_of("group", group["id"])
             print(f"{group['name']}  id={group['id']}  type={group['type']}  members={len(group['members'])}")
-            for grant in grants:
-                where = f" on {grant['library_id']}" if grant["library_id"] else ""
-                print(f"    {grant['effect']:5s} {grant['permission']}{where}")
 
 
 def cmd_member(acc: Accounts, args) -> None:
@@ -176,20 +163,6 @@ def cmd_member(acc: Accounts, args) -> None:
     else:
         acc.remove_member(group_id, user.id)
         print(f"{user.email} left {args.group}")
-
-
-def cmd_grant(acc: Accounts, args) -> None:
-    subject_type, subject_id = subject_of(acc, args.subject)
-    try:
-        if args.revoking:
-            acc.revoke(subject_type, subject_id, args.permission, args.library)
-            print(f"revoked {args.permission} from {args.subject}")
-        else:
-            effect = "deny" if args.deny else "allow"
-            acc.grant(subject_type, subject_id, args.permission, args.library, effect)
-            print(f"{effect} {args.permission}{' on ' + args.library if args.library else ''} for {args.subject}")
-    except (Invalid, NotFound) as exc:
-        sys.exit(str(exc))
 
 
 def resolve_doc_sha(acc: Accounts, query: str) -> str:
@@ -224,11 +197,13 @@ def library_of(acc: Accounts, name: str) -> dict:
 
 def cmd_library(acc: Accounts, args) -> None:
     if args.action == "add":
+        owner_id = user_of(acc, args.owner).id if args.owner else None
         try:
-            lib = acc.create_library(args.name, args.description)
+            lib = acc.create_library(args.name, args.description, owner_id=owner_id)
         except Invalid as exc:
             sys.exit(str(exc))
-        print(f"created library {lib['name']} id={lib['id']}")
+        print(f"created library {lib['name']} id={lib['id']}"
+             + (f" owner={args.owner}" if args.owner else ""))
     elif args.action == "list":
         libs = acc.libraries()
         if not libs:
@@ -239,7 +214,7 @@ def cmd_library(acc: Accounts, args) -> None:
     elif args.action == "delete":
         lib = library_of(acc, args.name)
         acc.delete_library(lib["id"])
-        print(f"deleted library {lib['name']} (grants on it and its attachments to chats are gone too)")
+        print(f"deleted library {lib['name']} (its access list and chat attachments go too)")
     elif args.action == "documents":
         from library import manifest_documents
 
@@ -253,7 +228,7 @@ def cmd_library(acc: Accounts, args) -> None:
             print(f"    sha256   {sha}")
             in_libs = [names.get(lib_id, lib_id) for lib_id in acc.libraries_of(sha)]
             print(f"    in       {', '.join(in_libs) or '(no library)'}")
-    else:  # add-doc, remove-doc
+    elif args.action in ("add-doc", "remove-doc"):
         lib = library_of(acc, args.name)
         sha = resolve_doc_sha(acc, args.document)
         if args.action == "add-doc":
@@ -262,12 +237,19 @@ def cmd_library(acc: Accounts, args) -> None:
         else:
             acc.remove_document(lib["id"], sha)
             print(f"removed {sha[:12]}… from {lib['name']}")
-
-
-def cmd_permissions(acc: Accounts, args) -> None:
-    for name, describes in PERMISSIONS.items():
-        scope = "per library" if name.startswith("library.") else "global"
-        print(f"{name:20s} {scope:11s} {describes}")
+    elif args.action == "share":
+        lib = library_of(acc, args.name)
+        subject_type, subject_id = subject_of(acc, args.document)
+        try:
+            acc.set_library_access(lib["id"], subject_type, subject_id, args.role)
+        except (Invalid, NotFound) as exc:
+            sys.exit(str(exc))
+        print(f"{args.document} can now {args.role} {lib['name']}")
+    else:  # unshare
+        lib = library_of(acc, args.name)
+        subject_type, subject_id = subject_of(acc, args.document)
+        acc.remove_library_access(lib["id"], subject_type, subject_id)
+        print(f"{args.document} no longer has access to {lib['name']}")
 
 
 def main() -> None:
@@ -278,12 +260,12 @@ def main() -> None:
     add = subs.add_parser("add", help="create a user (prompts for a password)")
     add.add_argument("email")
     add.add_argument("--name", required=True, help="display name")
-    add.add_argument("--admin", action="store_true", help="full permissions, and can manage users")
+    add.add_argument("--admin", action="store_true", help="an admin can manage every user, group and library")
     add.add_argument("--no-password", action="store_true", help="for QUERY_AUTH_MODE=proxy")
     add.add_argument("--password-stdin", action="store_true", help="read the password from stdin instead of asking")
     add.set_defaults(run=cmd_add)
 
-    subs.add_parser("list", help="list users, their groups and what they may do").set_defaults(run=cmd_list)
+    subs.add_parser("list", help="list users and their groups").set_defaults(run=cmd_list)
 
     passwd = subs.add_parser("passwd", help="change a password")
     passwd.add_argument("email")
@@ -317,33 +299,30 @@ def main() -> None:
     mem.add_argument("email")
     mem.set_defaults(run=cmd_member)
 
-    for name, revoking in (("grant", False), ("revoke", True)):
-        cmd = subs.add_parser(name, help=f"{name} a permission for a user (by email) or a group (by name)")
-        cmd.add_argument("subject")
-        cmd.add_argument("permission", choices=sorted(PERMISSIONS))
-        cmd.add_argument("--library", default=None, help="library id, for the library.* permissions")
-        if not revoking:
-            cmd.add_argument("--deny", action="store_true",
-                             help="record a refusal, which overrides the subject's groups")
-        cmd.set_defaults(run=cmd_grant, revoking=revoking, deny=False)
-
-    subs.add_parser("permissions", help="list the permission names").set_defaults(run=cmd_permissions)
-
-    lib = subs.add_parser("library", help="add, delete or list libraries, and assign documents to them")
-    lib.add_argument("action", choices=["add", "delete", "list", "documents", "add-doc", "remove-doc"])
+    lib = subs.add_parser("library", help="add, delete or list libraries, assign documents, and share access")
+    lib.add_argument("action", choices=["add", "delete", "list", "documents", "add-doc", "remove-doc",
+                                        "share", "unshare"])
     lib.add_argument("name", nargs="?", default=None, help="library name or id")
-    lib.add_argument("document", nargs="?", default=None, help="a document's sha256, or a filename to match")
-    lib.add_argument("--description", default=None)
+    lib.add_argument("document", nargs="?", default=None,
+                     help="add-doc/remove-doc: a document's sha256, or a filename to match; "
+                          "share/unshare: a user's email or a group's name")
+    lib.add_argument("role", nargs="?", choices=["read", "write"], default=None, help="share only")
+    lib.add_argument("--description", default=None, help="add only")
+    lib.add_argument("--owner", default=None, help="add only: the owning user's email -- full access, no sharing needed")
     lib.set_defaults(run=cmd_library)
 
     args = parser.parse_args()
     if args.command == "group" and args.action in ("add", "delete") and not args.name:
         parser.error(f"group {args.action} needs a name")
     if args.command == "library":
-        if args.action in ("add", "delete", "add-doc", "remove-doc") and not args.name:
+        if args.action in ("add", "delete", "add-doc", "remove-doc", "share", "unshare") and not args.name:
             parser.error(f"library {args.action} needs a name")
-        if args.action in ("add-doc", "remove-doc") and not args.document:
-            parser.error(f"library {args.action} needs a document (sha256 or filename)")
+        if args.action in ("add-doc", "remove-doc", "share", "unshare") and not args.document:
+            what = "a document (sha256 or filename)" if args.action in ("add-doc", "remove-doc") \
+                else "a subject (a user's email or a group's name)"
+            parser.error(f"library {args.action} needs {what}")
+        if args.action == "share" and not args.role:
+            parser.error("library share needs a role: read or write")
     args.run(accounts(), args)
 
 

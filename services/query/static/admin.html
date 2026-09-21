@@ -36,6 +36,7 @@
   .tag.admin { color:var(--accent); border-color:var(--accent); }
   .tag.off { color:var(--err); border-color:var(--err); }
   .tag.allow { color:var(--ok); border-color:var(--ok); } .tag.deny { color:var(--err); border-color:var(--err); }
+  .tag.write { color:var(--accent); border-color:var(--accent); } .tag.read { color:var(--muted); }
   .none { white-space:nowrap; font-size:12px; color:var(--muted); }  /* a placeholder that breaks mid-phrase reads as broken text */
   code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; background:var(--soft); padding:1px 4px; border-radius:4px; }
   #env { width:100%; height:60vh; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12.5px; line-height:1.5; white-space:pre; tab-size:4; resize:vertical; }
@@ -87,27 +88,25 @@
 
   <section class="panel on" id="tab-users">
     <h2>Users</h2>
-    <p class="hint">The same operations as <code>ragctl user</code>. Permissions resolve in a fixed order: an admin gets everything; otherwise the user's own grant wins over their groups', and a deny beats an allow at the same level.</p>
+    <p class="hint">The same operations as <code>ragctl user</code>. <code>is_admin</code> is the only role: an admin can do anything to any library, everyone else only chats and works within the libraries they own or were given access to.</p>
     <div class="row"><button class="primary" id="newUser">+ New user</button></div>
     <h3>Accounts</h3>
-    <table><thead><tr><th>Email</th><th>Name</th><th>Groups</th><th>Effective permissions</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
-    <h3>Permission names</h3>
-    <table><thead><tr><th>Permission</th><th>Scope</th><th>Allows</th></tr></thead><tbody id="permRows"></tbody></table>
+    <table><thead><tr><th>Email</th><th>Name</th><th>Groups</th><th>Libraries owned</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
   </section>
 
   <section class="panel" id="tab-groups">
     <h2>Groups</h2>
-    <p class="hint">A group hands a permission to a team; a single user can still be lifted out of it with a grant of their own.</p>
+    <p class="hint">A group of users, for granting library access to a team at once instead of one user at a time.</p>
     <div class="row"><button class="primary" id="newGroup">+ New group</button></div>
     <h3>Groups</h3>
-    <table><thead><tr><th>Name</th><th>Type</th><th>Members</th><th>Grants</th><th></th></tr></thead><tbody id="groupRows"></tbody></table>
+    <table><thead><tr><th>Name</th><th>Type</th><th>Members</th><th></th></tr></thead><tbody id="groupRows"></tbody></table>
   </section>
 
   <section class="panel" id="tab-libraries">
     <h2>Libraries</h2>
-    <p class="hint">A library is a named set of documents. <code>library.read</code> on one lets a user search and cite it; a user who can't read a library is never told it exists.</p>
+    <p class="hint">A library is a named set of documents with an owner. The owner (or an admin) has full control; everyone else needs a read or write row in its access list to search or cite it -- a user with no access is never told it exists.</p>
     <div class="row"><button class="primary" id="newLibrary">+ New library</button></div>
-    <table><thead><tr><th>Name</th><th>Description</th><th>Documents</th><th>Id</th><th></th></tr></thead><tbody id="libraryRows"></tbody></table>
+    <table><thead><tr><th>Name</th><th>Description</th><th>Owner</th><th>Documents</th><th>Id</th><th></th></tr></thead><tbody id="libraryRows"></tbody></table>
   </section>
 
   <section class="panel" id="tab-documents">
@@ -199,6 +198,7 @@ function confirmed(question) { return window.confirm(question); }
 /** A small modal form. fields: [{name, label, type, value, options, required}]. */
 function ask(title, fields, okLabel = "Save") {
   return new Promise(resolve => {
+    accessLibrary = null;   // not the access dialog -- stop it reacting to this one's clicks
     $("#modalTitle").textContent = title;
     $("#modalOk").textContent = okLabel;
     $("#modalBody").innerHTML = fields.map(f => {
@@ -230,7 +230,8 @@ function ask(title, fields, okLabel = "Save") {
 
 // ------------------------------------------------------------------- state --
 
-let me = null, cache = {users: [], groups: [], libraries: [], documents: [], permissions: {}};
+let me = null, cache = {users: [], groups: [], libraries: [], documents: []};
+let accessLibrary = null;   // the library the access dialog (if open) is editing
 
 function showGate() {
   $("#app").hidden = true; $("#gate").hidden = false;
@@ -276,46 +277,21 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
 
 async function loadAccounts() {
   const [users, groups, libraries] = await Promise.all([
-    api("/api/admin/users"), api("/api/admin/groups"), api("/api/admin/libraries"),
+    api("/api/admin/users"), api("/api/admin/groups"), api("/api/libraries"),
   ]);
-  cache.users = users.users; cache.permissions = users.permissions;
+  cache.users = users.users;
   cache.groups = groups.groups; cache.libraries = libraries.libraries;
-  // Grants are per subject, so they are fetched alongside rather than inline.
-  const subjects = [...cache.users.map(u => ["user", u.id]), ...cache.groups.map(g => ["group", g.id])];
-  const grants = await Promise.all(subjects.map(([t, id]) => api(`/api/admin/grants/${t}/${id}`)));
-  cache.grants = new Map(subjects.map(([t, id], i) => [`${t}:${id}`, grants[i].grants]));
-  renderUsers(); renderGroups(); renderLibraries(); renderPermissions();
+  renderUsers(); renderGroups(); renderLibraries();
 }
 
 const libName = id => cache.libraries.find(l => l.id === id)?.name || id;
-const grantsFor = (type, id) => cache.grants.get(`${type}:${id}`) || [];
 
-function grantTags(type, id) {
-  const grants = grantsFor(type, id);
-  if (!grants.length) return '<span class="small">none</span>';
-  return grants.map(g => `<span class="tag ${g.effect}">${esc(g.permission)}${
-    g.library_id ? " · " + esc(libName(g.library_id)) : ""}</span>`).join(" ");
-}
-
-/** What a user may actually do, as the server resolved it, with their own
- *  grants underneath so a surprising result can be traced to the grant that
- *  caused it -- a deny in particular, which removes a permission and so can
- *  never show up in the resolved list. */
-function effectiveCell(u) {
-  if (u.is_admin) return '<span class="small">everything (admin)</span>';
-  if (u.disabled) return '<span class="small">nothing (disabled)</span>';
-  const effective = Object.entries(u.effective || {});
-  const resolved = effective.length
-    ? effective.map(([name, libs]) => libs.map(lib =>
-        `<span class="tag allow">${esc(name)}${lib && lib !== "None" ? " · " + esc(libName(lib)) : ""}</span>`).join(" ")).join(" ")
-    : '<span class="small">nothing yet</span>';
-  const own = grantsFor("user", u.id);
-  const ownLine = own.length
-    ? `<div class="small" style="margin-top:3px">own grants: ${own.map(g =>
-        `<span class="tag ${g.effect}">${g.effect === "deny" ? "deny " : ""}${esc(g.permission)}${
-          g.library_id ? " · " + esc(libName(g.library_id)) : ""}</span>`).join(" ")}</div>`
-    : "";
-  return resolved + ownLine;
+/** The libraries this subject owns, as a UI-friendly stand-in for the old
+ *  grants column -- what a user may do on a library they don't own lives on
+ *  the library's own access list now (see openAccessDialog), not here. */
+function ownedLibrariesCell(userId) {
+  const owned = cache.libraries.filter(l => l.owner_id === userId);
+  return owned.length ? owned.map(l => `<span class="tag">${esc(l.name)}</span>`).join(" ") : '<span class="small">none</span>';
 }
 
 function renderUsers() {
@@ -327,19 +303,13 @@ function renderUsers() {
       <td>${esc(u.email)} ${flags}${self ? '<span class="small"> · you</span>' : ""}<div class="small">${esc(u.id)}</div></td>
       <td>${esc(u.display_name || "")}</td>
       <td class="small">${esc((u.groups || []).join(", ")) || "—"}</td>
-      <td>${effectiveCell(u)}</td>
+      <td>${ownedLibrariesCell(u.id)}</td>
       <td class="actions">
         <button class="small" data-act="edit">Edit</button>
-        <button class="small" data-act="grant">Grant</button>
         <button class="small" data-act="passwd">Password</button>
         <button class="small danger" data-act="delete"${self ? " disabled" : ""}>Delete</button>
       </td></tr>`;
   }).join("") || '<tr><td colspan="5" class="small">No users.</td></tr>';
-}
-
-function renderPermissions() {
-  $("#permRows").innerHTML = Object.entries(cache.permissions).map(([name, p]) =>
-    `<tr><td><code>${esc(name)}</code></td><td class="small">${esc(p.scope)}</td><td class="small">${esc(p.describes)}</td></tr>`).join("");
 }
 
 function renderGroups() {
@@ -349,23 +319,26 @@ function renderGroups() {
       <td>${esc(g.name)}<div class="small">${esc(g.id)}</div></td>
       <td class="small">${g.type === "open" ? "Open" : "Locked"}</td>
       <td class="small">${esc(members.join(", ")) || "—"}</td>
-      <td>${grantTags("group", g.id)}</td>
       <td class="actions">
         <button class="small" data-act="members">Members</button>
-        <button class="small" data-act="grant">Grant</button>
         <button class="small danger" data-act="delete">Delete</button>
       </td></tr>`;
-  }).join("") || '<tr><td colspan="5" class="small">No groups.</td></tr>';
+  }).join("") || '<tr><td colspan="4" class="small">No groups.</td></tr>';
 }
 
 function renderLibraries() {
   $("#libraryRows").innerHTML = cache.libraries.map(l =>
     `<tr data-id="${l.id}">
       <td>${esc(l.name)}</td><td class="small">${esc(l.description || "")}</td>
+      <td class="small">${esc(l.owner_name || "—")}</td>
       <td>${l.document_count}</td><td class="small"><code>${esc(l.id)}</code></td>
-      <td class="actions"><button class="small danger" data-act="delete">Delete</button></td>
-    </tr>`).join("") || '<tr><td colspan="5" class="small">No libraries.</td></tr>';
-  // The upload/grant dialogs pick from the same list.
+      <td class="actions">
+        <button class="small" data-act="edit">Edit</button>
+        <button class="small" data-act="access">Access…</button>
+        <button class="small danger" data-act="delete">Delete</button>
+      </td>
+    </tr>`).join("") || '<tr><td colspan="6" class="small">No libraries.</td></tr>';
+  // The upload dialog picks from the same list.
   for (const select of document.querySelectorAll("select.libraryPick"))
     select.innerHTML = cache.libraries.map(l => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join("");
 }
@@ -383,7 +356,6 @@ $("#newUser").onclick = guard(async () => {
     email: form.email, display_name: form.display_name,
     password: form.password || null, is_admin: form.is_admin}});
   toast(`Created ${form.email}.`);
-  if (!form.is_admin) toast(`${form.email} has no permissions yet — grant chat.use to let them ask questions.`);
   await loadAccounts();
 });
 
@@ -407,8 +379,6 @@ $("#userRows").onclick = guard(async e => {
     if (!form?.password) return;
     await api(`/api/admin/users/${id}`, {method: "PATCH", body: {password: form.password}});
     toast(`Password changed; ${user.email} is signed out everywhere.`);
-  } else if (button.dataset.act === "grant") {
-    await grantDialog("user", id, user.email);
   } else if (button.dataset.act === "delete") {
     if (!confirmed(`Delete ${user.email}? Their conversations are kept.`)) return;
     await api(`/api/admin/users/${id}`, {method: "DELETE"});
@@ -436,11 +406,9 @@ $("#groupRows").onclick = guard(async e => {
   const id = button.closest("tr").dataset.id;
   const group = cache.groups.find(g => g.id === id);
   if (button.dataset.act === "delete") {
-    if (!confirmed(`Delete group ${group.name}? Its grants go with it.`)) return;
+    if (!confirmed(`Delete group ${group.name}? Its access rows on any library go with it.`)) return;
     await api(`/api/admin/groups/${id}`, {method: "DELETE"});
     toast(`Deleted group ${group.name}.`);
-  } else if (button.dataset.act === "grant") {
-    await grantDialog("group", id, group.name);
   } else if (button.dataset.act === "members") {
     const inGroup = new Set(group.members || []);
     const form = await ask(`Members of ${group.name}`, [
@@ -457,32 +425,6 @@ $("#groupRows").onclick = guard(async e => {
   await loadAccounts();
 });
 
-/** Grant or revoke one permission for a user or a group. */
-async function grantDialog(type, id, label) {
-  const names = Object.entries(cache.permissions);
-  const form = await ask(`Permissions for ${label}`, [
-    {name: "permission", label: "Permission", type: "select",
-     options: names.map(([n, p]) => ({value: n, label: `${n} — ${p.describes}`}))},
-    {name: "library_id", label: "Library (only for the library.* permissions)", type: "select",
-     options: [{value: "", label: "— none (global permission) —"},
-               ...cache.libraries.map(l => ({value: l.id, label: l.name}))]},
-    {name: "effect", label: "Effect", type: "select", options: [
-      {value: "allow", label: "Allow"},
-      {value: "deny", label: "Deny (overrides the subject's groups)"},
-      {value: "revoke", label: "Revoke (remove the grant, fall back to groups)"}]},
-  ], "Apply");
-  if (!form) return;
-  const body = {subject_type: type, subject_id: id, permission: form.permission,
-                library_id: form.library_id || null, effect: form.effect === "revoke" ? "allow" : form.effect};
-  if (form.effect === "revoke") {
-    await api("/api/admin/grants", {method: "DELETE", body});
-    toast(`Revoked ${form.permission} from ${label}.`);
-  } else {
-    await api("/api/admin/grants", {method: "POST", body});
-    toast(`${form.effect === "deny" ? "Denied" : "Allowed"} ${form.permission} for ${label}.`);
-  }
-}
-
 // --------------------------------------------------------------- libraries --
 
 $("#newLibrary").onclick = guard(async () => {
@@ -490,20 +432,103 @@ $("#newLibrary").onclick = guard(async () => {
     {name: "name", label: "Name", required: true},
     {name: "description", label: "Description (shown to the chat model)"}], "Create");
   if (!form) return;
-  await api("/api/admin/libraries", {method: "POST", body: {name: form.name, description: form.description || null}});
+  // Self-service endpoint -- the caller (an admin here) becomes the owner.
+  await api("/api/libraries", {method: "POST", body: {name: form.name, description: form.description || null}});
   toast(`Created library ${form.name}.`);
   await Promise.all([loadAccounts(), loadDocuments()]);
 });
 
 $("#libraryRows").onclick = guard(async e => {
-  const button = e.target.closest("button[data-act='delete']"); if (!button) return;
+  const button = e.target.closest("button[data-act]"); if (!button) return;
   const id = button.closest("tr").dataset.id;
   const library = cache.libraries.find(l => l.id === id);
-  if (!confirmed(`Delete ${library.name}? Grants on it and its attachments to chats go too. The documents stay indexed.`)) return;
-  await api(`/api/admin/libraries/${id}`, {method: "DELETE"});
-  toast(`Deleted ${library.name}.`);
-  await Promise.all([loadAccounts(), loadDocuments()]);
+  if (button.dataset.act === "delete") {
+    if (!confirmed(`Delete ${library.name}? Its access list and its attachments to chats go too. The documents stay indexed.`)) return;
+    await api(`/api/libraries/${id}`, {method: "DELETE"});
+    toast(`Deleted ${library.name}.`);
+    await Promise.all([loadAccounts(), loadDocuments()]);
+  } else if (button.dataset.act === "edit") {
+    const form = await ask(`Edit ${library.name}`, [
+      {name: "name", label: "Name", value: library.name, required: true},
+      {name: "description", label: "Description", value: library.description || ""}]);
+    if (!form) return;
+    await api(`/api/libraries/${id}`, {method: "PATCH", body: {name: form.name, description: form.description || null}});
+    toast(`Updated ${form.name}.`);
+    await loadAccounts();
+  } else if (button.dataset.act === "access") {
+    await openAccessDialog(library);
+  }
 });
+
+/** The access dialog: who besides the owner can read or write one library.
+ *  Unlike ask()'s plain forms, it lists rows and applies each change (add,
+ *  change role, remove) immediately -- there's no separate "Save". */
+async function openAccessDialog(library) {
+  accessLibrary = library;
+  renderAccess(await api(`/api/libraries/${library.id}/access`));
+  $("#modalOk").textContent = "Done";
+  $("#modal").showModal();
+}
+
+function renderAccess(data) {
+  const rows = data.access.map(a => `<tr data-type="${esc(a.subject_type)}" data-id="${esc(a.subject_id)}">
+      <td>${esc(a.name)}<div class="small">${esc(a.subject_type)}</div></td>
+      <td><span class="tag ${a.role}">${esc(a.role)}</span></td>
+      <td class="actions">
+        <button class="small" type="button" data-act="toggle" data-role="${a.role === "write" ? "read" : "write"}">${
+          a.role === "write" ? "Make read" : "Make write"}</button>
+        <button class="small danger" type="button" data-act="remove">Remove</button>
+      </td></tr>`).join("") || '<tr><td colspan="3" class="small">No one else has access.</td></tr>';
+  $("#modalTitle").textContent = `Access to ${accessLibrary.name}`;
+  $("#modalBody").innerHTML = `
+    <p class="small">Owner: ${data.owner ? esc(data.owner.name) : "— none, the owner was deleted —"}</p>
+    <table><thead><tr><th>Who</th><th>Role</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+    <label>Add</label>
+    <div class="row">
+      <select id="accessType" style="width:auto"><option value="user">User</option><option value="group">Group</option></select>
+      <select id="accessSubject" style="width:auto"></select>
+      <select id="accessRole" style="width:auto"><option value="read">Read</option><option value="write">Write</option></select>
+      <button class="small" type="button" id="accessAdd">Add</button>
+    </div>`;
+  $("#accessType").onchange = fillAccessSubjects;
+  fillAccessSubjects();
+}
+
+function fillAccessSubjects() {
+  const options = $("#accessType").value === "user"
+    ? cache.users.map(u => ({value: u.id, label: u.email}))
+    : cache.groups.map(g => ({value: g.id, label: g.name}));
+  $("#accessSubject").innerHTML = options.map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("")
+    || '<option value="">— none —</option>';
+}
+
+// Delegated so it survives renderAccess's innerHTML replacements. accessLibrary
+// is null whenever the modal is showing an unrelated ask() form instead, so
+// this is a no-op then (nothing in those forms matches these selectors).
+$("#modalBody").addEventListener("click", guard(async e => {
+  if (!accessLibrary) return;
+  if (e.target.closest("#accessAdd")) {
+    const subject_id = $("#accessSubject").value;
+    if (!subject_id) return toast("Nothing to add.", "err");
+    await api(`/api/libraries/${accessLibrary.id}/access`, {method: "PUT",
+      body: {subject_type: $("#accessType").value, subject_id, role: $("#accessRole").value}});
+    toast("Access updated.");
+    renderAccess(await api(`/api/libraries/${accessLibrary.id}/access`));
+    return;
+  }
+  const button = e.target.closest("button[data-act]"); if (!button) return;
+  const tr = button.closest("tr");
+  const subject_type = tr.dataset.type, subject_id = tr.dataset.id;
+  if (button.dataset.act === "remove") {
+    await api(`/api/libraries/${accessLibrary.id}/access/${subject_type}/${subject_id}`, {method: "DELETE"});
+    toast("Access removed.");
+  } else if (button.dataset.act === "toggle") {
+    await api(`/api/libraries/${accessLibrary.id}/access`, {method: "PUT",
+      body: {subject_type, subject_id, role: button.dataset.role}});
+    toast("Role changed.");
+  }
+  renderAccess(await api(`/api/libraries/${accessLibrary.id}/access`));
+}));
 
 // --------------------------------------------------------------- documents --
 
@@ -539,7 +564,7 @@ $("#docRows").onclick = guard(async e => {
      options: cache.libraries.map(l => ({value: l.id, label: `${l.name}${inLibs.has(l.id) ? " (already in)" : ""}`}))},
   ], "Apply");
   if (!form) return;
-  await api(`/api/admin/libraries/${form.library_id}/documents/${sha}`,
+  await api(`/api/libraries/${form.library_id}/documents/${sha}`,
             {method: form.action === "add" ? "PUT" : "DELETE"});
   toast("Library membership updated.");
   await Promise.all([loadDocuments(), loadAccounts()]);

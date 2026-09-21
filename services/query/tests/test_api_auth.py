@@ -70,16 +70,25 @@ def test_the_service_key_is_ignored_when_none_is_configured(service, monkeypatch
         api.current_user(FakeRequest({"authorization": "Bearer secret-key"}))
 
 
-def test_a_permission_dependency_refuses_and_allows(service):
+def test_whoami_has_no_permissions_key(service):
+    """The permissions map went away with grants -- what a caller may do on
+    any given library is per library now (GET /api/libraries' `role`), and
+    is_admin (on `user`) is the only global fact left."""
     user = service.create_user("member@example.com", "hash", display_name="Member")
-    guard = api.requires("chat.use")
+    body = api.whoami(user)
+    assert set(body) == {"user", "auth_mode"}
+    assert "permissions" not in body
+
+
+def test_the_admin_dependency_refuses_and_allows(service):
+    user = service.create_user("member@example.com", "hash", display_name="Member")
 
     with pytest.raises(HTTPException) as exc:
-        guard(user)
+        api.admin(user)
     assert exc.value.status_code == 403
 
-    service.grant("user", user.id, "chat.use")
-    assert guard(user).id == user.id
+    admin = service.update_user(user.id, is_admin=True)
+    assert api.admin(admin).id == user.id
 
 
 # ------------------------------------------------- the streaming turn path --
@@ -118,7 +127,6 @@ def chat(service, monkeypatch):
 
 def test_a_turn_is_stored_against_the_user_who_asked(chat):
     user = chat.create_user("member@example.com", "hash", display_name="Member")
-    chat.grant("user", user.id, "chat.use")
     conv = api.state.db.create_conversation("everyday", user_id=user.id)
 
     events = drain(api.send_message(conv["id"], api.NewMessage(content="who pays?"), user))

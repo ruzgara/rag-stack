@@ -3,7 +3,8 @@ The system endpoints: who may reach them, and what a reload actually applies.
 
 The gating matters more than it looks. Editing .env can set
 QUERY_AUTH_MODE=proxy, after which auth.py believes a header -- so these
-endpoints are deliberately not behind a grantable permission.
+endpoints check users.is_admin directly (`superuser`), the only admin
+concept there is.
 """
 
 from __future__ import annotations
@@ -58,18 +59,6 @@ def test_an_admin_reaches_the_system_endpoints(admin):
 
 def test_an_ordinary_user_is_refused(service):
     user = service.create_user("member@example.com", password_hash="hash", display_name="Member")
-    with pytest.raises(HTTPException) as exc:
-        api.superuser(user)
-    assert exc.value.status_code == 403
-
-
-def test_managing_users_does_not_get_you_the_env_editor(service):
-    """users.manage is a delegable grant; editing .env is not. A user who can
-    administer accounts still can't rewrite the configuration they run on."""
-    user = service.create_user("helpdesk@example.com", password_hash="hash", display_name="Helpdesk")
-    service.grant("user", user.id, "users.manage")
-
-    assert service.allowed(user.id, "users.manage")
     with pytest.raises(HTTPException) as exc:
         api.superuser(user)
     assert exc.value.status_code == 403

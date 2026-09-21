@@ -38,11 +38,6 @@ def _current_user(request: Request) -> User:
     return current_user(request)
 
 
-def _chat_user(request: Request) -> User:
-    from api import requires
-
-    return requires("chat.use")(_current_user(request))
-
 # Options with no meaning here; a client sending them would silently get
 # something other than what it asked for, so they're rejected.
 UNSUPPORTED = ("tools", "functions", "tool_choice", "function_call", "response_format", "logprobs", "audio")
@@ -89,7 +84,7 @@ def models(user: "User" = Depends(_current_user)) -> dict:
 
 
 @router.post("/chat/completions")
-def chat_completions(body: ChatCompletionRequest, user: "User" = Depends(_chat_user)):
+def chat_completions(body: ChatCompletionRequest, user: "User" = Depends(_current_user)):
     from api import state
 
     extras = body.model_extra or {}
