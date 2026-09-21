@@ -448,6 +448,7 @@ are rejected.
 ./ragctl health               # checks Ollama (+ model checks + an embedding
                                # smoke test), docling-serve, Qdrant and the query service
 ./ragctl logs [docling|ollama|ingest|query|qdrant]
+./ragctl logs rotate         # rotate data/logs now (also runs hourly on its own)
 ./ragctl models check         # confirm .env model names exist in Ollama
 ./ragctl search "question"    # hybrid search + reranking (-v, --fused, --json)
 ./ragctl user list            # accounts and groups (see below)
@@ -456,6 +457,15 @@ are rejected.
 ./ragctl reload               # re-apply .env changes to running services
 ./ragctl clean --yes          # wipe everything: ingest data, the index, chat history, accounts
 ```
+
+Logs go to `data/logs` (launchd writes each service's stdout and stderr
+there). The `com.ragstack.logrotate` LaunchAgent checks their size every
+`LOG_ROTATE_INTERVAL` seconds and rotates anything past `LOG_MAX_MB`,
+keeping `LOG_KEEP` compressed generations — `query-api.log.1.gz`,
+`.2.gz`, and so on. It rotates by copying and then truncating in place,
+because launchd holds an open handle on each log: renaming the file would
+leave the service writing to an unlinked inode until its next restart.
+`./ragctl logs rotate --force` rotates regardless of size.
 
 `ragctl clean --yes` wipes `data/inbox`, `work`, `processed`, `failed`,
 `markdown`, `docling` and `manifest.jsonl`, deletes the Qdrant collection,

@@ -40,6 +40,9 @@ load_env() {
     DOCLING_PORT="${DOCLING_PORT:-5001}"
     QDRANT_PORT="${QDRANT_PORT:-6333}"
     QUERY_PORT="${QUERY_PORT:-8088}"
+    LOG_MAX_MB="${LOG_MAX_MB:-20}"
+    LOG_KEEP="${LOG_KEEP:-5}"
+    LOG_ROTATE_INTERVAL="${LOG_ROTATE_INTERVAL:-3600}"
 }
 
 compose() {
@@ -123,6 +126,7 @@ render_template() {
         -e "s#__OLLAMA_MAX_QUEUE__#${OLLAMA_MAX_QUEUE:-1024}#g" \
         -e "s#__DOCLING_NUM_THREADS__#${DOCLING_NUM_THREADS:-4}#g" \
         -e "s#__DOCLING_LOC_NUM_WORKERS__#${DOCLING_LOC_NUM_WORKERS:-2}#g" \
+        -e "s#__LOG_ROTATE_INTERVAL__#${LOG_ROTATE_INTERVAL:-3600}#g" \
         "$src" > "$dst"
 }
 
@@ -138,6 +142,7 @@ render_all() {
     render_template "$REPO_ROOT/launchd/com.ragstack.docling.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.docling.plist"
     render_template "$REPO_ROOT/launchd/com.ragstack.ingest.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.ingest.plist"
     render_template "$REPO_ROOT/launchd/com.ragstack.query.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.query.plist"
+    render_template "$REPO_ROOT/launchd/com.ragstack.logrotate.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.logrotate.plist"
 }
 
 launchd_label_loaded() {
@@ -213,6 +218,7 @@ cmd_install() {
     else
         unload_agent "com.ragstack.ingest"
     fi
+    load_agent "com.ragstack.logrotate"
     ok "LaunchAgents installed and loaded"
 
     echo "== Prefetching docling models (best-effort) =="
@@ -255,6 +261,7 @@ cmd_up() {
     render_all
     load_agent "com.ragstack.ollama-env"
     load_agent "com.ragstack.docling"
+    load_agent "com.ragstack.logrotate"
     if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
         load_agent "com.ragstack.ingest"
     fi
@@ -269,6 +276,7 @@ cmd_down() {
     unload_agent "com.ragstack.query"
     unload_agent "com.ragstack.docling"
     unload_agent "com.ragstack.ingest"
+    unload_agent "com.ragstack.logrotate"
     ok "Docker services stopped; docling-serve and the query service unloaded. Ollama.app is left running (it's a shared, native app)."
 }
 
@@ -297,6 +305,7 @@ cmd_reload() {
     render_all
     load_agent "com.ragstack.ollama-env"
     load_agent "com.ragstack.docling"
+    load_agent "com.ragstack.logrotate"
     if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
         load_agent "com.ragstack.ingest"
     else
@@ -315,7 +324,7 @@ cmd_reload() {
 cmd_status() {
     load_env
     echo "== Native services =="
-    for label in com.ragstack.ollama-env com.ragstack.docling com.ragstack.ingest com.ragstack.query; do
+    for label in com.ragstack.ollama-env com.ragstack.docling com.ragstack.ingest com.ragstack.query com.ragstack.logrotate; do
         if launchd_label_loaded "$label"; then ok "$label loaded"; else info "$label not loaded"; fi
     done
     if pgrep -x "Ollama" >/dev/null 2>&1; then ok "Ollama.app running"; else warn "Ollama.app not running"; fi
@@ -333,10 +342,91 @@ cmd_status() {
     done
 }
 
+# Rotate one log by copy-and-truncate: the running services were started by
+# launchd, which holds an open fd on the file, so renaming it out of the way
+# would leave them writing to an unlinked inode until the next restart.
+# Truncating in place keeps that fd valid (everything here appends).
+# Returns 0 if it rotated the file, 1 if it left it alone.
+rotate_log() {
+    local file="$1" max_bytes="$2" keep="$3" force="$4"
+    [[ -f "$file" ]] || return 1
+
+    local size
+    size="$(stat -f%z "$file" 2>/dev/null || echo 0)"
+    (( size > 0 )) || return 1
+    if [[ "$force" != "true" ]] && (( size < max_bytes )); then
+        return 1
+    fi
+
+    if (( keep > 0 )); then
+        # Shift generations up: .1.gz -> .2.gz, ... and drop the oldest.
+        rm -f "$file.$keep.gz"
+        local i
+        for (( i = keep - 1; i >= 1; i-- )); do
+            if [[ -f "$file.$i.gz" ]]; then
+                mv -f "$file.$i.gz" "$file.$((i + 1)).gz"
+            fi
+        done
+        cp "$file" "$file.1"
+        : > "$file"
+        gzip -f "$file.1"
+    else
+        : > "$file"
+    fi
+
+    return 0
+}
+
+# Drop archived generations beyond `keep` -- what a lowered LOG_KEEP leaves
+# behind. Applied to every log, not just the ones that rotated, so an idle
+# service's old archives go away too.
+prune_generations() {
+    local file="$1" keep="$2" old n
+    for old in "$file".*.gz; do
+        [[ -f "$old" ]] || continue   # no match: the glob came back literal
+        n="${old#"$file".}"; n="${n%.gz}"
+        if [[ "$n" =~ ^[0-9]+$ ]] && (( n > keep )); then
+            rm -f "$old"
+        fi
+    done
+}
+
+# Size-based rotation for everything in data/logs. Run hourly by the
+# com.ragstack.logrotate LaunchAgent; also runnable by hand.
+cmd_logs_rotate() {
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            *) die "logs rotate: unknown option $1" ;;
+        esac
+    done
+    mkdir -p "$LOG_DIR"
+
+    local max_bytes=$(( LOG_MAX_MB * 1024 * 1024 ))
+    local rotated=0 f
+    shopt -s nullglob
+    for f in "$LOG_DIR"/*.log; do
+        if rotate_log "$f" "$max_bytes" "$LOG_KEEP" "$force"; then
+            info "$(date '+%Y-%m-%d %H:%M:%S') rotated $(basename "$f")"
+            rotated=$(( rotated + 1 ))
+        fi
+        prune_generations "$f" "$LOG_KEEP"
+    done
+    shopt -u nullglob
+
+    if (( rotated == 0 )); then
+        info "nothing to rotate (all logs under ${LOG_MAX_MB}MB)"
+    else
+        ok "Rotated $rotated log(s), keeping $LOG_KEEP compressed generation(s) each."
+    fi
+}
+
 cmd_logs() {
     load_env
     local svc="${1:-}"
     case "$svc" in
+        rotate) shift; cmd_logs_rotate "$@" ;;
         docling) tail -n 100 -f "$LOG_DIR/docling-serve.log" ;;
         ollama) tail -n 100 -f "$LOG_DIR/ollama-env.log" ;;
         ingest)
@@ -349,7 +439,7 @@ cmd_logs() {
         query) tail -n 100 -f "$LOG_DIR/query-api.log" ;;
         qdrant) compose logs -f "$svc" ;;
         "") compose logs -f ;;
-        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, query, qdrant" ;;
+        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, query, qdrant (or 'rotate')" ;;
     esac
 }
 
@@ -550,6 +640,7 @@ cmd_uninstall() {
     unload_agent "com.ragstack.docling"
     unload_agent "com.ragstack.ingest"
     unload_agent "com.ragstack.query"
+    unload_agent "com.ragstack.logrotate"
     rm -rf "$RUNTIME_DIR"
     for svc in docling ingest embed query; do rm -rf "$REPO_ROOT/services/$svc/.venv"; done
     rm -rf "$REPO_ROOT/ui/node_modules" "$REPO_ROOT/ui/.vite" # ui/dist itself is committed -- left in place
@@ -579,6 +670,8 @@ Usage: ./ragctl <command> [args]
                           the admin UI reloads the stack from inside it)
   status                Show what's running and reachable
   logs [svc]             Tail logs (svc: docling, ollama, ingest, query, qdrant)
+  logs rotate [--force]  Rotate data/logs now (size-based; LOG_MAX_MB / LOG_KEEP
+                         in .env). Runs hourly on its own via a LaunchAgent.
   models check           Verify .env model names exist in 'ollama list'
   ingest [--force-vlm] [--reprocess]
                          Convert data/inbox to markdown + docling JSON once
