@@ -129,7 +129,13 @@ CREATE TABLE IF NOT EXISTS group_members (
 -- at one; membership and retrieval filtering come later.
 CREATE TABLE IF NOT EXISTS libraries (
     id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
+    -- Unique per owner, not globally: a system-wide UNIQUE let any user
+    -- probe whether a name was taken (learning a library they can't see
+    -- exists) or squat a name before its rightful owner claimed it. Scoped
+    -- uniqueness is enforced in accounts.py (SQLite's UNIQUE would treat
+    -- every NULL owner_id as distinct, which isn't what we want for
+    -- ragctl-created/orphaned libraries either).
+    name        TEXT NOT NULL,
     description TEXT,
     -- Who created it -- an authorization source, not just metadata: the
     -- owner has full access (accounts.library_role) without a row in

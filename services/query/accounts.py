@@ -239,15 +239,20 @@ class Accounts:
 
     def create_library(self, name: str, description: str | None = None, owner_id: str | None = None) -> dict:
         """owner_id, if given, is itself the access grant -- library_role
-        gives the owner "owner" with no row in library_access needed."""
+        gives the owner "owner" with no row in library_access needed.
+
+        Name uniqueness is scoped to the owner (NULL owner is its own scope,
+        for ragctl/orphaned libraries), not global -- otherwise any user
+        could learn a library they can't see exists, or squat a name before
+        its rightful owner claimed it, just by trying to create it."""
         name = (name or "").strip()
         if not name:
             raise Invalid("a library needs a name")
         library = {"id": uuid.uuid4().hex, "name": name, "description": description, "owner_id": owner_id,
                   "created_at": time.time()}
         with self.db._conn() as db:
-            if db.execute("SELECT 1 FROM libraries WHERE name = ?", (name,)).fetchone():
-                raise Invalid(f"a library called {name!r} already exists")
+            if db.execute("SELECT 1 FROM libraries WHERE name = ? AND owner_id IS ?", (name, owner_id)).fetchone():
+                raise Invalid(f"you already have a library called {name!r}")
             db.execute("INSERT INTO libraries (id, name, description, owner_id, created_at) VALUES (?, ?, ?, ?, ?)",
                        (library["id"], name, description, owner_id, library["created_at"]))
         return library
@@ -266,9 +271,14 @@ class Accounts:
             values.append(description)
         if sets:
             with self.db._conn() as db:
-                if name is not None and db.execute(
-                        "SELECT 1 FROM libraries WHERE name = ? AND id != ?", (name, library_id)).fetchone():
-                    raise Invalid(f"a library called {name!r} already exists")
+                if name is not None:
+                    owner_row = db.execute("SELECT owner_id FROM libraries WHERE id = ?", (library_id,)).fetchone()
+                    if owner_row is None:
+                        raise NotFound(f"no library {library_id}")
+                    if db.execute(
+                            "SELECT 1 FROM libraries WHERE name = ? AND owner_id IS ? AND id != ?",
+                            (name, owner_row["owner_id"], library_id)).fetchone():
+                        raise Invalid(f"you already have a library called {name!r}")
                 if db.execute(f"UPDATE libraries SET {', '.join(sets)} WHERE id = ?",
                               (*values, library_id)).rowcount == 0:
                     raise NotFound(f"no library {library_id}")

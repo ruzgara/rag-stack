@@ -230,10 +230,25 @@ def test_deleting_the_owner_keeps_the_library_but_clears_the_owner(acc):
 
 def test_a_library_name_is_unique_and_not_blank(acc):
     acc.create_library("Project finance")
-    with pytest.raises(Invalid, match="already exists"):
+    with pytest.raises(Invalid, match="already have a library"):
         acc.create_library("Project finance")
     with pytest.raises(Invalid, match="needs a name"):
         acc.create_library("   ")
+
+
+def test_library_name_uniqueness_is_scoped_per_owner(acc):
+    """Global uniqueness let a user probe for a hidden library's name (a 400
+    on creation confirms it exists) or squat a name before its rightful
+    owner claimed it -- scoping to the owner closes both."""
+    a = user(acc, "a@example.com")
+    b = user(acc, "b@example.com")
+
+    mine = acc.create_library("Project finance", owner_id=a.id)
+    theirs = acc.create_library("Project finance", owner_id=b.id)
+    assert mine["id"] != theirs["id"]
+
+    with pytest.raises(Invalid, match="already have a library"):
+        acc.create_library("Project finance", owner_id=a.id)
 
 
 def test_the_owner_alone_has_full_access_no_row_needed(acc):
@@ -253,7 +268,7 @@ def test_updating_a_library_renames_it_and_checks_uniqueness(acc):
     assert updated["name"] == "Renamed"
     assert updated["description"] == "new description"
 
-    with pytest.raises(Invalid, match="already exists"):
+    with pytest.raises(Invalid, match="already have a library"):
         acc.update_library(lib["id"], name="Other")
     with pytest.raises(Invalid, match="needs a name"):
         acc.update_library(lib["id"], name="   ")
