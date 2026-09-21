@@ -33,6 +33,13 @@ MIN_PASSWORD_LENGTH = 10
 ROLES = ("read", "write")
 
 
+def _escape_like(value: str) -> str:
+    """Backslash-escapes SQLite LIKE's own wildcards so a query containing
+    literal % or _ doesn't turn into a pattern -- paired with `ESCAPE '\\'`
+    on the LIKE itself."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class Denied(Exception):
     """The caller is known, but not allowed to do this."""
 
@@ -110,11 +117,15 @@ class Accounts:
             return [self._row_to_user(db, r) for r in db.execute("SELECT * FROM users ORDER BY email")]
 
     def search_users(self, query: str, limit: int = 20) -> list[User]:
-        """Finds users whose email or display name contains query (case-insensitive)."""
-        needle = f"%{query.strip().lower()}%"
+        """Finds enabled users whose email or display name contains query
+        (case-insensitive). % and _ in query are literal, not LIKE
+        wildcards -- unescaped, a query of just "_" would LIKE-match every
+        single-char-containing value, i.e. everyone."""
+        needle = f"%{_escape_like(query.strip().lower())}%"
         with self.db._conn() as db:
             rows = db.execute(
-                "SELECT * FROM users WHERE lower(email) LIKE ? OR lower(display_name) LIKE ? "
+                "SELECT * FROM users WHERE NOT disabled "
+                "AND (lower(email) LIKE ? ESCAPE '\\' OR lower(display_name) LIKE ? ESCAPE '\\') "
                 "ORDER BY email LIMIT ?", (needle, needle, limit)).fetchall()
             return [self._row_to_user(db, r) for r in rows]
 

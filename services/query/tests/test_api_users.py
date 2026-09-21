@@ -77,3 +77,16 @@ def test_search_users_finds_nothing_for_an_unmatched_query(service, admin):
 def test_search_users_is_available_to_any_signed_in_user_not_just_admins(service, admin):
     member = service.create_user("member@example.com", password_hash="hash", display_name="Member")
     assert api.search_users(q="member", user=member)["users"][0]["email"] == "member@example.com"
+
+
+def test_search_users_excludes_disabled_accounts(service, admin):
+    jane = service.create_user("jane@example.com", password_hash="hash", display_name="Jane Doe")
+    service.update_user(jane.id, disabled=True)
+
+    assert api.search_users(q="jane", user=admin)["users"] == []
+
+
+def test_search_users_does_not_treat_underscore_as_a_wildcard(service, admin):
+    service.create_user("jane@example.com", password_hash="hash", display_name="Jane Doe")
+
+    assert api.search_users(q="_", user=admin)["users"] == []

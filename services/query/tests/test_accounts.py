@@ -73,6 +73,27 @@ def test_search_users_finds_nothing_for_an_unmatched_query(acc):
     assert acc.search_users("nobody-like-this") == []
 
 
+def test_search_users_excludes_disabled_accounts(acc):
+    jane = user(acc, "jane@example.com", display_name="Jane Doe")
+    acc.update_user(jane.id, disabled=True)
+
+    assert acc.search_users("jane") == []
+
+
+def test_search_users_treats_percent_and_underscore_as_literal(acc):
+    """% and _ are SQL LIKE wildcards -- unescaped, "_" would match every
+    email or name with at least one character, i.e. every user."""
+    user(acc, "jane@example.com", display_name="Jane Doe")
+    user(acc, "other@example.com", display_name="Someone Else")
+
+    assert acc.search_users("_") == []
+    assert acc.search_users("%") == []
+
+    literal = user(acc, "has_underscore@example.com", display_name="Underscored")
+    assert [u.id for u in acc.search_users("has_underscore")] == [literal.id]
+    assert acc.search_users("hasXunderscore") == []
+
+
 def test_the_first_admin_adopts_what_was_stored_before_accounts_existed(acc):
     """Conversations written under LOCAL_USER shouldn't disappear on upgrade."""
     conv = acc.db.create_conversation("everyday", "Old chat", user_id=LOCAL_USER)
