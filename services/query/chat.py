@@ -118,6 +118,7 @@ class ChatConfig:
     tool_results: int
     max_tool_rounds: int
     max_source_tokens: int
+    ollama_context_length: int | None
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ChatConfig":
@@ -151,6 +152,13 @@ class ChatConfig:
             tool_results=_int(env, "CHAT_TOOL_RESULTS", "6"),
             max_tool_rounds=rounds,
             max_source_tokens=_int(env, "CHAT_MAX_SOURCE_TOKENS", "6000"),
+            # Ollama truncates every model to this regardless of what the
+            # model itself supports (unset means Ollama's own built-in
+            # default, which we don't try to guess). context_length() uses
+            # it to cap the reported limit -- otherwise a model advertising
+            # a bigger window than Ollama is actually configured to serve
+            # would make "context used" read far too low.
+            ollama_context_length=int(env["OLLAMA_CONTEXT_LENGTH"]) if env.get("OLLAMA_CONTEXT_LENGTH") else None,
         )
 
     def preset(self, name: str | None) -> Preset:
@@ -293,13 +301,20 @@ class ChatService:
         return "tools" in (info.get("capabilities") or []) if info else False
 
     def context_length(self, model: str) -> int | None:
-        """The model's maximum context window, from Ollama's model_info
-        (e.g. `qwen3vl.context_length`). None if it can't be determined."""
+        """The context window this model actually gets to use: its own
+        maximum, from Ollama's model_info (e.g. `qwen3vl.context_length`),
+        capped by OLLAMA_CONTEXT_LENGTH if that's set lower -- Ollama itself
+        truncates to it, so reporting the model's uncapped max would read
+        "context used" far too low once the model exceeds what Ollama is
+        actually configured to serve. None if the model's max can't be
+        determined."""
         info = self._show(model)
         if not info:
             return None
         for key, value in (info.get("model_info") or {}).items():
             if key.endswith(".context_length"):
+                if self.cfg.ollama_context_length is not None:
+                    return min(value, self.cfg.ollama_context_length)
                 return value
         return None
 

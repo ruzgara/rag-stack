@@ -204,6 +204,26 @@ def test_context_limit_is_none_when_ollama_cant_report_it():
     assert result.stats["context_limit"] is None and result.stats["context_used_pct"] is None
 
 
+def test_context_limit_is_capped_by_ollamas_configured_context_length():
+    """A model can advertise a bigger window (e.g. 128k) than Ollama is
+    actually configured to serve (OLLAMA_CONTEXT_LENGTH) -- the reported
+    limit has to be whichever is smaller, or "context used" reads far too
+    low against a window the model never really gets."""
+    ollama = FakeOllama(rewrite='{"search": false, "query": "hi"}', streams=[answer("Hi", "!", prompt_tokens=200)],
+                        context_length=131072)
+    svc, _, _ = service(ollama=ollama, OLLAMA_CONTEXT_LENGTH=32768)
+    _, result = run(svc, "hi")
+    assert result.stats["context_limit"] == 32768
+
+
+def test_context_limit_is_the_models_own_when_it_is_smaller_than_ollamas_configured_length():
+    ollama = FakeOllama(rewrite='{"search": false, "query": "hi"}', streams=[answer("Hi", "!", prompt_tokens=200)],
+                        context_length=8192)
+    svc, _, _ = service(ollama=ollama, OLLAMA_CONTEXT_LENGTH=32768)
+    _, result = run(svc, "hi")
+    assert result.stats["context_limit"] == 8192
+
+
 def test_no_relevant_sources_is_said_plainly():
     ollama = FakeOllama(streams=[answer("Not covered.")])
     svc, _, _ = service({}, ollama)
