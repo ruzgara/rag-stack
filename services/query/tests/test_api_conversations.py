@@ -27,14 +27,14 @@ def acc(tmp_path, monkeypatch):
 
 @pytest.fixture
 def member(acc):
-    user = acc.create_user("member@example.com")
+    user = acc.create_user("member@example.com", display_name="Member")
     acc.grant("user", user.id, "chat.use")
     return user
 
 
 @pytest.fixture
 def other_member(acc):
-    user = acc.create_user("other@example.com")
+    user = acc.create_user("other@example.com", display_name="Other")
     acc.grant("user", user.id, "chat.use")
     return user
 

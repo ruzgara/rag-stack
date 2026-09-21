@@ -28,7 +28,7 @@ def service(tmp_path, monkeypatch):
 
 @pytest.fixture
 def admin(service):
-    return service.create_user("admin@example.com", password_hash="hash", is_admin=True)
+    return service.create_user("admin@example.com", password_hash="hash", display_name="Admin", is_admin=True)
 
 
 def users_by_email(admin) -> dict[str, dict]:
@@ -36,14 +36,14 @@ def users_by_email(admin) -> dict[str, dict]:
 
 
 def test_a_user_with_nothing_granted_has_no_permissions(service, admin):
-    service.create_user("new@example.com", password_hash="hash")
+    service.create_user("new@example.com", password_hash="hash", display_name="New")
     assert users_by_email(admin)["new@example.com"]["effective"] == {}
 
 
 def test_a_permission_inherited_from_a_group_is_reported(service, admin):
     """The grant is on the group, so a list of the user's own grants would
     show nothing -- and the user can still ask questions."""
-    user = service.create_user("member@example.com", password_hash="hash")
+    user = service.create_user("member@example.com", password_hash="hash", display_name="Member")
     group = service.create_group("Analysts")
     service.add_member(group["id"], user.id)
     service.grant("group", group["id"], "chat.use")
@@ -54,7 +54,7 @@ def test_a_permission_inherited_from_a_group_is_reported(service, admin):
 def test_a_users_own_deny_removes_a_permission_their_group_grants(service, admin):
     """The case the admin console got wrong: the user holds a deny, the group
     holds an allow, and the resolved answer is that they cannot read it."""
-    user = service.create_user("member@example.com", password_hash="hash")
+    user = service.create_user("member@example.com", password_hash="hash", display_name="Member")
     group = service.create_group("Analysts")
     service.add_member(group["id"], user.id)
     with service.db._conn() as db:
@@ -71,7 +71,7 @@ def test_a_users_own_deny_removes_a_permission_their_group_grants(service, admin
 
 
 def test_a_library_permission_names_the_library_it_applies_to(service, admin):
-    user = service.create_user("member@example.com", password_hash="hash")
+    user = service.create_user("member@example.com", password_hash="hash", display_name="Member")
     with service.db._conn() as db:
         db.execute("INSERT INTO libraries (id, name, created_at) VALUES ('lib-1', 'Project finance', 0)")
     service.grant("user", user.id, "library.read", "lib-1")
@@ -86,7 +86,7 @@ def test_an_admin_is_reported_as_holding_everything(service, admin):
 
 
 def test_a_disabled_user_holds_nothing_whatever_was_granted(service, admin):
-    user = service.create_user("gone@example.com", password_hash="hash")
+    user = service.create_user("gone@example.com", password_hash="hash", display_name="Gone")
     service.grant("user", user.id, "chat.use")
     service.update_user(user.id, disabled=True)
 

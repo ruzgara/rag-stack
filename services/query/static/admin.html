@@ -374,13 +374,13 @@ $("#newUser").onclick = guard(async () => {
   const proxy = me.auth_mode === "proxy";
   const form = await ask("New user", [
     {name: "email", label: "Email", type: "email", required: true},
-    {name: "display_name", label: "Display name (optional)"},
+    {name: "display_name", label: "Display name", required: true},
     {name: "password", label: proxy ? "Password (not used in proxy mode)" : "Password (at least 10 characters)", type: "password"},
     {name: "is_admin", label: "Administrator", type: "checkbox"},
   ], "Create");
   if (!form) return;
   await api("/api/admin/users", {method: "POST", body: {
-    email: form.email, display_name: form.display_name || null,
+    email: form.email, display_name: form.display_name,
     password: form.password || null, is_admin: form.is_admin}});
   toast(`Created ${form.email}.`);
   if (!form.is_admin) toast(`${form.email} has no permissions yet — grant chat.use to let them ask questions.`);
@@ -393,13 +393,13 @@ $("#userRows").onclick = guard(async e => {
   const user = cache.users.find(u => u.id === id);
   if (button.dataset.act === "edit") {
     const form = await ask(`Edit ${user.email}`, [
-      {name: "display_name", label: "Display name", value: user.display_name || ""},
+      {name: "display_name", label: "Display name", value: user.display_name || "", required: true},
       {name: "is_admin", label: "Administrator", type: "checkbox", value: user.is_admin},
       {name: "disabled", label: "Disabled (refuse logins, keep history)", type: "checkbox", value: user.disabled},
     ]);
     if (!form) return;
     await api(`/api/admin/users/${id}`, {method: "PATCH", body: {
-      display_name: form.display_name || null, is_admin: form.is_admin, disabled: form.disabled}});
+      display_name: form.display_name, is_admin: form.is_admin, disabled: form.disabled}});
     toast(`Updated ${user.email}.`);
   } else if (button.dataset.act === "passwd") {
     const form = await ask(`New password for ${user.email}`, [

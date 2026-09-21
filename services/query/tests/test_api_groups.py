@@ -25,12 +25,12 @@ def acc(tmp_path, monkeypatch):
 
 @pytest.fixture
 def admin(acc):
-    return acc.create_user("admin@example.com", is_admin=True)
+    return acc.create_user("admin@example.com", display_name="Admin", is_admin=True)
 
 
 @pytest.fixture
 def member(acc):
-    return acc.create_user("member@example.com")
+    return acc.create_user("member@example.com", display_name="Member")
 
 
 def test_an_admin_creates_a_group_with_a_type(admin):

@@ -47,7 +47,7 @@ def service(tmp_path, monkeypatch):
 
 @pytest.fixture
 def admin(service):
-    return service.create_user("admin@example.com", password_hash="hash", is_admin=True)
+    return service.create_user("admin@example.com", password_hash="hash", display_name="Admin", is_admin=True)
 
 
 # -------------------------------------------------------------------- gate --
@@ -57,7 +57,7 @@ def test_an_admin_reaches_the_system_endpoints(admin):
 
 
 def test_an_ordinary_user_is_refused(service):
-    user = service.create_user("member@example.com", password_hash="hash")
+    user = service.create_user("member@example.com", password_hash="hash", display_name="Member")
     with pytest.raises(HTTPException) as exc:
         api.superuser(user)
     assert exc.value.status_code == 403
@@ -66,7 +66,7 @@ def test_an_ordinary_user_is_refused(service):
 def test_managing_users_does_not_get_you_the_env_editor(service):
     """users.manage is a delegable grant; editing .env is not. A user who can
     administer accounts still can't rewrite the configuration they run on."""
-    user = service.create_user("helpdesk@example.com", password_hash="hash")
+    user = service.create_user("helpdesk@example.com", password_hash="hash", display_name="Helpdesk")
     service.grant("user", user.id, "users.manage")
 
     assert service.allowed(user.id, "users.manage")

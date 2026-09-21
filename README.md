@@ -125,7 +125,7 @@ to confirm every service is reachable. Then create the account you'll use —
 nothing else works until one exists, and there is no self-registration:
 
 ```bash
-./ragctl user add you@example.com --admin
+./ragctl user add you@example.com --name "Your Name" --admin
 ```
 
 It prompts for the password, at the terminal — piping into the prompt is
@@ -441,7 +441,7 @@ are rejected.
 `markdown`, `docling` and `manifest.jsonl`, deletes the Qdrant collection,
 and clears `data/chat.db` entirely — conversations, uploads, users, groups
 and grants. It's a full reset: after running it, sign-in needs a fresh
-`ragctl user add you@example.com --admin`. Model caches (`data/hf-cache`,
+`ragctl user add you@example.com --name "Your Name" --admin`. Model caches (`data/hf-cache`,
 `data/docling-artifacts`) are left alone since they're expensive to
 redownload and aren't "your data."
 For a full teardown, use `ragctl uninstall` instead.
@@ -520,13 +520,13 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
 
 ## Accounts, groups and permissions
 
-Everyone who uses the service has an account: an email, a password, and
-permissions. There is no self-registration — an admin creates accounts, from
-the command line today and from an admin page later.
+Everyone who uses the service has an account: an email, a name, a password,
+and permissions. There is no self-registration — an admin creates accounts,
+from the command line today and from an admin page later.
 
 ```
-ragctl user add you@example.com --admin     # the first admin (prompts for a password)
-ragctl user add alice@example.com           # a colleague
+ragctl user add you@example.com --name "Your Name" --admin     # the first admin (prompts for a password)
+ragctl user add alice@example.com --name "Alice"                # a colleague
 ragctl user group add Analysts
 ragctl user member add Analysts alice@example.com
 ragctl user grant Analysts chat.use         # a whole team at once

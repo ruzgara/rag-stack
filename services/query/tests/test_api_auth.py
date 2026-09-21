@@ -71,7 +71,7 @@ def test_the_service_key_is_ignored_when_none_is_configured(service, monkeypatch
 
 
 def test_a_permission_dependency_refuses_and_allows(service):
-    user = service.create_user("member@example.com", "hash")
+    user = service.create_user("member@example.com", "hash", display_name="Member")
     guard = api.requires("chat.use")
 
     with pytest.raises(HTTPException) as exc:
@@ -117,7 +117,7 @@ def chat(service, monkeypatch):
 
 
 def test_a_turn_is_stored_against_the_user_who_asked(chat):
-    user = chat.create_user("member@example.com", "hash")
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
     chat.grant("user", user.id, "chat.use")
     conv = api.state.db.create_conversation("everyday", user_id=user.id)
 
@@ -131,7 +131,7 @@ def test_a_turn_is_stored_against_the_user_who_asked(chat):
 
 
 def test_a_turn_that_breaks_is_stored_as_an_error_for_that_user(chat, monkeypatch):
-    user = chat.create_user("member@example.com", "hash")
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
     conv = api.state.db.create_conversation("everyday", user_id=user.id)
 
     def explode(self, question, history, preset, **kw):
@@ -150,7 +150,7 @@ def test_a_turn_that_breaks_is_stored_as_an_error_for_that_user(chat, monkeypatc
 # ------------------------------------------------------------------- retry --
 
 def test_retrying_replaces_the_last_answer_and_keeps_the_question(chat):
-    user = chat.create_user("member@example.com", "hash")
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
     conv = api.state.db.create_conversation("everyday", user_id=user.id)
     drain(api.send_message(conv["id"], api.NewMessage(content="who pays?"), user))
     first_answer_id = api.state.db.get_conversation(conv["id"], user_id=user.id)["messages"][-1]["id"]
@@ -166,7 +166,7 @@ def test_retrying_replaces_the_last_answer_and_keeps_the_question(chat):
 
 
 def test_retrying_a_chat_with_nothing_to_retry_is_404(chat):
-    user = chat.create_user("member@example.com", "hash")
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
     conv = api.state.db.create_conversation("everyday", user_id=user.id)  # no messages yet
 
     with pytest.raises(HTTPException) as exc:
@@ -175,7 +175,7 @@ def test_retrying_a_chat_with_nothing_to_retry_is_404(chat):
 
 
 def test_a_failed_turn_can_be_retried(chat, monkeypatch):
-    user = chat.create_user("member@example.com", "hash")
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
     conv = api.state.db.create_conversation("everyday", user_id=user.id)
 
     def explode(self, question, history, preset, **kw):

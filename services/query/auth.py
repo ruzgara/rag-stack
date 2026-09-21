@@ -165,7 +165,11 @@ class Auth:
                 return None
             user = self.accounts.by_email(email)
             if not user:
-                user = self.accounts.create_user(email, display_name=identity.display_name,
+                # The proxy may not send a name header; fall back to the
+                # email's local part so account creation never fails on a
+                # missing name it has no way to prompt for.
+                name = identity.display_name or email.split("@", 1)[0]
+                user = self.accounts.create_user(email, display_name=name,
                                                  is_admin=not self.accounts.any_users())
             return None if user.disabled else user
         try:

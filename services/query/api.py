@@ -258,7 +258,7 @@ class PasswordChange(BaseModel):
 class NewUser(BaseModel):
     email: str
     password: str | None = None      # omitted in proxy mode
-    display_name: str | None = None
+    display_name: str
     is_admin: bool = False
 
 

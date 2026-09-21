@@ -112,7 +112,7 @@ def test_two_sessions_uploading_the_same_name_dont_overwrite_each_other(inbox, u
 
 @pytest.fixture
 def admin(inbox):
-    return api.state.accounts.create_user("admin@example.com", is_admin=True)
+    return api.state.accounts.create_user("admin@example.com", display_name="Admin", is_admin=True)
 
 
 def test_an_admin_can_upload_past_every_limit(inbox, admin):
@@ -169,7 +169,7 @@ def test_an_upload_to_an_unknown_library_is_404(inbox, user):
     """An admin clears the permission check unconditionally, so this is
     where a bad id actually gets checked -- for a member, library.write on
     an id that was never granted is a 403 before it gets this far."""
-    admin = api.state.accounts.create_user("admin@example.com", is_admin=True)
+    admin = api.state.accounts.create_user("admin@example.com", display_name="Admin", is_admin=True)
 
     with pytest.raises(HTTPException) as exc:
         api.upload(user=admin, library_id="no-such-library", files=[pdf("book.pdf")])

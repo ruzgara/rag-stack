@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS users (
     id             TEXT PRIMARY KEY,
     email          TEXT NOT NULL UNIQUE,   -- stored lowercased
     password_hash  TEXT,                   -- null when identity comes from a proxy
-    display_name   TEXT,
+    display_name   TEXT NOT NULL,
     is_admin       INTEGER NOT NULL DEFAULT 0,
     disabled       INTEGER NOT NULL DEFAULT 0,
     -- Bumped to invalidate this user's signed session cookies everywhere

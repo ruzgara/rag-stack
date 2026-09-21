@@ -31,12 +31,12 @@ def acc(tmp_path, monkeypatch):
 
 @pytest.fixture
 def admin(acc):
-    return acc.create_user("admin@example.com", is_admin=True)
+    return acc.create_user("admin@example.com", display_name="Admin", is_admin=True)
 
 
 @pytest.fixture
 def member(acc):
-    user = acc.create_user("member@example.com")
+    user = acc.create_user("member@example.com", display_name="Member")
     acc.grant("user", user.id, "chat.use")
     return user
 
@@ -137,7 +137,7 @@ def test_an_unknown_librarys_detail_is_404(member):
 
 def test_a_user_with_share_and_read_can_share_read_with_another(acc, admin, member):
     lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    target = acc.create_user("target@example.com")
+    target = acc.create_user("target@example.com", display_name="Target")
     acc.grant("user", member.id, "library.share", lib["id"])
     acc.grant("user", member.id, "library.read", lib["id"])
 
@@ -150,7 +150,7 @@ def test_a_user_with_share_and_read_can_share_read_with_another(acc, admin, memb
 
 def test_sharing_without_library_share_is_403(acc, admin, member):
     lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    target = acc.create_user("target@example.com")
+    target = acc.create_user("target@example.com", display_name="Target")
     acc.grant("user", member.id, "library.read", lib["id"])  # no library.share
 
     with pytest.raises(HTTPException) as exc:
@@ -161,7 +161,7 @@ def test_sharing_without_library_share_is_403(acc, admin, member):
 
 def test_sharing_more_than_you_hold_is_403(acc, admin, member):
     lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    target = acc.create_user("target@example.com")
+    target = acc.create_user("target@example.com", display_name="Target")
     acc.grant("user", member.id, "library.share", lib["id"])  # no library.write
 
     with pytest.raises(HTTPException) as exc:
@@ -172,7 +172,7 @@ def test_sharing_more_than_you_hold_is_403(acc, admin, member):
 
 def test_sharing_library_share_itself_is_rejected(acc, admin, member):
     lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    target = acc.create_user("target@example.com")
+    target = acc.create_user("target@example.com", display_name="Target")
     acc.grant("user", member.id, "library.share", lib["id"])
     acc.grant("user", member.id, "library.read", lib["id"])
 
@@ -184,7 +184,7 @@ def test_sharing_library_share_itself_is_rejected(acc, admin, member):
 
 def test_unsharing_removes_access(acc, admin, member):
     lib = api.admin_create_library(api.NewLibrary(name="Project finance"), admin=admin)
-    target = acc.create_user("target@example.com")
+    target = acc.create_user("target@example.com", display_name="Target")
     acc.grant("user", member.id, "library.share", lib["id"])
     acc.grant("user", member.id, "library.read", lib["id"])
     api.share_library(lib["id"], api.ShareRequest(subject_type="user", subject_id=target.id,

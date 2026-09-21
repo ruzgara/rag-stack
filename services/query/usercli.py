@@ -277,8 +277,8 @@ def main() -> None:
 
     add = subs.add_parser("add", help="create a user (prompts for a password)")
     add.add_argument("email")
+    add.add_argument("--name", required=True, help="display name")
     add.add_argument("--admin", action="store_true", help="full permissions, and can manage users")
-    add.add_argument("--name", default=None, help="display name")
     add.add_argument("--no-password", action="store_true", help="for QUERY_AUTH_MODE=proxy")
     add.add_argument("--password-stdin", action="store_true", help="read the password from stdin instead of asking")
     add.set_defaults(run=cmd_add)

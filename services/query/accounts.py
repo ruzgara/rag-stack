@@ -67,7 +67,7 @@ class Invalid(Exception):
 class User:
     id: str
     email: str
-    display_name: str | None
+    display_name: str
     is_admin: bool
     disabled: bool
     session_epoch: int
@@ -87,6 +87,13 @@ def normalise_email(email: str) -> str:
     cleaned = (email or "").strip().lower()
     if not EMAIL_RE.match(cleaned):
         raise Invalid(f"{email!r} is not an email address")
+    return cleaned
+
+
+def normalise_display_name(display_name: str | None) -> str:
+    cleaned = (display_name or "").strip()
+    if not cleaned:
+        raise Invalid("a name is required")
     return cleaned
 
 
@@ -144,6 +151,7 @@ class Accounts:
         """Creates a user. The first admin also adopts anything stored before
         there were accounts, so existing conversations aren't orphaned."""
         email = normalise_email(email)
+        display_name = normalise_display_name(display_name)
         user_id = uuid.uuid4().hex
         with self.db._conn() as db:
             if db.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
@@ -166,6 +174,8 @@ class Accounts:
 
     def update_user(self, user_id: str, *, display_name: str | None = None, is_admin: bool | None = None,
                     disabled: bool | None = None) -> User:
+        if display_name is not None:
+            display_name = normalise_display_name(display_name)
         sets, values = [], []
         for column, value in (("display_name", display_name), ("is_admin", is_admin), ("disabled", disabled)):
             if value is not None:

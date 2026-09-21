@@ -26,6 +26,7 @@ def library(acc):
 
 
 def user(acc: Accounts, email: str = "member@example.com", **kw) -> User:
+    kw.setdefault("display_name", "Test User")
     return acc.create_user(email, password_hash="hash", **kw)
 
 
@@ -48,6 +49,18 @@ def test_the_same_email_cannot_be_registered_twice(acc):
     user(acc)
     with pytest.raises(Invalid, match="already has an account"):
         user(acc)
+
+
+@pytest.mark.parametrize("display_name", [None, "", "   "])
+def test_a_user_needs_a_name_to_be_created(acc, display_name):
+    with pytest.raises(Invalid, match="name is required"):
+        acc.create_user("member@example.com", password_hash="hash", display_name=display_name)
+
+
+def test_a_users_name_cannot_be_cleared_by_an_update(acc):
+    created = user(acc)
+    with pytest.raises(Invalid, match="name is required"):
+        acc.update_user(created.id, display_name="   ")
 
 
 def test_a_missing_user_is_not_found(acc):

@@ -34,6 +34,7 @@ class FakeRequest:
 
 
 def member(acc: Accounts, email: str = "member@example.com", password: str = PASSWORD, **kw):
+    kw.setdefault("display_name", "Test User")
     return acc.create_user(email, hash_password(password), **kw)
 
 
@@ -166,6 +167,15 @@ def test_proxy_mode_creates_a_user_it_has_not_seen_before(acc):
     assert (user.email, user.display_name) == ("new@example.com", "New Person")
     assert user.is_admin  # the first user through the door has to be able to manage the rest
     assert acc.by_email("new@example.com") is not None
+
+
+def test_proxy_mode_falls_back_to_the_email_local_part_when_no_name_header_is_sent(acc):
+    """A name is mandatory, but the proxy isn't guaranteed to send one."""
+    auth = Auth(acc, {"QUERY_AUTH_MODE": "proxy"})
+
+    user = auth.current_user(FakeRequest(headers={"X-Forwarded-Email": "new@example.com"}))
+
+    assert user.display_name == "new"
 
 
 def test_proxy_mode_still_refuses_a_disabled_user_and_a_junk_header(acc):
