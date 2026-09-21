@@ -654,6 +654,12 @@ The backend assumes more than one session at a time:
 - **One turn per conversation.** Two sends to the same conversation are
   serialised, and the question is stored once its turn is admitted, not when
   the request arrives, so two tabs can't read each other's half-written
+- **The line is fair between users**, not first come, first served: a freed
+  slot goes to whoever has the least running or already waiting, so ten
+  questions sent at once by one person interleave with everyone else's
+  rather than going first. One user can hold at most
+  `QUERY_MAX_QUEUED_PER_USER` places in line, so nobody can fill the queue
+  and have everyone else turned away.
   history.
 - **Ingest quotas.** Converting a document is the most expensive thing here,
   so `/api/upload` is capped per user over a rolling window

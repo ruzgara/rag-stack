@@ -15,9 +15,12 @@ Three limits, checked together:
                   the first, because it has to read the history the first
                   one is still writing
 
-There are no user accounts yet, so callers pass db.LOCAL_USER and the
-per-user limit is effectively a per-machine one; when login exists it starts
-working per person without changes here.
+The line is fair between users rather than first come, first served: a
+freed slot goes to whoever has the least already running or ahead of them
+in line (see _priority), so someone who sends ten questions at once gets
+them answered in turn with everyone else's, not ahead of them. And one user
+can only hold max_queued_per_user places in line, so nobody can fill the
+queue itself and have everyone else turned away.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ class GateConfig:
     max_concurrent: int = 2
     max_per_user: int = 2
     max_queued: int = 32
+    max_queued_per_user: int = 4
     max_wait: float = 180.0
 
     @classmethod
@@ -46,6 +50,7 @@ class GateConfig:
             max_concurrent=max(1, int(env.get("QUERY_MAX_CONCURRENT") or 2)),
             max_per_user=max(1, int(env.get("QUERY_MAX_PER_USER") or 2)),
             max_queued=max(1, int(env.get("QUERY_MAX_QUEUED") or 32)),
+            max_queued_per_user=max(1, int(env.get("QUERY_MAX_QUEUED_PER_USER") or 4)),
             max_wait=float(env.get("QUERY_QUEUE_WAIT") or 180),
         )
 
@@ -66,6 +71,11 @@ class Gate:
         self._waiting: list[_Ticket] = []
         self._running: list[_Ticket] = []
         self._seq = 0
+        # Per user, the _admitted count when they last got a turn in -- the
+        # round-robin tiebreak in _priority. Never pruned: it's one int per
+        # account that has ever asked anything.
+        self._admitted = 0
+        self._last_admitted: dict[str, int] = {}
 
     # ------------------------------------------------------------ internals --
 
@@ -78,11 +88,27 @@ class Gate:
                 and (ticket.conv_id is None
                      or not any(t.conv_id == ticket.conv_id for t in self._running)))
 
+    def _priority(self, ticket: _Ticket) -> tuple[int, int, int]:
+        """Where a waiting ticket stands: first by how much its user already
+        has running or waiting ahead of it, so a user's third queued turn
+        ranks with everyone else's third; then by who was let in least
+        recently, so that when one turn ends its user doesn't win the next
+        slot straight back; then by arrival. Together a burst from one
+        person interleaves with everyone else's instead of going first."""
+        ahead = sum(1 for t in self._waiting if t.user_id == ticket.user_id and t.seq < ticket.seq)
+        return (self._in_flight(ticket.user_id) + ahead, self._last_admitted.get(ticket.user_id, -1),
+                ticket.seq)
+
     def _next(self) -> _Ticket | None:
-        """The first waiting ticket that could start now. Not simply the first
-        in line: a caller held back by its own per-user limit must not block
-        someone else's turn behind it."""
-        return next((t for t in self._waiting if self._free(t)), None)
+        """The best-placed waiting ticket that could start now. Not simply
+        the best-placed one: a caller held back by its own per-user or
+        per-conversation limit must not block someone else's turn behind it."""
+        return min((t for t in self._waiting if self._free(t)), key=self._priority, default=None)
+
+    def _position(self, ticket: _Ticket) -> int:
+        """This ticket's 1-based place in line, in the order _next serves it."""
+        mine = self._priority(ticket)
+        return 1 + sum(1 for t in self._waiting if self._priority(t) < mine)
 
     # ---------------------------------------------------------------- admit --
 
@@ -98,14 +124,20 @@ class Gate:
         with self._cond:
             if len(self._waiting) >= self.cfg.max_queued:
                 raise Busy(f"{len(self._waiting)} requests are already waiting; try again shortly")
+            if sum(1 for t in self._waiting if t.user_id == user_id) >= self.cfg.max_queued_per_user:
+                raise Busy(f"you already have {self.cfg.max_queued_per_user} requests waiting; "
+                           "try again when one has started")
             self._seq += 1
             ticket = _Ticket(self._seq, user_id, conv_id)
             self._waiting.append(ticket)
+            # A newcomer can rank ahead of turns already waiting, so they
+            # recheck their places rather than keep reporting stale ones.
+            self._cond.notify_all()
             deadline = time.monotonic() + self.cfg.max_wait
             reported = 0
             try:
                 while self._next() is not ticket:
-                    position = self._waiting.index(ticket) + 1
+                    position = self._position(ticket)
                     if position != reported and on_position:
                         reported = position
                         # Called with the lock held: it only queues an event.
@@ -115,6 +147,8 @@ class Gate:
                                    f"{len(self._running)} turn(s) running")
                 self._waiting.remove(ticket)
                 self._running.append(ticket)
+                self._admitted += 1
+                self._last_admitted[user_id] = self._admitted
             except BaseException:
                 if ticket in self._waiting:
                     self._waiting.remove(ticket)

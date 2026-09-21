@@ -146,10 +146,77 @@ def test_a_failed_turn_still_frees_its_slot():
         pass
 
 
+def queue_up(g: Gate, *users: str) -> list[Runner]:
+    """Starts a waiting Runner per user, in this order -- each one in line
+    before the next arrives, so their arrival order is the one given."""
+    runners = []
+    for user in users:
+        runners.append(Runner(g, user=user).start())
+        deadline = time.monotonic() + 2
+        while g.stats()["queued"] < len(runners) and time.monotonic() < deadline:
+            time.sleep(0.005)
+    return runners
+
+
+def admitted_in_order(holder: Runner, waiting: list[Runner]) -> list[Runner]:
+    """Lets each turn finish as soon as it starts, and returns the order they
+    got in."""
+    order, pending = [], list(waiting)
+    holder.finish()
+    while pending:
+        started = next((r for r in pending if r.admitted.wait(0.01)), None)
+        if started is None:
+            continue
+        order.append(started)
+        pending.remove(started)
+        started.finish()
+    return order
+
+
+def test_a_burst_from_one_user_interleaves_with_everyone_elses():
+    """First come, first served would run all three of u1's before u2's."""
+    g = gate(max_concurrent=1, max_per_user=1)
+    holder = Runner(g, user="u0").start()
+    assert holder.admitted.wait(2)
+    a1, a2, a3, b1 = queue_up(g, "u1", "u1", "u1", "u2")
+
+    assert admitted_in_order(holder, [a1, a2, a3, b1]) == [a1, b1, a2, a3]
+
+
+def test_a_waiting_turns_position_is_its_fair_place_not_its_arrival():
+    g = gate(max_concurrent=1, max_per_user=1)
+    holder = Runner(g, user="u0").start()
+    assert holder.admitted.wait(2)
+    a1, a2, b1 = queue_up(g, "u1", "u1", "u2")
+    time.sleep(0.05)
+
+    assert b1.positions == [2]  # behind u1's first turn, ahead of its second
+    assert a2.positions == [2, 3]  # and u1's second is told it slipped back
+
+    admitted_in_order(holder, [a1, a2, b1])
+
+
+def test_one_user_cannot_fill_the_queue():
+    g = gate(max_queued=8, max_queued_per_user=2, max_wait=5)
+    holder = Runner(g, user="u0").start()
+    assert holder.admitted.wait(2)
+    mine = queue_up(g, "u1", "u1")
+
+    with pytest.raises(Busy, match="already have 2 requests waiting"):
+        with g.admit("u1"):
+            pass
+    theirs = queue_up(g, "u2")[0]  # someone else still gets in line
+
+    admitted_in_order(holder, [*mine, theirs])
+    assert theirs.error is None
+
+
 def test_the_gate_reads_its_limits_from_the_environment():
     cfg = GateConfig.from_env({"QUERY_MAX_CONCURRENT": "4", "QUERY_MAX_PER_USER": "2",
-                               "QUERY_MAX_QUEUED": "10", "QUERY_QUEUE_WAIT": "30"})
-    assert (cfg.max_concurrent, cfg.max_per_user, cfg.max_queued, cfg.max_wait) == (4, 2, 10, 30.0)
+                               "QUERY_MAX_QUEUED": "10", "QUERY_MAX_QUEUED_PER_USER": "3",
+                               "QUERY_QUEUE_WAIT": "30"})
+    assert (cfg.max_concurrent, cfg.max_per_user, cfg.max_queued, cfg.max_queued_per_user, cfg.max_wait) == \
+        (4, 2, 10, 3, 30.0)
     assert GateConfig.from_env({"QUERY_MAX_CONCURRENT": "0"}).max_concurrent == 1  # never zero
 
 
