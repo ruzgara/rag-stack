@@ -339,7 +339,13 @@ cmd_logs() {
     case "$svc" in
         docling) tail -n 100 -f "$LOG_DIR/docling-serve.log" ;;
         ollama) tail -n 100 -f "$LOG_DIR/ollama-env.log" ;;
-        ingest) tail -n 100 -f "$LOG_DIR/ingest-watch.log" ;;
+        ingest)
+            if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
+                tail -n 100 -f "$LOG_DIR/ingest-watch.log"
+            else
+                tail -n 100 -f "$LOG_DIR/ingest-api.log"
+            fi
+            ;;
         query) tail -n 100 -f "$LOG_DIR/query-api.log" ;;
         qdrant) compose logs -f "$svc" ;;
         "") compose logs -f ;;
