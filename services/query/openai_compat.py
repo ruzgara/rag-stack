@@ -30,8 +30,8 @@ router = APIRouter(prefix="/v1")
 
 
 def _current_user(request: Request) -> User:
-    """The same identity check as the native API: a session cookie, or the
-    QUERY_API_KEY service account. Deferred imports keep api.py's import of
+    """The same identity check as the native API: a session cookie, a proxy
+    header, a personal API token, or the QUERY_API_KEY service account. Deferred imports keep api.py's import of
     this module from turning circular."""
     from api import current_user
 

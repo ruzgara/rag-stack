@@ -1,5 +1,6 @@
 """
-Who is calling: password login today, a trusted proxy header later.
+Who is calling: a password login, a trusted proxy header, or a personal API
+token.
 
 Everything that could go wrong cryptographically is delegated. Passwords are
 hashed by pwdlib (argon2id), and the session cookie is signed by Starlette's
@@ -19,6 +20,11 @@ Two modes, chosen by QUERY_AUTH_MODE:
 The cookie holds a user id and the user's session_epoch, and both are checked
 against the row on every request, so disabling a user or changing a password
 takes effect at once without a session table to clean up.
+
+Beside either mode, a personal API token (Authorization: Bearer rsk_...) acts
+as the user it belongs to -- for scripts and OpenAI-compatible clients, which
+can't hold a session cookie. It works the same in both modes: the proxy
+vouches for browsers, the token for itself.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from pathlib import Path
 from fastapi import HTTPException, Request
 from pwdlib import PasswordHash
 
-from accounts import Accounts, Denied, Invalid, MIN_PASSWORD_LENGTH, User, normalise_email
+from accounts import TOKEN_PREFIX, Accounts, Denied, Invalid, MIN_PASSWORD_LENGTH, User, normalise_email
 
 _hasher = PasswordHash.recommended()
 
@@ -106,6 +112,12 @@ class Throttle:
                 self._failures.pop(key, None)
 
 
+def bearer_token(request: Request) -> str | None:
+    """The credential in an Authorization: Bearer header, if there is one."""
+    scheme, _, credential = request.headers.get("authorization", "").partition(" ")
+    return (credential.strip() or None) if scheme.lower() == "bearer" else None
+
+
 def session_secret(env: dict, data_dir: Path) -> str:
     """The key the session cookie is signed with. Taken from the environment
     when set; otherwise generated once and kept in data/session.key, so a
@@ -154,7 +166,16 @@ class Auth:
     def current_user(self, request: Request) -> User | None:
         """The caller as a stored user, or None. In proxy mode a user seen for
         the first time is created without a password, since the proxy vouches
-        for it; in password mode nothing is ever created here."""
+        for it, and as an ordinary member; in password mode nothing is ever
+        created here.
+
+        A personal API token wins over both, and one that doesn't check out
+        (unknown, expired, its user disabled) is a refusal, not a fall back
+        to whatever cookie came with it: a caller presenting a credential
+        means to be identified by it."""
+        token = bearer_token(request)
+        if token and token.startswith(TOKEN_PREFIX):
+            return self.accounts.user_for_token(token)
         identity = self.identify(request)
         if not identity:
             return None
@@ -169,8 +190,10 @@ class Auth:
                 # email's local part so account creation never fails on a
                 # missing name it has no way to prompt for.
                 name = identity.display_name or email.split("@", 1)[0]
-                user = self.accounts.create_user(email, display_name=name,
-                                                 is_admin=not self.accounts.any_users())
+                # Never an admin, not even the first account: whoever reached
+                # the proxy first would otherwise own the install. Admins are
+                # made at the terminal (ragctl user admin).
+                user = self.accounts.create_user(email, display_name=name)
             return None if user.disabled else user
         try:
             user = self.accounts.user(identity.user_id or "")

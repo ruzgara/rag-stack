@@ -151,6 +151,10 @@ def select_docs(sha_prefix: str | None) -> tuple[list[Doc], list[str]]:
                     continue
                 if rec.get("status") == "processed":
                     latest[rec["sha256"]] = rec  # later rows win
+                elif rec.get("status") == "deleted":
+                    # Deleted by its uploader (the query service's purge.py);
+                    # a later "processed" row brings it back.
+                    latest.pop(rec["sha256"], None)
 
     docs, no_json = [], []
     for sha, rec in latest.items():

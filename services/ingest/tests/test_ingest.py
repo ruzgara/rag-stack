@@ -388,3 +388,17 @@ def test_fix_headings_only_uses_the_rotated_copy(make_doc, dirs, monkeypatch):
     ingest.fix_headings_only(config())
 
     assert used == [dirs["WORK"] / "abc123.pdf"]
+
+
+def test_a_deleted_document_is_converted_again_when_re_uploaded(dirs):
+    """Its uploader deleted it (the query service appends a "deleted" row);
+    the same file uploaded again must be converted, not skipped as already
+    processed -- skipping would also delete it from the inbox."""
+    rows = [{"sha256": "aaa", "filename": "a.pdf", "status": "processed"},
+            {"sha256": "aaa", "filename": "a.pdf", "status": "deleted"}]
+    ingest.MANIFEST.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert not ingest.already_processed("aaa")
+
+    with ingest.MANIFEST.open("a") as f:
+        f.write(json.dumps({"sha256": "aaa", "filename": "a.pdf", "status": "processed"}) + "\n")
+    assert ingest.already_processed("aaa")  # converted again after the delete

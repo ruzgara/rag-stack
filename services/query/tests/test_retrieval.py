@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 from conftest import SEARCH_ENV, FakeQdrant, FakeReranker, make_hit, point
@@ -268,3 +270,29 @@ def test_an_index_built_with_another_model_is_refused(search_cfg):
     r = Retriever(search_cfg(), client=httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(RuntimeError, match="built with other:latest"):
         r._check_index()
+
+
+def test_deleting_a_document_drops_its_points_by_sha(search_cfg):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.url.params.get("wait"), json.loads(request.content)))
+        return httpx.Response(200, json={"result": {"status": "completed"}})
+
+    r = Retriever(search_cfg(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    r.delete_document("sha-1")
+
+    [(method, path, wait, body)] = seen
+    assert (method, path, wait) == ("POST", f"/collections/{r.cfg.collection}/points/delete", "true")
+    assert body == {"filter": {"must": [{"key": "doc_sha", "match": {"value": "sha-1"}}]}}
+
+
+def test_deleting_from_a_collection_that_does_not_exist_yet_is_not_an_error(search_cfg):
+    handler = lambda request: httpx.Response(404, text="Collection `ragstack_chunks` doesn't exist!")  # noqa: E731
+    Retriever(search_cfg(), client=httpx.Client(transport=httpx.MockTransport(handler))).delete_document("sha-1")
+
+
+def test_deleting_when_qdrant_fails_raises(search_cfg):
+    handler = lambda request: httpx.Response(500, text="boom")  # noqa: E731
+    with pytest.raises(RuntimeError):
+        Retriever(search_cfg(), client=httpx.Client(transport=httpx.MockTransport(handler))).delete_document("x")

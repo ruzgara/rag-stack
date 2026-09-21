@@ -242,3 +242,17 @@ def test_doc_filter():
         "must": [{"key": "doc_sha", "match": {"value": "abc"}}],
         "must_not": [{"key": "fingerprint", "match": {"value": "fp"}}],
     }
+
+
+def test_select_docs_leaves_out_a_deleted_document_until_it_is_ingested_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(embed, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(embed, "MANIFEST", tmp_path / "manifest.jsonl")
+    (tmp_path / "docling").mkdir()
+    (tmp_path / "docling" / "aaa.json").write_text("{}")
+    row = {"sha256": "aaa", "filename": "a.pdf", "status": "processed", "docling_json": "docling/aaa.json"}
+    embed.MANIFEST.write_text(json.dumps(row) + "\n" + json.dumps({**row, "status": "deleted"}) + "\n")
+    assert embed.select_docs(None)[0] == []
+
+    with embed.MANIFEST.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    assert [d.sha256 for d in embed.select_docs(None)[0]] == ["aaa"]

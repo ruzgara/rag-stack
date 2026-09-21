@@ -12,7 +12,8 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 export HF_HOME="__REPO_ROOT__/data/hf-cache"
 
 cd "__REPO_ROOT__/services/query"
-# Always 127.0.0.1, whatever BIND_ADDR says: there are no user accounts yet,
-# so anyone who can reach this service can read every conversation. One
-# worker: the reranker lives in process memory on the GPU.
+# Always 127.0.0.1, whatever BIND_ADDR says: sign-in is real, but passwords,
+# session cookies and API tokens shouldn't cross a network in the clear -- to
+# expose it, put TLS in front (Caddy, tailscale serve). One worker: the
+# reranker lives in process memory on the GPU.
 exec "__UV_BIN__" run --python 3.12 uvicorn api:app --host 127.0.0.1 --port "__QUERY_PORT__" --workers 1

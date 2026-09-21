@@ -100,11 +100,14 @@ def test_a_repeated_filename_gets_its_own_name(inbox, user):
     assert {p.name for p in inbox.iterdir()} == {"book.pdf", "book (1).pdf"}
 
 
-def test_two_sessions_uploading_the_same_name_dont_overwrite_each_other(inbox, user):
+def test_two_sessions_uploading_the_same_name_dont_overwrite_each_other(inbox, user, monkeypatch):
     """The name is claimed with a hard link, which fails rather than replacing,
-    so the loser tries the next name instead of clobbering the winner."""
+    so the loser tries the next name instead of clobbering the winner. Room
+    for all four in the quota: this is about names, not the quota."""
+    monkeypatch.setattr(api.state, "uploads", UploadLimits(max_file_mb=1, max_files=10, max_mb=2, window_hours=24))
+    library_id = own(user)
     results = []
-    threads = [threading.Thread(target=lambda n=i: results.append(api.upload(user=user, library_id=own(user), files=[pdf("book.pdf", size=500 + n)])))
+    threads = [threading.Thread(target=lambda n=i: results.append(api.upload(user=user, library_id=library_id, files=[pdf("book.pdf", size=500 + n)])))
                for i in range(4)]
     for t in threads:
         t.start()
@@ -259,3 +262,117 @@ def test_a_reused_inbox_name_belongs_to_its_newest_uploader(inbox, user):
 
     assert api.documents(user=user)["inbox"] == []
     assert api.documents(user=other)["inbox"] == ["report.pdf"]
+
+
+# ------------------------------------------------------------ deleting uploads --
+
+class FakeRetriever:
+    def __init__(self, down: bool = False):
+        self.deleted: list[str] = []
+        self.down = down
+
+    def delete_document(self, doc_sha: str) -> None:
+        if self.down:
+            raise RuntimeError("qdrant is down")
+        self.deleted.append(doc_sha)
+
+
+@pytest.fixture
+def retriever(inbox, monkeypatch):
+    fake = FakeRetriever()
+    monkeypatch.setattr(api.state, "retriever", fake, raising=False)
+    monkeypatch.setattr(api, "MANIFEST", inbox.parent / "manifest.jsonl")
+    return fake
+
+
+def ingested(inbox, name: str, content: bytes) -> str:
+    """What ingest leaves behind for one file: the original moved to
+    processed/, its outputs keyed by sha, and a manifest row."""
+    import hashlib
+    import json
+    sha = hashlib.sha256(content).hexdigest()
+    data = inbox.parent
+    (data / "processed").mkdir(exist_ok=True)
+    (inbox / name).rename(data / "processed" / name)
+    for folder, suffix in (("markdown", "md"), ("docling", "json")):
+        (data / folder).mkdir(exist_ok=True)
+        (data / folder / f"{sha}.{suffix}").write_text("output")
+    with (data / "manifest.jsonl").open("a") as f:
+        f.write(json.dumps({"sha256": sha, "filename": name, "status": "processed", "timestamp": 1}) + "\n")
+    return sha
+
+
+def test_deleting_your_upload_purges_the_document_everywhere(inbox, user, retriever):
+    import json
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    sha = ingested(inbox, "book.pdf", b"x" * 1_000)
+    reader = api.state.accounts.create_user("reader@example.com", display_name="Reader")
+    copied_into = own(reader)  # a reader it was shared with, who copied it into their own library
+    api.state.accounts.add_document(copied_into, sha)
+    [upload] = api.list_uploads(user=user)["uploads"]
+    assert upload["status"] == "processed"
+
+    assert api.delete_upload(upload["id"], user=user) == {"purged": True}
+
+    data = inbox.parent
+    assert retriever.deleted == [sha]
+    assert not (data / "processed" / "book.pdf").exists()
+    assert not (data / "markdown" / f"{sha}.md").exists() and not (data / "docling" / f"{sha}.json").exists()
+    assert api.state.accounts.libraries_of(sha) == []  # out of every library, the copy included
+    last = json.loads((data / "manifest.jsonl").read_text().splitlines()[-1])
+    assert (last["sha256"], last["status"]) == (sha, "deleted")
+    assert api.documents(user=user)["documents"] == []
+    assert api.list_uploads(user=user)["uploads"] == []
+    assert api.state.db.upload_usage(3600, user_id=user.id) == (1, 1_000)  # the quota isn't refunded
+
+
+def test_deleting_an_upload_still_waiting_removes_it_from_the_inbox(inbox, user, retriever):
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    [upload] = api.list_uploads(user=user)["uploads"]
+    assert upload["status"] == "waiting"
+
+    api.delete_upload(upload["id"], user=user)
+
+    assert not (inbox / "book.pdf").exists()
+    assert api.state.accounts.libraries_of(upload["doc_sha"]) == []
+
+
+def test_a_document_someone_else_uploaded_too_is_kept_for_them(inbox, user, retriever):
+    other = api.state.accounts.create_user("other@example.com", display_name="Other")
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    api.upload(user=other, library_id=own(other), files=[pdf("same-bytes.pdf")])  # identical content
+    [mine] = api.list_uploads(user=user)["uploads"]
+
+    assert api.delete_upload(mine["id"], user=user) == {"purged": False}
+
+    assert retriever.deleted == []
+    assert api.state.accounts.libraries_of(mine["doc_sha"]) == [own(other)]  # gone from mine, kept in theirs
+    assert (inbox / "same-bytes.pdf").exists()
+    assert api.list_uploads(user=user)["uploads"] == []
+    assert len(api.list_uploads(user=other)["uploads"]) == 1
+
+
+def test_nothing_is_deleted_when_the_index_cant_be_reached(inbox, user, retriever):
+    retriever.down = True
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    [upload] = api.list_uploads(user=user)["uploads"]
+
+    with pytest.raises(HTTPException) as exc:
+        api.delete_upload(upload["id"], user=user)
+
+    assert exc.value.status_code == 503
+    assert (inbox / "book.pdf").exists()
+    assert api.state.accounts.libraries_of(upload["doc_sha"]) == [own(user)]
+    assert len(api.list_uploads(user=user)["uploads"]) == 1  # still there to retry
+
+
+def test_nobody_can_delete_someone_elses_upload(inbox, user, retriever):
+    other = api.state.accounts.create_user("other@example.com", display_name="Other")
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    [upload] = api.list_uploads(user=user)["uploads"]
+
+    with pytest.raises(HTTPException) as exc:
+        api.delete_upload(upload["id"], user=other)
+
+    assert exc.value.status_code == 404
+    assert retriever.deleted == [] and (inbox / "book.pdf").exists()

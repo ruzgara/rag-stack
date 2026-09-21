@@ -165,7 +165,9 @@ def test_proxy_mode_creates_a_user_it_has_not_seen_before(acc):
                                                  "X-Forwarded-User": "New Person"}))
 
     assert (user.email, user.display_name) == ("new@example.com", "New Person")
-    assert user.is_admin  # the first user through the door has to be able to manage the rest
+    # Not even the first account: whoever reached the proxy first would own
+    # the install. Admins are made at the terminal (ragctl user admin).
+    assert not user.is_admin
     assert acc.by_email("new@example.com") is not None
 
 

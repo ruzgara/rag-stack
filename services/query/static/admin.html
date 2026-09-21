@@ -88,7 +88,7 @@
 
   <section class="panel on" id="tab-users">
     <h2>Users</h2>
-    <p class="hint">The same operations as <code>ragctl user</code>. <code>is_admin</code> is the only role: an admin can do anything to any library, everyone else only chats and works within the libraries they own or were given access to.</p>
+    <p class="hint">The same operations as <code>ragctl user</code>, for members. Admin accounts -- making, demoting, editing, disabling or deleting one -- are only managed at the terminal, with <code>ragctl user</code>. <code>is_admin</code> is the only role: an admin can do anything to any library, everyone else only chats and works within the libraries they own or were given access to.</p>
     <div class="row"><button class="primary" id="newUser">+ New user</button></div>
     <h3>Accounts</h3>
     <table><thead><tr><th>Email</th><th>Name</th><th>Groups</th><th>Libraries owned</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
@@ -286,9 +286,8 @@ async function loadAccounts() {
 
 const libName = id => cache.libraries.find(l => l.id === id)?.name || id;
 
-/** The libraries this subject owns, as a UI-friendly stand-in for the old
- *  grants column -- what a user may do on a library they don't own lives on
- *  the library's own access list now (see openAccessDialog), not here. */
+/** The libraries this user owns. What they may do on a library they don't
+ *  own lives on that library's own access list (see openAccessDialog). */
 function ownedLibrariesCell(userId) {
   const owned = cache.libraries.filter(l => l.owner_id === userId);
   return owned.length ? owned.map(l => `<span class="tag">${esc(l.name)}</span>`).join(" ") : '<span class="small">none</span>';
@@ -304,10 +303,12 @@ function renderUsers() {
       <td>${esc(u.display_name || "")}</td>
       <td class="small">${esc((u.groups || []).join(", ")) || "—"}</td>
       <td>${ownedLibrariesCell(u.id)}</td>
-      <td class="actions">
-        <button class="small" data-act="edit">Edit</button>
+      <td class="actions">${u.is_admin
+        // Admin accounts are managed only at the terminal; the API refuses these.
+        ? '<span class="small">managed with <code>ragctl user</code></span>'
+        : `<button class="small" data-act="edit">Edit</button>
         <button class="small" data-act="passwd">Password</button>
-        <button class="small danger" data-act="delete"${self ? " disabled" : ""}>Delete</button>
+        <button class="small danger" data-act="delete">Delete</button>`}
       </td></tr>`;
   }).join("") || '<tr><td colspan="5" class="small">No users.</td></tr>';
 }
@@ -349,12 +350,11 @@ $("#newUser").onclick = guard(async () => {
     {name: "email", label: "Email", type: "email", required: true},
     {name: "display_name", label: "Display name", required: true},
     {name: "password", label: proxy ? "Password (not used in proxy mode)" : "Password (at least 10 characters)", type: "password"},
-    {name: "is_admin", label: "Administrator", type: "checkbox"},
   ], "Create");
   if (!form) return;
+  // Always a member: admins are only made at the terminal (ragctl user admin).
   await api("/api/admin/users", {method: "POST", body: {
-    email: form.email, display_name: form.display_name,
-    password: form.password || null, is_admin: form.is_admin}});
+    email: form.email, display_name: form.display_name, password: form.password || null}});
   toast(`Created ${form.email}.`);
   await loadAccounts();
 });
@@ -366,12 +366,11 @@ $("#userRows").onclick = guard(async e => {
   if (button.dataset.act === "edit") {
     const form = await ask(`Edit ${user.email}`, [
       {name: "display_name", label: "Display name", value: user.display_name || "", required: true},
-      {name: "is_admin", label: "Administrator", type: "checkbox", value: user.is_admin},
       {name: "disabled", label: "Disabled (refuse logins, keep history)", type: "checkbox", value: user.disabled},
     ]);
     if (!form) return;
     await api(`/api/admin/users/${id}`, {method: "PATCH", body: {
-      display_name: form.display_name, is_admin: form.is_admin, disabled: form.disabled}});
+      display_name: form.display_name, disabled: form.disabled}});
     toast(`Updated ${user.email}.`);
   } else if (button.dataset.act === "passwd") {
     const form = await ask(`New password for ${user.email}`, [
@@ -380,7 +379,7 @@ $("#userRows").onclick = guard(async e => {
     await api(`/api/admin/users/${id}`, {method: "PATCH", body: {password: form.password}});
     toast(`Password changed; ${user.email} is signed out everywhere.`);
   } else if (button.dataset.act === "delete") {
-    if (!confirmed(`Delete ${user.email}? Their conversations are kept.`)) return;
+    if (!confirmed(`Delete ${user.email}? Their chats, workspaces and tokens are deleted; their libraries and documents move to the Admin Workspace.`)) return;
     await api(`/api/admin/users/${id}`, {method: "DELETE"});
     toast(`Deleted ${user.email}.`);
   }

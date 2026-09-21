@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Accounts from the command line, for everything the admin UI doesn't exist for
-yet -- and for the first admin, who has to be created before anyone can sign
+Accounts from the command line: the same operations as the admin console at
+/admin, plus everything to do with admin accounts, which only the terminal
+may do -- making, demoting, renaming, re-passwording, disabling or deleting
+one. That includes the first admin, who has to exist before anyone can sign
 in to create anyone.
 
 Passwords are always prompted for, never taken as an argument: an argument
@@ -12,6 +14,7 @@ Run through ragctl:
   ragctl user add bob@example.com --password-stdin  ...or scripted, from stdin
   ragctl user list                               users, with their groups
   ragctl user passwd alice@example.com           change a password
+  ragctl user rename alice@example.com --name "Alice Smith"   change a display name
   ragctl user disable alice@example.com          keep the history, refuse logins
   ragctl user delete alice@example.com
   ragctl user group add Analysts                 groups (locked: admin-only membership)
@@ -26,6 +29,9 @@ Run through ragctl:
   ragctl user library share "Project finance" alice@example.com write   read or write, a user or a group
   ragctl user library unshare "Project finance" alice@example.com
   ragctl user library delete "Project finance"
+  ragctl user token add alice@example.com --name "laptop script" [--expires-days 90]
+  ragctl user token list alice@example.com       personal API tokens (never the tokens themselves)
+  ragctl user token revoke alice@example.com <token id>
 """
 
 from __future__ import annotations
@@ -34,6 +40,8 @@ import argparse
 import getpass
 import sys
 from pathlib import Path
+
+import time
 
 from accounts import Accounts, Invalid
 from auth import hash_password
@@ -120,6 +128,14 @@ def cmd_passwd(acc: Accounts, args) -> None:
     print(f"password changed; {user.email} is signed out everywhere")
 
 
+def cmd_rename(acc: Accounts, args) -> None:
+    try:
+        user = acc.update_user(user_of(acc, args.email).id, display_name=args.name)
+    except Invalid as exc:
+        sys.exit(str(exc))
+    print(f"{user.email} is now called {user.display_name}")
+
+
 def cmd_disable(acc: Accounts, args) -> None:
     user = acc.update_user(user_of(acc, args.email).id, disabled=not args.enable)
     print(f"{user.email} is now {'enabled' if not user.disabled else 'disabled'}")
@@ -132,7 +148,7 @@ def cmd_admin(acc: Accounts, args) -> None:
 
 def cmd_delete(acc: Accounts, args) -> None:
     user = user_of(acc, args.email)
-    if input(f"Delete {user.email}? Their conversations are kept. [y/N] ").strip().lower() != "y":
+    if input(f"Delete {user.email}? Their chats, workspaces and tokens are deleted; their libraries and documents move to the Admin Workspace. [y/N] ").strip().lower() != "y":
         sys.exit("cancelled")
     acc.delete_user(user.id)
     print(f"deleted {user.email}")
@@ -252,6 +268,34 @@ def cmd_library(acc: Accounts, args) -> None:
         print(f"{args.document} no longer has access to {lib['name']}")
 
 
+def cmd_token(acc: Accounts, args) -> None:
+    user = user_of(acc, args.email)
+    if args.action == "add":
+        expires_at = time.time() + args.expires_days * 86400 if args.expires_days else None
+        try:
+            token, row = acc.create_token(user.id, args.name, expires_at)
+        except Invalid as exc:
+            sys.exit(str(exc))
+        print(f"created token {row['id']} for {user.email} -- copy it now, it can't be shown again:")
+        print(token)
+    elif args.action == "list":
+        tokens = acc.tokens(user.id)
+        if not tokens:
+            print(f"{user.email} has no tokens")
+        stamp = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "never"  # noqa: E731
+        for t in tokens:
+            print(f"{t['name']}  ({t['hint']}...)")
+            print(f"    id       {t['id']}")
+            print(f"    created  {stamp(t['created_at'])}   last used {stamp(t['last_used_at'])}   "
+                  f"expires {stamp(t['expires_at'])}")
+    else:
+        try:
+            acc.revoke_token(args.token_id, user.id)
+        except NotFound:
+            sys.exit(f"{user.email} has no token {args.token_id}")
+        print(f"revoked token {args.token_id}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="ragctl user", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -272,6 +316,11 @@ def main() -> None:
     passwd.add_argument("--password-stdin", action="store_true", help="read the password from stdin instead of asking")
     passwd.set_defaults(run=cmd_passwd)
 
+    rename = subs.add_parser("rename", help="change a display name")
+    rename.add_argument("email")
+    rename.add_argument("--name", required=True, help="the new display name")
+    rename.set_defaults(run=cmd_rename)
+
     disable = subs.add_parser("disable", help="refuse logins without deleting anything")
     disable.add_argument("email")
     disable.add_argument("--enable", action="store_true", help="undo it")
@@ -282,7 +331,7 @@ def main() -> None:
     admin.add_argument("--revoke", action="store_true", help="take it away instead")
     admin.set_defaults(run=cmd_admin)
 
-    delete = subs.add_parser("delete", help="delete a user (their conversations are kept)")
+    delete = subs.add_parser("delete", help="delete a user and their chats (their libraries go to the Admin Workspace)")
     delete.add_argument("email")
     delete.set_defaults(run=cmd_delete)
 
@@ -311,7 +360,22 @@ def main() -> None:
     lib.add_argument("--owner", default=None, help="add only: the owning user's email -- full access, no sharing needed")
     lib.set_defaults(run=cmd_library)
 
+    tok = subs.add_parser("token", help="add, list or revoke a user's personal API tokens")
+    tok.add_argument("action", choices=["add", "list", "revoke"])
+    tok.add_argument("email")
+    tok.add_argument("token_id", nargs="?", default=None, help="revoke only")
+    tok.add_argument("--name", default=None, help="add only: what it's for, to tell tokens apart")
+    tok.add_argument("--expires-days", type=int, default=None, help="add only: default never")
+    tok.set_defaults(run=cmd_token)
+
     args = parser.parse_args()
+    if args.command == "token":
+        if args.action == "add" and not args.name:
+            parser.error("token add needs --name")
+        if args.action == "revoke" and not args.token_id:
+            parser.error("token revoke needs a token id (see token list)")
+        if args.expires_days is not None and args.expires_days < 1:
+            parser.error("--expires-days must be at least 1")
     if args.command == "group" and args.action in ("add", "delete") and not args.name:
         parser.error(f"group {args.action} needs a name")
     if args.command == "library":

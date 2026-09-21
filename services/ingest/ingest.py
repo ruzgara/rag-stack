@@ -176,17 +176,22 @@ def sha256_of(path: Path) -> str:
 
 
 def already_processed(sha: str) -> bool:
+    """Whether the latest processed-or-deleted row for this document says
+    processed. A "deleted" row (written when its uploader deletes it, by the
+    query service's purge.py) cancels the ones before it, so the same file
+    uploaded again is converted again rather than skipped -- and removed."""
     if not MANIFEST.exists():
         return False
+    processed = False
     with MANIFEST.open() as f:
         for line in f:
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("sha256") == sha and rec.get("status") == "processed":
-                return True
-    return False
+            if rec.get("sha256") == sha and rec.get("status") in ("processed", "deleted"):
+                processed = rec["status"] == "processed"
+    return processed
 
 
 def append_manifest(result: Result) -> None:
@@ -636,6 +641,8 @@ def fix_headings_only(cfg: Config) -> int:
                 continue
             if rec.get("status") == "processed" and rec.get("docling_json"):
                 latest[rec["sha256"]] = rec
+            elif rec.get("status") == "deleted":  # see already_processed
+                latest.pop(rec["sha256"], None)
     docs = [r for r in latest.values() if Path(r["filename"]).suffix.lower() in PDF_SUFFIXES]
     if not docs:
         print("No processed PDFs with docling JSON.")

@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from db import ChatDB, NotFound, WorkspaceLibraries
+from db import ADMIN_WORKSPACE_ID, ChatDB, NotFound, WorkspaceLibraries
 
 USER = "user-under-test"
 OTHER = "someone-else"
@@ -15,7 +15,8 @@ OTHER = "someone-else"
 SCOPED = ("create_conversation", "list_conversations", "get_conversation", "update_conversation",
           "delete_conversation", "restore_conversation", "archive_conversation", "unarchive_conversation",
           "history", "add_user_message", "add_assistant_message", "prepare_retry",
-          "record_upload", "upload_usage",
+          "record_upload", "upload_usage", "list_uploads", "get_upload", "delete_uploads",
+          "document_held_by_others",
           "create_workspace", "list_workspaces", "get_workspace", "update_workspace", "delete_workspace",
           "restore_workspace", "touch_workspace")
 
@@ -309,23 +310,99 @@ def test_a_deleted_chat_cannot_be_archived(db):
 # ------------------------------------------------------------ ingest quota --
 
 def test_uploads_are_counted_within_the_window(db):
-    db.record_upload("a.pdf", 1_000)
-    db.record_upload("b.pdf", 2_500)
+    db.record_upload("a.pdf", 1_000, "sha-a")
+    db.record_upload("b.pdf", 2_500, "sha-b")
     assert db.upload_usage(3600) == (2, 3_500)
 
 
 def test_uploads_outside_the_window_dont_count(db):
-    db.record_upload("old.pdf", 5_000)
+    db.record_upload("old.pdf", 5_000, "sha-old")
     with db._conn() as conn:
         conn.execute("UPDATE uploads SET created_at = created_at - 7200")
     assert db.upload_usage(3600) == (0, 0)
 
 
 def test_uploads_are_counted_per_user(db):
-    db.record_upload("mine.pdf", 1_000)
-    db.record_upload("theirs.pdf", 9_000, user_id="someone-else")
+    db.record_upload("mine.pdf", 1_000, "sha-mine")
+    db.record_upload("theirs.pdf", 9_000, "sha-theirs", user_id="someone-else")
     assert db.upload_usage(3600) == (1, 1_000)
     assert db.upload_usage(3600, user_id="someone-else") == (1, 9_000)
+
+
+# ----------------------------------------------------------------- uploads --
+
+def test_a_deleted_upload_stops_listing_but_still_counts_against_the_quota(db):
+    """Converting it cost the GPU time either way; deleting mustn't refund it."""
+    kept = db.record_upload("kept.pdf", 1_000, "sha-kept")
+    gone = db.record_upload("gone.pdf", 2_000, "sha-gone")
+
+    assert db.delete_uploads("sha-gone") == ["gone.pdf"]
+
+    assert [u["id"] for u in db.list_uploads()] == [kept["id"]]
+    with pytest.raises(NotFound):
+        db.get_upload(gone["id"])
+    assert db.upload_usage(3600) == (2, 3_000)
+
+
+def test_deleting_an_upload_takes_every_copy_of_that_document_by_that_user(db):
+    db.record_upload("book.pdf", 1_000, "sha-1")
+    db.record_upload("book (1).pdf", 1_000, "sha-1")
+    db.record_upload("book.pdf", 1_000, "sha-1", user_id=OTHER)
+
+    assert sorted(db.delete_uploads("sha-1")) == ["book (1).pdf", "book.pdf"]
+    assert db.list_uploads() == []
+    assert len(db.as_user(OTHER).list_uploads()) == 1  # someone else's copy is theirs
+
+
+def test_someone_else_s_live_upload_counts_as_holding_the_document(db):
+    db.record_upload("book.pdf", 1_000, "sha-1")
+    assert not db.document_held_by_others("sha-1")  # only mine
+
+    db.record_upload("book.pdf", 1_000, "sha-1", user_id=OTHER)
+    assert db.document_held_by_others("sha-1")
+
+    db.as_user(OTHER).delete_uploads("sha-1")
+    assert not db.document_held_by_others("sha-1")  # a deleted one doesn't
+
+
+def test_an_upload_is_only_ever_its_uploaders(db):
+    theirs = db.as_user(OTHER).record_upload("theirs.pdf", 1_000, "sha-1")
+    with pytest.raises(NotFound):
+        db.get_upload(theirs["id"])
+
+
+# --------------------------------------------------------- admin workspace --
+
+def test_the_admin_workspace_exists_from_the_start_and_only_admins_see_it(db):
+    assert [w["id"] for w in db.list_workspaces(is_admin=True)] == [ADMIN_WORKSPACE_ID]
+    assert db.list_workspaces() == []
+    assert db.get_workspace(ADMIN_WORKSPACE_ID, is_admin=True)["name"] == "Admin Workspace"
+    with pytest.raises(NotFound):
+        db.get_workspace(ADMIN_WORKSPACE_ID)
+
+
+def test_the_admin_workspace_is_created_once(tmp_path):
+    first = ChatDB(tmp_path / "chat.db")
+    ChatDB(tmp_path / "chat.db")  # a restart
+    assert len(first.list_workspaces(user_id="an-admin", is_admin=True)) == 1
+
+
+def test_each_admin_sees_only_their_own_chats_in_the_admin_workspace(db):
+    mine = db.create_conversation("everyday", workspace_id=ADMIN_WORKSPACE_ID)
+    db.as_user(OTHER).create_conversation("everyday", workspace_id=ADMIN_WORKSPACE_ID)
+
+    assert [c["id"] for c in db.list_conversations(workspace_id=ADMIN_WORKSPACE_ID, is_admin=True)] == [mine["id"]]
+    [ws] = db.list_workspaces(is_admin=True)
+    assert ws["conversation_count"] == 1
+
+
+def test_a_demoted_admin_s_chats_in_the_admin_workspace_are_hidden(db):
+    conv = db.create_conversation("everyday", workspace_id=ADMIN_WORKSPACE_ID)
+
+    assert db.list_conversations() == []
+    with pytest.raises(NotFound):
+        db.get_conversation(conv["id"])
+    assert db.get_conversation(conv["id"], is_admin=True)["id"] == conv["id"]  # back once promoted
 
 
 # --------------------------------------------------------------- libraries --

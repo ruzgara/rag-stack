@@ -5,9 +5,12 @@ who a library has been shared with, and how the two combine (library_role).
 
 from __future__ import annotations
 
+import time
+
+import accounts as accounts_module
 import pytest
-from accounts import DEFAULT_LIBRARY, Accounts, Denied, Invalid, User
-from db import LOCAL_USER, ChatDB, NotFound
+from accounts import DEFAULT_LIBRARY, TOKEN_PREFIX, Accounts, Denied, Invalid, User
+from db import ADMIN_WORKSPACE_ID, LOCAL_USER, ChatDB, NotFound
 
 
 @pytest.fixture
@@ -120,7 +123,7 @@ def test_search_users_treats_percent_and_underscore_as_literal(acc):
 def test_the_first_admin_adopts_what_was_stored_before_accounts_existed(acc):
     """Conversations written under LOCAL_USER shouldn't disappear on upgrade."""
     conv = acc.db.create_conversation("everyday", "Old chat", user_id=LOCAL_USER)
-    acc.db.record_upload("old.pdf", 10, user_id=LOCAL_USER)
+    acc.db.record_upload("old.pdf", 10, "sha-old", user_id=LOCAL_USER)
 
     admin = user(acc, "admin@example.com", is_admin=True)
 
@@ -149,16 +152,50 @@ def test_disabling_a_user_also_invalidates_their_sessions(acc):
     assert updated.disabled and updated.session_epoch == created.session_epoch + 1
 
 
-def test_deleting_a_user_keeps_their_conversations_but_drops_their_library_access(acc):
+def test_deleting_a_user_wipes_everything_about_them(acc):
     created = user(acc)
-    lib = acc.create_library("Project finance")
-    acc.set_library_access(lib["id"], "user", created.id, "read")
-    conv = acc.db.create_conversation("everyday", user_id=created.id)
+    other_lib = acc.create_library("Someone else's")
+    acc.set_library_access(other_lib["id"], "user", created.id, "read")
+    group = acc.create_group("Analysts")
+    acc.add_member(group["id"], created.id)
+    workspace = acc.db.create_workspace("Research", user_id=created.id)
+    acc.db.create_conversation("everyday", user_id=created.id)
+    acc.db.create_conversation("everyday", user_id=created.id, workspace_id=workspace["id"])
+    acc.create_token(created.id, "script")
 
     acc.delete_user(created.id)
 
-    assert acc.library_access(lib["id"]) == []
-    assert [c["id"] for c in acc.db.list_conversations(user_id=created.id)] == [conv["id"]]
+    assert acc.library_access(other_lib["id"]) == []
+    assert acc.groups()[0]["members"] == []
+    assert acc.db.list_conversations(user_id=created.id) == []
+    assert acc.db.list_workspaces(user_id=created.id) == []
+    with acc.db._conn() as db:
+        for table, column in (("conversations", "user_id"), ("messages", "user_id"),
+                              ("workspaces", "owner_id"), ("api_tokens", "user_id"),
+                              ("group_members", "user_id")):
+            assert db.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (created.id,)).fetchone()[0] == 0
+
+
+def test_a_deleted_users_libraries_and_documents_pass_to_the_admin_workspace(acc):
+    created = user(acc)
+    own = default_library(acc, created)
+    project = acc.create_library("Project finance", owner_id=created.id)
+    acc.add_document(project["id"], "sha-1")
+    reader = user(acc, "reader@example.com")
+    acc.set_library_access(project["id"], "user", reader.id, "read")
+    acc.db.record_upload("book.pdf", 1_000, "sha-1", user_id=created.id)
+
+    acc.delete_user(created.id)
+
+    for lib_id in (own, project["id"]):
+        assert acc.library(lib_id)["owner_id"] is None  # kept, unowned
+    assert acc.library(project["id"])["documents"] == ["sha-1"]
+    assert set(acc.db.get_workspace(ADMIN_WORKSPACE_ID, user_id="any-admin", is_admin=True)["library_ids"]) == \
+        {own, project["id"]}
+    assert acc.library_role(reader.id, project["id"]) == "read"  # its sharing stays with it
+    # Their upload passes to the admins, so the document still counts as held
+    # and nobody else deleting an identical upload can purge it.
+    assert acc.db.document_held_by_others("sha-1", user_id=reader.id)
 
 
 # ----------------------------------------------------------------- groups --
@@ -696,3 +733,89 @@ def test_library_overview_for_an_admin_narrows_to_a_selection_like_everyone_else
     overview = {o["name"]: o for o in acc.library_overview(admin.id, [a["id"]])}
 
     assert overview["A"]["in_scope"] and not overview["B"]["in_scope"]
+
+
+# ----------------------------------------------------------------- tokens --
+
+def test_a_token_is_shown_once_and_only_its_hash_is_stored(acc):
+    owner = user(acc)
+    token, row = acc.create_token(owner.id, "laptop script")
+
+    assert token.startswith(TOKEN_PREFIX) and token.startswith(row["hint"])
+    with acc.db._conn() as db:
+        stored = db.execute("SELECT * FROM api_tokens").fetchone()
+    assert token not in dict(stored).values()
+    assert [t["id"] for t in acc.tokens(owner.id)] == [row["id"]]
+    assert "token_hash" not in acc.tokens(owner.id)[0]
+
+
+def test_a_token_identifies_its_user_and_records_its_use(acc):
+    owner = user(acc)
+    token, _ = acc.create_token(owner.id, "script")
+
+    assert acc.user_for_token(token).id == owner.id
+    assert acc.tokens(owner.id)[0]["last_used_at"] is not None
+
+
+@pytest.mark.parametrize("presented", ["", "rsk_", "rsk_not-a-real-token", "no-prefix-at-all"])
+def test_an_unknown_token_identifies_nobody(acc, presented):
+    acc.create_token(user(acc).id, "script")
+    assert acc.user_for_token(presented) is None
+
+
+def test_an_expired_token_identifies_nobody(acc, monkeypatch):
+    owner = user(acc)
+    token, _ = acc.create_token(owner.id, "short-lived", expires_at=time.time() + 60)
+    assert acc.user_for_token(token) is not None
+
+    later = time.time() + 120
+    monkeypatch.setattr(accounts_module.time, "time", lambda: later)
+    assert acc.user_for_token(token) is None
+
+
+def test_a_disabled_users_tokens_stop_working_and_resume_with_them(acc):
+    owner = user(acc)
+    token, _ = acc.create_token(owner.id, "script")
+
+    acc.update_user(owner.id, disabled=True)
+    assert acc.user_for_token(token) is None
+    acc.update_user(owner.id, disabled=False)
+    assert acc.user_for_token(token).id == owner.id
+
+
+def test_a_revoked_token_stops_working(acc):
+    owner = user(acc)
+    token, row = acc.create_token(owner.id, "script")
+
+    acc.revoke_token(row["id"], owner.id)
+
+    assert acc.user_for_token(token) is None
+    assert acc.tokens(owner.id) == []
+
+
+def test_nobody_can_revoke_someone_elses_token(acc):
+    owner, other = user(acc, "owner@example.com"), user(acc, "other@example.com")
+    token, row = acc.create_token(owner.id, "script")
+
+    with pytest.raises(NotFound):
+        acc.revoke_token(row["id"], other.id)
+    assert acc.user_for_token(token).id == owner.id
+
+
+def test_deleting_a_user_deletes_their_tokens(acc):
+    owner = user(acc)
+    token, _ = acc.create_token(owner.id, "script")
+
+    acc.delete_user(owner.id)
+
+    assert acc.user_for_token(token) is None
+    with acc.db._conn() as db:
+        assert db.execute("SELECT COUNT(*) FROM api_tokens").fetchone()[0] == 0
+
+
+def test_a_token_needs_a_name_and_a_future_expiry(acc):
+    owner = user(acc)
+    with pytest.raises(Invalid, match="needs a name"):
+        acc.create_token(owner.id, "   ")
+    with pytest.raises(Invalid, match="in the future"):
+        acc.create_token(owner.id, "script", expires_at=time.time() - 1)

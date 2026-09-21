@@ -19,13 +19,15 @@ everywhere when it is bumped.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import secrets
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
 
-from db import LOCAL_USER, ChatDB, NotFound
+from db import ADMIN_WORKSPACE_ID, ADMIN_WORKSPACE_OWNER, LOCAL_USER, ChatDB, NotFound
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MIN_PASSWORD_LENGTH = 10
@@ -69,6 +71,20 @@ class User:
 
 
 DEFAULT_LIBRARY = "Default Library"
+
+# Personal API tokens: the prefix marks a bearer credential as one of these
+# (rather than QUERY_API_KEY), and 32 random bytes make a plain sha256 of it
+# as safe to store as a slow password hash would be -- there's nothing to
+# brute-force.
+TOKEN_PREFIX = "rsk_"
+MAX_TOKEN_NAME = 100
+# last_used_at is for "is this token still in use?", not an audit log, so it
+# isn't rewritten on every request.
+TOKEN_TOUCH_SECONDS = 60.0
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def default_workspace_name(display_name: str) -> str:
@@ -206,15 +222,88 @@ class Accounts:
             db.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (time.time(), user_id))
 
     def delete_user(self, user_id: str) -> None:
-        """Removes the account and its access-list rows. Conversations are
-        kept -- they are a record of what the machine answered, and dropping
-        them silently would be a surprising thing for an admin action to do.
-        Libraries this user owned are kept too, orphaned (owner_id set null
-        by the foreign key) rather than deleted."""
+        """Removes the account and everything about them -- conversations
+        (with their messages and sources), workspaces, tokens, group
+        memberships and the access they'd been given -- except their
+        libraries and the documents in them. Those are kept: the libraries
+        become unowned (owner_id set null by the foreign key, their sharing
+        rows untouched) and are attached to the admin workspace, where every
+        admin can find them. Their upload records pass to the admins too
+        rather than going, so the documents still count as held: another
+        user deleting their own upload of an identical file mustn't purge a
+        document that's now in the admins' care (see api.delete_upload).
+        One transaction, so a failure leaves the account whole."""
         with self.db._conn() as db:
+            owned = [r["id"] for r in db.execute("SELECT id FROM libraries WHERE owner_id = ?", (user_id,))]
             if db.execute("DELETE FROM users WHERE id = ?", (user_id,)).rowcount == 0:
                 raise NotFound(f"no user {user_id}")
+            # api_tokens and group_members cascade with the user row.
             db.execute("DELETE FROM library_access WHERE subject_type = 'user' AND subject_id = ?", (user_id,))
+            # Messages and their sources cascade with the conversation; the
+            # workspaces' library attachments cascade with them.
+            db.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+            db.execute("DELETE FROM workspaces WHERE owner_id = ?", (user_id,))
+            db.execute("UPDATE uploads SET user_id = ? WHERE user_id = ?", (ADMIN_WORKSPACE_OWNER, user_id))
+            now = time.time()
+            db.executemany("INSERT OR IGNORE INTO workspace_libraries (workspace_id, library_id, added_at) "
+                           "VALUES (?, ?, ?)", [(ADMIN_WORKSPACE_ID, lib_id, now) for lib_id in owned])
+
+    # -------------------------------------------------------------- tokens --
+
+    def create_token(self, user_id: str, name: str, expires_at: float | None = None) -> tuple[str, dict]:
+        """Makes a personal API token for this user. Returns the token itself
+        -- the only time it is ever available, since only its hash is kept --
+        and the stored row as tokens() lists it."""
+        name = (name or "").strip()
+        if not name:
+            raise Invalid("a token needs a name, to tell it apart later")
+        if len(name) > MAX_TOKEN_NAME:
+            raise Invalid(f"a token's name is at most {MAX_TOKEN_NAME} characters")
+        now = time.time()
+        if expires_at is not None and expires_at <= now:
+            raise Invalid("a token's expiry has to be in the future")
+        token = TOKEN_PREFIX + secrets.token_urlsafe(32)
+        row = {"id": uuid.uuid4().hex, "name": name, "hint": token[:len(TOKEN_PREFIX) + 6],
+               "created_at": now, "last_used_at": None, "expires_at": expires_at}
+        with self.db._conn() as db:
+            if not db.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+                raise NotFound(f"no user {user_id}")
+            db.execute("INSERT INTO api_tokens (id, user_id, name, token_hash, hint, created_at, expires_at) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (row["id"], user_id, name, token_hash(token), row["hint"], now, expires_at))
+        return token, row
+
+    def tokens(self, user_id: str) -> list[dict]:
+        """This user's tokens, newest first -- never the hash."""
+        with self.db._conn() as db:
+            return [dict(r) for r in db.execute(
+                "SELECT id, name, hint, created_at, last_used_at, expires_at FROM api_tokens "
+                "WHERE user_id = ? ORDER BY created_at DESC", (user_id,))]
+
+    def revoke_token(self, token_id: str, user_id: str) -> None:
+        """Deletes one of this user's tokens. Someone else's is NotFound,
+        same as one that doesn't exist."""
+        with self.db._conn() as db:
+            if db.execute("DELETE FROM api_tokens WHERE id = ? AND user_id = ?",
+                          (token_id, user_id)).rowcount == 0:
+                raise NotFound(f"no token {token_id}")
+
+    def user_for_token(self, token: str) -> User | None:
+        """Whom a presented token acts as, or None: unknown, expired, or its
+        user disabled."""
+        if not token.startswith(TOKEN_PREFIX):
+            return None
+        now = time.time()
+        with self.db._conn() as db:
+            row = db.execute("SELECT id, user_id, last_used_at, expires_at FROM api_tokens WHERE token_hash = ?",
+                             (token_hash(token),)).fetchone()
+            if row is None or (row["expires_at"] is not None and row["expires_at"] <= now):
+                return None
+            if row["last_used_at"] is None or now - row["last_used_at"] >= TOKEN_TOUCH_SECONDS:
+                db.execute("UPDATE api_tokens SET last_used_at = ? WHERE id = ?", (now, row["id"]))
+            user = db.execute("SELECT * FROM users WHERE id = ?", (row["user_id"],)).fetchone()
+            user = self._row_to_user(db, user)
+        return None if user.disabled else user
 
     # -------------------------------------------------------------- groups --
 
@@ -359,6 +448,20 @@ class Accounts:
         with self.db._conn() as db:
             db.execute("DELETE FROM library_documents WHERE library_id = ? AND doc_sha = ?", (library_id, doc_sha))
 
+    def drop_document(self, doc_sha: str) -> None:
+        """Takes a document out of every library -- the database half of
+        purging it (see purge.py for the rest)."""
+        with self.db._conn() as db:
+            db.execute("DELETE FROM library_documents WHERE doc_sha = ?", (doc_sha,))
+
+    def remove_document_from_owned(self, doc_sha: str, user_id: str) -> None:
+        """Takes a document out of the libraries this user owns, leaving it
+        wherever else it is -- for deleting an upload whose document someone
+        else also uploaded, so it isn't purged."""
+        with self.db._conn() as db:
+            db.execute("DELETE FROM library_documents WHERE doc_sha = ? AND library_id IN "
+                       "(SELECT id FROM libraries WHERE owner_id = ?)", (doc_sha, user_id))
+
     def libraries_of(self, doc_sha: str) -> list[str]:
         """Which libraries a document belongs to, by its sha256."""
         with self.db._conn() as db:
@@ -400,8 +503,8 @@ class Accounts:
                 return "owner", "owner"
             if user.is_admin:
                 # Unconditional, even for a library_id that doesn't exist --
-                # same as an admin's old blanket "*" grant, so a bad id is
-                # still a 404 from the caller rather than a 403 first.
+                # so a bad id is still a 404 from the caller rather than a
+                # 403 first.
                 return "owner", "admin"
             if lib is None:
                 return None, None

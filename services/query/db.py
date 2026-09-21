@@ -23,6 +23,15 @@ from typing import Iterator
 
 LOCAL_USER = "local"
 
+# The workspace every admin shares, and nobody else can see: where a deleted
+# user's libraries go (Accounts.delete_user). It's created with the database,
+# owned by this placeholder rather than any one user -- a user id is a uuid
+# hex, so it can't collide -- and can't be renamed or deleted (api.py). Each
+# admin's chats in it are still their own (conversations.user_id).
+ADMIN_WORKSPACE_ID = "admin-workspace"
+ADMIN_WORKSPACE_OWNER = "admins"
+ADMIN_WORKSPACE_NAME = "Admin Workspace"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
     id           TEXT PRIMARY KEY,
@@ -97,8 +106,16 @@ CREATE TABLE IF NOT EXISTS uploads (
     user_id     TEXT NOT NULL,
     filename    TEXT NOT NULL,   -- the name given to the file in data/inbox
     bytes       INTEGER NOT NULL,
-    created_at  REAL NOT NULL
+    doc_sha     TEXT NOT NULL,   -- the document it became (content-addressed, so shared by identical uploads)
+    created_at  REAL NOT NULL,
+    -- Set when the uploader deletes it (see api.delete_upload). The row is
+    -- kept rather than removed so it still counts against the ingest quota --
+    -- converting it cost the GPU time whether or not it was later deleted --
+    -- but it no longer lists, and no longer counts as someone holding the
+    -- document.
+    deleted_at  REAL
 );
+CREATE INDEX IF NOT EXISTS uploads_sha ON uploads (doc_sha);
 CREATE INDEX IF NOT EXISTS uploads_user ON uploads (user_id, created_at DESC);
 """
 
@@ -117,6 +134,23 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at  REAL
 );
 
+-- Personal API tokens: a bearer credential that acts as its user, for
+-- scripts and OpenAI-compatible clients. Only a hash is kept -- the token
+-- itself is shown once, when it's made -- and a token is revoked by deleting
+-- its row. It carries no permissions of its own: every request re-reads the
+-- user, so disabling, demoting or deleting them applies to their tokens too.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    token_hash    TEXT NOT NULL UNIQUE,   -- sha256 hex of the whole token
+    hint          TEXT NOT NULL,          -- its first few characters, to tell tokens apart
+    created_at    REAL NOT NULL,
+    last_used_at  REAL,
+    expires_at    REAL                    -- null: never
+);
+CREATE INDEX IF NOT EXISTS api_tokens_user ON api_tokens (user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS groups (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
@@ -134,8 +168,9 @@ CREATE TABLE IF NOT EXISTS group_members (
     PRIMARY KEY (group_id, user_id)
 );
 
--- A named collection of documents. Created here so library_access can point
--- at one; membership and retrieval filtering come later.
+-- A named collection of documents, owned by a user and shared through
+-- library_access. Which documents it holds is library_documents (below);
+-- retrieval is filtered to the documents in the libraries a user can read.
 CREATE TABLE IF NOT EXISTS libraries (
     id          TEXT PRIMARY KEY,
     -- Unique per owner, not globally: a system-wide UNIQUE let any user
@@ -200,7 +235,8 @@ CREATE TABLE IF NOT EXISTS conversation_libraries (
 # belong to at most one workspace (conversations.workspace_id, added below)
 # and cascade with it, since a chat only makes sense inside its workspace.
 # Libraries are a many-to-many attachment, same shape as conversation_libraries
-# -- a library itself stays a global, admin-managed row (accounts.py).
+# -- a library itself belongs to its owner, not to any workspace, and can sit
+# in several (accounts.py).
 WORKSPACES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS workspaces (
     id            TEXT PRIMARY KEY,
@@ -247,6 +283,19 @@ class NotFound(Exception):
     pass
 
 
+# A chat is visible unless it sits in the admin workspace and the caller
+# isn't an admin (any more). Takes (is_admin,); needs `w` joined as the
+# chat's workspace.
+_ADMIN_CHAT_VISIBLE = f"(c.workspace_id IS NULL OR w.owner_id != '{ADMIN_WORKSPACE_OWNER}' OR ?)"
+
+
+def _visible(alias: str = "w") -> str:
+    """SQL for "a workspace this caller can see": their own, or the admin
+    workspace if they're an admin. Takes (user_id, is_admin) as parameters."""
+    col = f"{alias}.owner_id" if alias else "owner_id"
+    return f"({col} = ? OR ({col} = '{ADMIN_WORKSPACE_OWNER}' AND ?))"
+
+
 class WorkspaceLibraries(ValueError):
     """Raised on an attempt to give a chat inside a workspace its own
     libraries -- they come from the workspace (see the note above SCHEMA)."""
@@ -259,6 +308,12 @@ class ChatDB:
         with self._conn() as db:
             db.execute("PRAGMA journal_mode=WAL")  # readers don't block the writer
             db.executescript(SCHEMA)
+            now = time.time()
+            db.execute(
+                "INSERT OR IGNORE INTO workspaces (id, owner_id, name, description, created_at, updated_at, "
+                "last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ADMIN_WORKSPACE_ID, ADMIN_WORKSPACE_OWNER, ADMIN_WORKSPACE_NAME,
+                 "Libraries left behind by deleted users. Only admins can see this workspace.", now, now, now))
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -292,31 +347,34 @@ class ChatDB:
         ws["library_ids"] = []
         return ws
 
-    def list_workspaces(self, user_id: str, deleted: bool = False) -> list[dict]:
+    def list_workspaces(self, user_id: str, deleted: bool = False, *, is_admin: bool = False) -> list[dict]:
         """`deleted=False` (the default) is the normal workspace list.
-        `deleted=True` is the Recently Deleted tray, for restore_workspace."""
+        `deleted=True` is the Recently Deleted tray, for restore_workspace.
+        An admin's list also has the admin workspace; conversation_count is
+        only ever the caller's own chats, which matters there, since every
+        admin's chats sit in it."""
         with self._conn() as db:
             rows = db.execute(
-                """SELECT w.id, w.name, w.description, w.created_at, w.updated_at, w.last_used_at,
+                f"""SELECT w.id, w.name, w.description, w.created_at, w.updated_at, w.last_used_at,
                           COUNT(c.id) AS conversation_count
-                   FROM workspaces w LEFT JOIN conversations c ON c.workspace_id = w.id
-                   WHERE w.owner_id = ? AND w.deleted = ?
+                   FROM workspaces w LEFT JOIN conversations c ON c.workspace_id = w.id AND c.user_id = ?
+                   WHERE {_visible()} AND w.deleted = ?
                    GROUP BY w.id ORDER BY w.last_used_at DESC""",
-                (user_id, int(deleted)),
+                (user_id, user_id, int(is_admin), int(deleted)),
             ).fetchall()
             libs: dict[str, list[str]] = {}
             for r in db.execute(
-                """SELECT wl.workspace_id, wl.library_id FROM workspace_libraries wl
-                   JOIN workspaces w ON w.id = wl.workspace_id WHERE w.owner_id = ?""", (user_id,)):
+                f"""SELECT wl.workspace_id, wl.library_id FROM workspace_libraries wl
+                   JOIN workspaces w ON w.id = wl.workspace_id WHERE {_visible()}""", (user_id, int(is_admin))):
                 libs.setdefault(r["workspace_id"], []).append(r["library_id"])
         return [{**dict(r), "library_ids": libs.get(r["id"], [])} for r in rows]
 
-    def get_workspace(self, workspace_id: str, user_id: str) -> dict:
+    def get_workspace(self, workspace_id: str, user_id: str, *, is_admin: bool = False) -> dict:
         with self._conn() as db:
             row = db.execute(
                 "SELECT id, name, description, created_at, updated_at, last_used_at FROM workspaces "
-                "WHERE id = ? AND owner_id = ? AND NOT deleted",
-                (workspace_id, user_id),
+                f"WHERE id = ? AND {_visible('')} AND NOT deleted",
+                (workspace_id, user_id, int(is_admin)),
             ).fetchone()
             if row is None:
                 raise NotFound(workspace_id)
@@ -325,17 +383,17 @@ class ChatDB:
                 "SELECT library_id FROM workspace_libraries WHERE workspace_id = ?", (workspace_id,))]
         return ws
 
-    def touch_workspace(self, workspace_id: str, user_id: str) -> None:
+    def touch_workspace(self, workspace_id: str, user_id: str, *, is_admin: bool = False) -> None:
         """Bumps last_used_at -- called when a turn runs in one of this
         workspace's conversations, so the switcher can sort by actual use
         rather than by edits to the workspace's own name/libraries."""
         with self._conn() as db:
-            db.execute("UPDATE workspaces SET last_used_at = ? WHERE id = ? AND owner_id = ? AND NOT deleted",
-                       (time.time(), workspace_id, user_id))
+            db.execute(f"UPDATE workspaces SET last_used_at = ? WHERE id = ? AND {_visible('')} AND NOT deleted",
+                       (time.time(), workspace_id, user_id, int(is_admin)))
 
     def update_workspace(self, workspace_id: str, *, name: str | None = None, description: str | None = None,
-                         library_ids: list[str] | None = None, user_id: str) -> dict:
-        self.get_workspace(workspace_id, user_id)  # raises NotFound
+                         library_ids: list[str] | None = None, user_id: str, is_admin: bool = False) -> dict:
+        self.get_workspace(workspace_id, user_id, is_admin=is_admin)  # raises NotFound
         now = time.time()
         with self._conn() as db:
             if name is not None:
@@ -348,7 +406,7 @@ class ChatDB:
                 db.executemany(
                     "INSERT INTO workspace_libraries (workspace_id, library_id, added_at) VALUES (?, ?, ?)",
                     [(workspace_id, lib_id, now) for lib_id in library_ids])
-        return self.get_workspace(workspace_id, user_id)
+        return self.get_workspace(workspace_id, user_id, is_admin=is_admin)
 
     def delete_workspace(self, workspace_id: str, user_id: str) -> None:
         """Marks the workspace deleted rather than removing the row -- a soft
@@ -406,7 +464,7 @@ class ChatDB:
             "SELECT library_id FROM conversation_libraries WHERE conversation_id = ?", (conv_id,))]
 
     def list_conversations(self, user_id: str, workspace_id: str | None = None, deleted: bool = False,
-                           archived: bool = False) -> list[dict]:
+                           archived: bool = False, *, is_admin: bool = False) -> list[dict]:
         """`deleted=False, archived=False` (the default) is the normal chat
         list: this chat's own delete or archive, or its workspace's delete,
         all hide it. `archived=True` is the Archived list (still excludes
@@ -415,7 +473,9 @@ class ChatDB:
         chat's own delete puts it there; a chat merely hidden because its
         workspace was deleted isn't something the user asked to delete, so
         it doesn't show up to restore this way (restoring the workspace
-        brings it back instead)."""
+        brings it back instead). Chats in the admin workspace only list for
+        an admin: someone demoted keeps them, out of sight, until promoted
+        again."""
         with self._conn() as db:
             params: tuple = (user_id,)
             if deleted:
@@ -427,6 +487,8 @@ class ChatDB:
             if workspace_id is not None:
                 where += " AND c.workspace_id = ?"
                 params += (workspace_id,)
+            where += f" AND {_ADMIN_CHAT_VISIBLE}"
+            params += (int(is_admin),)
             rows = db.execute(
                 f"""SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.last_read_at,
                           c.archived, COUNT(m.id) AS message_count,
@@ -451,20 +513,21 @@ class ChatDB:
                 libs.setdefault(r["conversation_id"], []).append(r["library_id"])
             ws_libs: dict[str, list[str]] = {}
             for r in db.execute(
-                """SELECT wl.workspace_id, wl.library_id FROM workspace_libraries wl
-                   JOIN workspaces w ON w.id = wl.workspace_id WHERE w.owner_id = ?""", (user_id,)):
+                f"""SELECT wl.workspace_id, wl.library_id FROM workspace_libraries wl
+                   JOIN workspaces w ON w.id = wl.workspace_id WHERE {_visible()}""", (user_id, int(is_admin))):
                 ws_libs.setdefault(r["workspace_id"], []).append(r["library_id"])
         return [{**dict(r), "library_ids": ws_libs.get(r["workspace_id"], []) if r["workspace_id"] is not None
                  else libs.get(r["id"], [])} for r in rows]
 
-    def get_conversation(self, conv_id: str, user_id: str, with_messages: bool = True) -> dict:
+    def get_conversation(self, conv_id: str, user_id: str, with_messages: bool = True, *,
+                         is_admin: bool = False) -> dict:
         """`with_messages=True` (the default) is a real open of the chat --
         it counts as reading it, so last_read_at is bumped to now.
         `with_messages=False` is used for internal existence/ownership
         checks (update, add-message, retry) and must not affect it."""
         with self._conn() as db:
-            # Same deleted/soft-deleted-workspace exclusion as
-            # list_conversations(deleted=False).
+            # Same deleted/soft-deleted-workspace and admin-workspace
+            # exclusions as list_conversations(deleted=False).
             row = db.execute(
                 """SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.last_read_at,
                           c.archived,
@@ -472,8 +535,8 @@ class ChatDB:
                               AS last_message_at
                    FROM conversations c LEFT JOIN workspaces w ON w.id = c.workspace_id
                    WHERE c.id = ? AND c.user_id = ? AND NOT c.deleted
-                         AND (c.workspace_id IS NULL OR NOT w.deleted)""",
-                (conv_id, user_id),
+                         AND (c.workspace_id IS NULL OR NOT w.deleted) AND """ + _ADMIN_CHAT_VISIBLE,
+                (conv_id, user_id, int(is_admin)),
             ).fetchone()
             if row is None:
                 raise NotFound(conv_id)
@@ -497,8 +560,8 @@ class ChatDB:
         return conv
 
     def update_conversation(self, conv_id: str, *, title: str | None = None, preset: str | None = None,
-                            library_ids: list[str] | None = None, user_id: str) -> dict:
-        conv = self.get_conversation(conv_id, user_id, with_messages=False)  # raises NotFound
+                            library_ids: list[str] | None = None, user_id: str, is_admin: bool = False) -> dict:
+        conv = self.get_conversation(conv_id, user_id, with_messages=False, is_admin=is_admin)  # raises NotFound
         if library_ids is not None and conv["workspace_id"] is not None:
             raise WorkspaceLibraries("a chat in a workspace uses the workspace's libraries; change the workspace's")
         with self._conn() as db:
@@ -510,7 +573,7 @@ class ChatDB:
                 db.execute("DELETE FROM conversation_libraries WHERE conversation_id = ?", (conv_id,))
                 db.executemany("INSERT INTO conversation_libraries (conversation_id, library_id) VALUES (?, ?)",
                                [(conv_id, lib_id) for lib_id in library_ids])
-        return self.get_conversation(conv_id, user_id, with_messages=False)
+        return self.get_conversation(conv_id, user_id, with_messages=False, is_admin=is_admin)
 
     def delete_conversation(self, conv_id: str, user_id: str) -> None:
         """Marks the chat deleted rather than removing it -- see the
@@ -522,15 +585,15 @@ class ChatDB:
                 (time.time(), conv_id, user_id)).rowcount == 0:
                 raise NotFound(conv_id)
 
-    def restore_conversation(self, conv_id: str, user_id: str) -> dict:
+    def restore_conversation(self, conv_id: str, user_id: str, *, is_admin: bool = False) -> dict:
         with self._conn() as db:
             if db.execute(
                 "UPDATE conversations SET deleted = 0, updated_at = ? WHERE id = ? AND user_id = ? AND deleted",
                 (time.time(), conv_id, user_id)).rowcount == 0:
                 raise NotFound(conv_id)
-        return self.get_conversation(conv_id, user_id, with_messages=False)
+        return self.get_conversation(conv_id, user_id, with_messages=False, is_admin=is_admin)
 
-    def archive_conversation(self, conv_id: str, user_id: str) -> dict:
+    def archive_conversation(self, conv_id: str, user_id: str, *, is_admin: bool = False) -> dict:
         """Archiving hides a chat from the normal list without touching
         `deleted` -- it's still fully open-able and repliable, just out of
         the way. A deleted chat can't be archived; restore it first."""
@@ -540,16 +603,16 @@ class ChatDB:
                 "WHERE id = ? AND user_id = ? AND NOT deleted AND NOT archived",
                 (time.time(), conv_id, user_id)).rowcount == 0:
                 raise NotFound(conv_id)
-        return self.get_conversation(conv_id, user_id, with_messages=False)
+        return self.get_conversation(conv_id, user_id, with_messages=False, is_admin=is_admin)
 
-    def unarchive_conversation(self, conv_id: str, user_id: str) -> dict:
+    def unarchive_conversation(self, conv_id: str, user_id: str, *, is_admin: bool = False) -> dict:
         with self._conn() as db:
             if db.execute(
                 "UPDATE conversations SET archived = 0, updated_at = ? "
                 "WHERE id = ? AND user_id = ? AND NOT deleted AND archived",
                 (time.time(), conv_id, user_id)).rowcount == 0:
                 raise NotFound(conv_id)
-        return self.get_conversation(conv_id, user_id, with_messages=False)
+        return self.get_conversation(conv_id, user_id, with_messages=False, is_admin=is_admin)
 
     # ------------------------------------------------------------ messages --
 
@@ -636,10 +699,52 @@ class ChatDB:
 
     # ------------------------------------------------------------- uploads --
 
-    def record_upload(self, filename: str, size: int, user_id: str) -> None:
+    def record_upload(self, filename: str, size: int, doc_sha: str, user_id: str) -> dict:
+        row = {"id": uuid.uuid4().hex, "filename": filename, "bytes": size, "doc_sha": doc_sha,
+               "created_at": time.time()}
         with self._conn() as db:
-            db.execute("INSERT INTO uploads (id, user_id, filename, bytes, created_at) VALUES (?, ?, ?, ?, ?)",
-                       (uuid.uuid4().hex, user_id, filename, size, time.time()))
+            db.execute("INSERT INTO uploads (id, user_id, filename, bytes, doc_sha, created_at) "
+                       "VALUES (?, ?, ?, ?, ?, ?)",
+                       (row["id"], user_id, filename, size, doc_sha, row["created_at"]))
+        return row
+
+    def list_uploads(self, user_id: str) -> list[dict]:
+        """This user's uploads, newest first, leaving out ones they deleted."""
+        with self._conn() as db:
+            return [dict(r) for r in db.execute(
+                "SELECT id, filename, bytes, doc_sha, created_at FROM uploads "
+                "WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC", (user_id,))]
+
+    def get_upload(self, upload_id: str, user_id: str) -> dict:
+        """One of this user's live uploads; NotFound for anyone else's, same
+        as for one that doesn't exist or was deleted."""
+        with self._conn() as db:
+            row = db.execute("SELECT id, filename, bytes, doc_sha, created_at FROM uploads "
+                             "WHERE id = ? AND user_id = ? AND deleted_at IS NULL", (upload_id, user_id)).fetchone()
+        if row is None:
+            raise NotFound(upload_id)
+        return dict(row)
+
+    def document_held_by_others(self, doc_sha: str, user_id: str) -> bool:
+        """Whether someone other than this user has a live upload of this
+        document -- their own copy of the same bytes, which deleting this
+        user's upload must not take away."""
+        with self._conn() as db:
+            return db.execute("SELECT 1 FROM uploads WHERE doc_sha = ? AND user_id != ? AND deleted_at IS NULL",
+                              (doc_sha, user_id)).fetchone() is not None
+
+    def delete_uploads(self, doc_sha: str, user_id: str) -> list[str]:
+        """Marks every live upload this user made of this document deleted --
+        uploading the same file twice is still one document -- and returns
+        their inbox filenames. The rows stay, for the quota (see the
+        deleted_at column)."""
+        with self._conn() as db:
+            names = [r["filename"] for r in db.execute(
+                "SELECT filename FROM uploads WHERE doc_sha = ? AND user_id = ? AND deleted_at IS NULL",
+                (doc_sha, user_id))]
+            db.execute("UPDATE uploads SET deleted_at = ? WHERE doc_sha = ? AND user_id = ? AND deleted_at IS NULL",
+                       (time.time(), doc_sha, user_id))
+        return names
 
     def upload_usage(self, window_seconds: float, user_id: str) -> tuple[int, int]:
         """How many files this user uploaded within the window, and their total
@@ -664,6 +769,7 @@ class ChatDB:
         with self._conn() as db:
             rows = db.execute(
                 f"""SELECT filename, user_id FROM uploads u WHERE filename IN ({placeholders})
+                    AND deleted_at IS NULL
                     AND created_at = (SELECT MAX(created_at) FROM uploads WHERE filename = u.filename)""",
                 tuple(filenames)).fetchall()
         return {r["filename"]: r["user_id"] for r in rows}

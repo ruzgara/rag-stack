@@ -7,8 +7,8 @@ Native API (for the rag-stack UI) under /api, OpenAI-compatible API under /v1
   uvicorn api:app --host 127.0.0.1 --port $QUERY_PORT
 
 It binds to 127.0.0.1. Every endpoint except /api/health identifies its
-caller -- a signed session cookie, a proxy header, or QUERY_API_KEY as the
-service account -- and, where it matters, checks what that caller may do
+caller -- a signed session cookie, a proxy header, a personal API token, or
+QUERY_API_KEY as the service account -- and, where it matters, checks what that caller may do
 (see accounts.py: library ownership and sharing, and users.is_admin for
 everything else). Admins additionally get /api/admin/system, which edits
 .env and reloads the service; the admin UI for all of it is served at
@@ -41,10 +41,11 @@ from pydantic import BaseModel, Field
 
 from chat import ChatConfig, ChatError, ChatService
 from accounts import Accounts, Denied, Invalid, User
-from auth import SESSION_MAX_AGE, Auth, as_http_error, hash_password, session_secret, verify_password
+from auth import SESSION_MAX_AGE, Auth, as_http_error, bearer_token, hash_password, session_secret, verify_password
 import settings
-from db import ChatDB, NotFound, WorkspaceLibraries
+from db import ADMIN_WORKSPACE_ID, ChatDB, NotFound, WorkspaceLibraries
 from limits import Busy, Gate, GateConfig, UploadLimits
+from purge import purge_document
 from retrieval import REPO_ROOT, Retriever, SearchConfig, load_env
 
 DATA_DIR = REPO_ROOT / "data"
@@ -190,16 +191,19 @@ SERVICE_ACCOUNT_EMAIL = "service@rag-stack.local"
 
 
 def service_key_user(request: Request) -> User | None:
-    """The caller presenting QUERY_API_KEY, as a user. Scripts and the
-    OpenAI-compatible endpoint authenticate this way; the key is a service
-    account with its own row and its own grants, not a way past them."""
+    """The caller presenting QUERY_API_KEY, as a user: one shared service
+    account with its own row and its own library access, not a way past it. For a
+    script or client acting as a particular person, a personal token
+    (/api/tokens) is the better fit -- it gets that person's libraries,
+    queue share and quota, and can be revoked on its own."""
     if not state.api_key or request.headers.get("authorization", "") != f"Bearer {state.api_key}":
         return None
     account = state.accounts.by_email(SERVICE_ACCOUNT_EMAIL)
     if not account:
-        # Created on first use so its conversations and quota are its own.
-        account = state.accounts.create_user(SERVICE_ACCOUNT_EMAIL, display_name="API key",
-                                             is_admin=not state.accounts.any_users())
+        # Created on first use so its conversations and quota are its own --
+        # never as an admin, even on an empty install: admins are only ever
+        # made at the terminal (ragctl user add --admin / ragctl user admin).
+        account = state.accounts.create_user(SERVICE_ACCOUNT_EMAIL, display_name="API key")
     return account
 
 
@@ -212,9 +216,8 @@ def current_user(request: Request) -> User:
 
 
 def admin(user: User = Depends(current_user)) -> User:
-    """The only admin concept there is: users.is_admin. No partial admins --
-    users.manage and libraries.manage are gone, so this one dependency
-    covers every admin-only route."""
+    """The only admin concept there is: users.is_admin. There are no partial
+    admins, so this one dependency covers every admin-only route."""
     if not user.is_admin:
         raise HTTPException(403, "only an admin can do this")
     return user
@@ -253,18 +256,30 @@ class PasswordChange(BaseModel):
     new_password: str
 
 
+class NewToken(BaseModel):
+    name: str
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)  # null: never
+
+
 class NewUser(BaseModel):
+    """No is_admin: admin accounts are only managed at the terminal (see
+    ADMIN_ACCOUNTS_AT_TERMINAL). Forbidding extra fields makes a client still
+    sending is_admin fail loudly rather than quietly get a member."""
     email: str
     password: str | None = None      # omitted in proxy mode
     display_name: str
-    is_admin: bool = False
+
+    model_config = {"extra": "forbid"}
 
 
 class UserUpdate(BaseModel):
+    """No is_admin, for the same reason as NewUser: promoting and demoting
+    are both terminal-only."""
     display_name: str | None = None
-    is_admin: bool | None = None
     disabled: bool | None = None
     password: str | None = None
+
+    model_config = {"extra": "forbid"}
 
 
 class NewGroup(BaseModel):
@@ -345,6 +360,44 @@ def search_users(q: str = Query(..., min_length=1), user: User = CurrentUser) ->
                        for u in state.accounts.search_users(q)]}
 
 
+# ----------------------------------------------------------------- tokens --
+# Personal API tokens: Authorization: Bearer rsk_... acts as the user who made
+# it (see auth.py), for scripts and OpenAI-compatible clients. Each user sees
+# and revokes only their own; an admin revokes other people's with `ragctl
+# user token`, or by disabling the user, which stops their tokens at once.
+
+
+@app.get("/api/tokens")
+def list_tokens(user: User = CurrentUser) -> dict:
+    return {"tokens": state.accounts.tokens(user.id)}
+
+
+@app.post("/api/tokens", status_code=201)
+def create_token(body: NewToken, request: Request, user: User = CurrentUser) -> dict:
+    """Makes a token and returns it, in `token` -- the only time it can be
+    read, since only its hash is kept. Needs a signed-in session: a token
+    can't make more tokens, or one that leaked could mint replacements that
+    outlive revoking it."""
+    if bearer_token(request):
+        raise HTTPException(403, "sign in to create a token; a token can't create another")
+    expires_at = time.time() + body.expires_in_days * 86400 if body.expires_in_days else None
+    try:
+        token, row = state.accounts.create_token(user.id, body.name, expires_at)
+    except Invalid as exc:
+        raise as_http_error(exc) from None
+    return {**row, "token": token}
+
+
+@app.delete("/api/tokens/{token_id}", status_code=204)
+def revoke_token(token_id: str, user: User = CurrentUser) -> None:
+    """Revoking works with the token itself too -- the quickest way to kill
+    one that leaked."""
+    try:
+        state.accounts.revoke_token(token_id, user.id)
+    except NotFound:
+        raise HTTPException(404, "no such token") from None
+
+
 # ------------------------------------------------------------------ admin --
 # What the admin UI at /admin calls, and what `ragctl user` does locally --
 # the two are deliberately the same set of operations.
@@ -362,21 +415,42 @@ def admin_create_user(body: NewUser, admin: User = Admin) -> dict:
         password_hash = hash_password(body.password) if body.password else None
         if state.auth.mode == "password" and not password_hash:
             raise Invalid("a password is required while QUERY_AUTH_MODE=password")
-        user = state.accounts.create_user(body.email, password_hash, body.display_name, body.is_admin)
+        user = state.accounts.create_user(body.email, password_hash, body.display_name)
     except Invalid as exc:
         raise as_http_error(exc) from None
     return user.public()
 
 
+# Admin accounts are only ever managed at the terminal (ragctl user): made,
+# promoted, demoted, renamed, re-passworded, disabled and deleted. Over HTTP
+# an admin manages members and nothing more, so taking over one admin session
+# -- or the console -- can't mint admins, lock the others out, or remove
+# them. An admin's own self-service (their password with the current one,
+# their tokens) is the same as any user's and stays on the API.
+ADMIN_ACCOUNTS_AT_TERMINAL = "admin accounts are managed at the terminal: ragctl user"
+
+
+def _member_account(user_id: str) -> User:
+    """The target of an admin-console action, if it's a member: 404 for no
+    such user, 403 for an admin account."""
+    try:
+        target = state.accounts.user(user_id)
+    except NotFound:
+        raise HTTPException(404, "no such user") from None
+    if target.is_admin:
+        raise HTTPException(403, ADMIN_ACCOUNTS_AT_TERMINAL)
+    return target
+
+
 @app.patch("/api/admin/users/{user_id}")
 def admin_update_user(user_id: str, body: UserUpdate, admin: User = Admin) -> dict:
-    if user_id == admin.id and body.disabled:
-        raise HTTPException(400, "you can't disable your own account")
+    """Members only -- an admin account (the caller's own included) is
+    managed at the terminal; see _member_account."""
+    _member_account(user_id)
     try:
         if body.password:
             state.accounts.set_password(user_id, hash_password(body.password))
-        user = state.accounts.update_user(user_id, display_name=body.display_name, is_admin=body.is_admin,
-                                          disabled=body.disabled)
+        user = state.accounts.update_user(user_id, display_name=body.display_name, disabled=body.disabled)
     except NotFound:
         raise HTTPException(404, "no such user") from None
     except Invalid as exc:
@@ -386,8 +460,8 @@ def admin_update_user(user_id: str, body: UserUpdate, admin: User = Admin) -> di
 
 @app.delete("/api/admin/users/{user_id}", status_code=204)
 def admin_delete_user(user_id: str, admin: User = Admin) -> None:
-    if user_id == admin.id:
-        raise HTTPException(400, "you can't delete your own account")
+    """Members only, same as admin_update_user."""
+    _member_account(user_id)
     try:
         state.accounts.delete_user(user_id)
     except NotFound:
@@ -785,14 +859,17 @@ def admin_list_documents(admin: User = Admin) -> dict:
 # holding the libraries and chats it was given. Deleting one is a soft
 # delete (see ChatDB.delete_workspace) that also hides its chats, though
 # neither is actually removed; libraries themselves stay regardless, since
-# they're the global, admin-managed rows from the section above. A chat in a
+# they belong to their owners (the section above), not to the workspace. A
+# workspace can only attach libraries its owner can read. The one exception
+# to "owned by one person" is the admin workspace (db.ADMIN_WORKSPACE_ID),
+# shared by every admin and invisible to everyone else. A chat in a
 # workspace searches the workspace's libraries as they are at each turn, so
 # changing them here changes what every chat in it searches.
 
 
 def _get_workspace(workspace_id: str, user: User) -> dict:
     try:
-        return state.db.get_workspace(workspace_id, user_id=user.id)
+        return state.db.get_workspace(workspace_id, user_id=user.id, is_admin=user.is_admin)
     except NotFound:
         raise HTTPException(404, "workspace not found") from None
 
@@ -808,7 +885,7 @@ def create_workspace(body: NewWorkspace, user: User = CurrentUser) -> dict:
 @app.get("/api/workspaces")
 def list_workspaces(deleted: bool = False, user: User = CurrentUser) -> dict:
     """The workspace list; pass `?deleted=true` for the Recently Deleted tray."""
-    return {"workspaces": state.db.list_workspaces(user_id=user.id, deleted=deleted)}
+    return {"workspaces": state.db.list_workspaces(user_id=user.id, is_admin=user.is_admin, deleted=deleted)}
 
 
 @app.get("/api/workspaces/{workspace_id}")
@@ -821,10 +898,12 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Curr
     name = body.name.strip() if body.name is not None else None
     if name == "":
         raise HTTPException(422, "a workspace needs a name")
+    if workspace_id == ADMIN_WORKSPACE_ID and name is not None:
+        raise HTTPException(403, "the admin workspace can't be renamed")
     _check_libraries(user, body.library_ids)
     try:
         return state.db.update_workspace(workspace_id, name=name, description=body.description,
-                                         library_ids=body.library_ids, user_id=user.id)
+                                         library_ids=body.library_ids, user_id=user.id, is_admin=user.is_admin)
     except NotFound:
         raise HTTPException(404, "workspace not found") from None
 
@@ -832,7 +911,10 @@ def update_workspace(workspace_id: str, body: WorkspaceUpdate, user: User = Curr
 @app.delete("/api/workspaces/{workspace_id}", status_code=204)
 def delete_workspace(workspace_id: str, user: User = CurrentUser) -> None:
     """Marks the workspace deleted, which also hides its chats -- see
-    ChatDB.delete_workspace. Nothing is actually removed."""
+    ChatDB.delete_workspace. Nothing is actually removed. The admin
+    workspace can't be deleted: it's where deleted users' libraries go."""
+    if workspace_id == ADMIN_WORKSPACE_ID:
+        raise HTTPException(403, "the admin workspace can't be deleted")
     try:
         state.db.delete_workspace(workspace_id, user_id=user.id)
     except NotFound:
@@ -852,7 +934,7 @@ def restore_workspace(workspace_id: str, user: User = CurrentUser) -> dict:
 @app.get("/api/workspaces/{workspace_id}/conversations")
 def list_workspace_conversations(workspace_id: str, user: User = CurrentUser) -> list[dict]:
     _get_workspace(workspace_id, user)  # 404 if missing or not this user's
-    return state.db.list_conversations(user_id=user.id, workspace_id=workspace_id)
+    return state.db.list_conversations(user_id=user.id, is_admin=user.is_admin, workspace_id=workspace_id)
 
 
 # ------------------------------------------------------------ conversations --
@@ -899,7 +981,7 @@ def _check_libraries(user: User, library_ids: list[str] | None) -> None:
 
 def _get_conversation(conv_id: str, user: User, with_messages: bool = True) -> dict:
     try:
-        return state.db.get_conversation(conv_id, user_id=user.id, with_messages=with_messages)
+        return state.db.get_conversation(conv_id, user_id=user.id, is_admin=user.is_admin, with_messages=with_messages)
     except NotFound:
         raise HTTPException(404, "conversation not found") from None
 
@@ -923,7 +1005,7 @@ def list_conversations(deleted: bool = False, archived: bool = False, user: User
     """The chat list; pass `?deleted=true` for the Recently Deleted tray or
     `?archived=true` for the Archived list (mutually exclusive -- `deleted`
     wins if both are set)."""
-    return state.db.list_conversations(user_id=user.id, deleted=deleted, archived=archived)
+    return state.db.list_conversations(user_id=user.id, is_admin=user.is_admin, deleted=deleted, archived=archived)
 
 
 @app.get("/api/conversations/{conv_id}")
@@ -937,7 +1019,7 @@ def update_conversation(conv_id: str, body: ConversationUpdate, user: User = Cur
     _check_libraries(user, body.library_ids)
     try:
         return state.db.update_conversation(conv_id, title=body.title, preset=preset,
-                                            library_ids=body.library_ids, user_id=user.id)
+                                            library_ids=body.library_ids, user_id=user.id, is_admin=user.is_admin)
     except NotFound:
         raise HTTPException(404, "conversation not found") from None
     except WorkspaceLibraries as exc:
@@ -957,7 +1039,7 @@ def delete_conversation(conv_id: str, user: User = CurrentUser) -> None:
 @app.post("/api/conversations/{conv_id}/restore")
 def restore_conversation(conv_id: str, user: User = CurrentUser) -> dict:
     try:
-        return state.db.restore_conversation(conv_id, user_id=user.id)
+        return state.db.restore_conversation(conv_id, user_id=user.id, is_admin=user.is_admin)
     except NotFound:
         raise HTTPException(404, "conversation not found") from None
 
@@ -968,7 +1050,7 @@ def archive_conversation(conv_id: str, user: User = CurrentUser) -> dict:
     out of the normal list (`GET /api/conversations?archived=true` to see
     it). A deleted chat can't be archived; restore it first."""
     try:
-        return state.db.archive_conversation(conv_id, user_id=user.id)
+        return state.db.archive_conversation(conv_id, user_id=user.id, is_admin=user.is_admin)
     except NotFound:
         raise HTTPException(404, "conversation not found") from None
 
@@ -976,7 +1058,7 @@ def archive_conversation(conv_id: str, user: User = CurrentUser) -> dict:
 @app.post("/api/conversations/{conv_id}/unarchive")
 def unarchive_conversation(conv_id: str, user: User = CurrentUser) -> dict:
     try:
-        return state.db.unarchive_conversation(conv_id, user_id=user.id)
+        return state.db.unarchive_conversation(conv_id, user_id=user.id, is_admin=user.is_admin)
     except NotFound:
         raise HTTPException(404, "conversation not found") from None
 
@@ -1010,7 +1092,7 @@ def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], p
                 if first_turn and not has_title:
                     title = state.chat.generate_title(preset, question, r.answer)
                     if title:
-                        state.db.update_conversation(conv_id, title=title, user_id=user.id)
+                        state.db.update_conversation(conv_id, title=title, user_id=user.id, is_admin=user.is_admin)
                         yield sse("title", {"title": title})
                 continue
             if kind == "token":
@@ -1088,7 +1170,7 @@ def send_message(conv_id: str, body: NewMessage, user: User = CurrentUser) -> St
     doc_shas = state.accounts.document_scope(user.id, conv["library_ids"])
     library_overview = state.accounts.library_overview(user.id, conv["library_ids"])
     if conv["workspace_id"]:
-        state.db.touch_workspace(conv["workspace_id"], user_id=user.id)
+        state.db.touch_workspace(conv["workspace_id"], user_id=user.id, is_admin=user.is_admin)
 
     def stream() -> Iterator[str]:
         history = state.db.history(conv_id, user_id=user.id)
@@ -1123,7 +1205,7 @@ def retry_message(conv_id: str, user: User = CurrentUser) -> StreamingResponse:
     doc_shas = state.accounts.document_scope(user.id, conv["library_ids"])
     library_overview = state.accounts.library_overview(user.id, conv["library_ids"])
     if conv["workspace_id"]:
-        state.db.touch_workspace(conv["workspace_id"], user_id=user.id)
+        state.db.touch_workspace(conv["workspace_id"], user_id=user.id, is_admin=user.is_admin)
 
     def stream() -> Iterator[str]:
         history = state.db.history(conv_id, user_id=user.id)
@@ -1176,6 +1258,11 @@ def _manifest_documents() -> dict[str, dict]:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if rec.get("status") == "deleted":
+                    # Its uploader deleted it (purge.py): gone, until a
+                    # later row says it was ingested again.
+                    latest.pop(rec["sha256"], None)
                     continue
                 prev = latest.get(rec["sha256"])
                 # A failed re-run doesn't undo an earlier success.
@@ -1278,14 +1365,59 @@ def upload(files: list[UploadFile] = File(...), *, library_id: Annotated[str, Fo
             os.unlink(tmp.name)
             rejected.append({"filename": name, "reason": reason})
             continue
-        state.accounts.add_document(library_id, _sha256(Path(tmp.name)))
+        sha = _sha256(Path(tmp.name))
+        state.accounts.add_document(library_id, sha)
         dest = _claim_inbox_name(name, tmp.name)
         files_used, bytes_used = files_used + 1, bytes_used + size
-        state.db.record_upload(dest.name, size, user_id=user.id)
+        state.db.record_upload(dest.name, size, sha, user_id=user.id)
         saved.append(dest.name)
     status = state.ingest.trigger() if saved else "nothing to ingest"
     return {"saved": saved, "rejected": rejected, "ingest": status,
             "quota": limits.remaining(files_used, bytes_used)}
+
+
+@app.get("/api/uploads")
+def list_uploads(user: User = CurrentUser) -> dict:
+    """Your uploads, newest first, each with where it stands: "waiting" in
+    the inbox, or the ingest outcome ("processed", "failed") once it ran."""
+    manifest = _manifest_documents()
+    out = []
+    for up in state.db.list_uploads(user.id):
+        if (INBOX / up["filename"]).is_file():
+            status = "waiting"
+        else:
+            status = (manifest.get(up["doc_sha"]) or {}).get("status", "unknown")
+        out.append({**up, "status": status})
+    return {"uploads": out}
+
+
+@app.delete("/api/uploads/{upload_id}")
+def delete_upload(upload_id: str, user: User = CurrentUser) -> dict:
+    """Deletes your upload, and with it the document -- from every library,
+    the index, and the disk (see purge.py) -- so a shared copy can't outlive
+    you taking it back. The exception is a document someone else uploaded
+    too, independently: it's theirs as much as yours, so only your upload
+    goes, along with the document's place in the libraries you own.
+    `purged` says which happened. Any other uploads you made of the same
+    file go with it, since they're the same document."""
+    try:
+        upload = state.db.get_upload(upload_id, user.id)
+    except NotFound:
+        raise HTTPException(404, "no such upload") from None
+    sha = upload["doc_sha"]
+    if state.db.document_held_by_others(sha, user.id):
+        state.accounts.remove_document_from_owned(sha, user.id)
+        state.db.delete_uploads(sha, user.id)
+        return {"purged": False}
+    names = [u["filename"] for u in state.db.list_uploads(user.id) if u["doc_sha"] == sha]
+    try:
+        purge_document(sha, retriever=state.retriever, data_dir=DATA_DIR, inbox=INBOX, manifest=MANIFEST,
+                       inbox_names=names)
+    except (RuntimeError, httpx.HTTPError) as exc:
+        raise HTTPException(503, f"couldn't remove it from the index, nothing was deleted: {exc}") from None
+    state.accounts.drop_document(sha)
+    state.db.delete_uploads(sha, user.id)
+    return {"purged": True}
 
 
 def _claim_inbox_name(name: str, written: str) -> Path:

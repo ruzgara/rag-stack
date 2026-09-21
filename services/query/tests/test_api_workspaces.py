@@ -9,7 +9,7 @@ from __future__ import annotations
 import api
 import pytest
 from accounts import Accounts
-from db import ChatDB
+from db import ADMIN_WORKSPACE_ID, ChatDB
 from fastapi import HTTPException
 
 
@@ -200,3 +200,38 @@ def test_restoring_a_workspace_makes_its_conversations_reachable_again(member):
 
     assert api.get_conversation(conv["id"], user=member)["id"] == conv["id"]
     assert [c["id"] for c in api.list_workspace_conversations(ws["id"], user=member)] == [conv["id"]]
+
+
+# ---------------------------------------------------------- admin workspace --
+
+@pytest.fixture
+def admin(acc):
+    return acc.create_user("admin@example.com", display_name="Admin", is_admin=True)
+
+
+def test_only_admins_can_reach_the_admin_workspace(admin, member):
+    assert ADMIN_WORKSPACE_ID in [w["id"] for w in api.list_workspaces(user=admin)["workspaces"]]
+    assert ADMIN_WORKSPACE_ID not in [w["id"] for w in api.list_workspaces(user=member)["workspaces"]]
+    with pytest.raises(HTTPException) as exc:
+        api.get_workspace(ADMIN_WORKSPACE_ID, user=member)
+    assert exc.value.status_code == 404
+    with pytest.raises(HTTPException):
+        api.create_conversation(api.NewConversation(workspace_id=ADMIN_WORKSPACE_ID), user=member)
+
+
+def test_an_admin_can_chat_in_the_admin_workspace_and_manage_its_libraries(acc, admin, member):
+    lib = api.create_library(api.NewLibrary(name="Orphans"), user=member)
+    conv = api.create_conversation(api.NewConversation(workspace_id=ADMIN_WORKSPACE_ID), user=admin)
+    api.update_workspace(ADMIN_WORKSPACE_ID, api.WorkspaceUpdate(library_ids=[lib["id"]]), user=admin)
+
+    assert api.get_conversation(conv["id"], user=admin)["library_ids"] == [lib["id"]]
+    api.archive_conversation(conv["id"], user=admin)  # re-reads the chat; must not 404 for an admin
+    api.unarchive_conversation(conv["id"], user=admin)
+
+
+def test_the_admin_workspace_cannot_be_renamed_or_deleted(admin):
+    for call in (lambda: api.update_workspace(ADMIN_WORKSPACE_ID, api.WorkspaceUpdate(name="Mine"), user=admin),
+                 lambda: api.delete_workspace(ADMIN_WORKSPACE_ID, user=admin)):
+        with pytest.raises(HTTPException) as exc:
+            call()
+        assert exc.value.status_code == 403

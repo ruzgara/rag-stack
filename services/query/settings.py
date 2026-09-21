@@ -22,9 +22,9 @@ Three things make writing it from a browser safe enough to do at all:
 
 Secrets are not masked. Masking cannot round-trip -- the mask would be saved
 back over the real value -- so the whole file is shown as it is, and reaching
-it requires an admin account (api.py gates these endpoints on is_admin, not
-on a grantable permission, because editing .env can set QUERY_AUTH_MODE=proxy
-and hand identity to anyone who can set a header).
+it requires an admin account (api.py gates these endpoints on is_admin, which
+only the terminal can grant -- ragctl user admin -- because editing .env can
+set QUERY_AUTH_MODE=proxy and hand identity to anyone who can set a header).
 
 Reload works in tiers, because not everything is reachable from inside the
 running process. `impact()` diffs the old and new text and says which tier an

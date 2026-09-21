@@ -50,6 +50,13 @@ def test_the_service_key_acts_as_its_own_account(service):
     assert service.by_email(api.SERVICE_ACCOUNT_EMAIL) is not None
 
 
+def test_the_service_account_is_never_an_admin_even_on_an_empty_install(service):
+    """Otherwise whoever held the key before anyone ran ragctl user add
+    --admin would own the install."""
+    assert service.users() == []
+    assert api.current_user(FakeRequest({"authorization": "Bearer secret-key"})).is_admin is False
+
+
 def test_the_service_account_is_reused_not_recreated(service):
     first = api.current_user(FakeRequest({"authorization": "Bearer secret-key"}))
     second = api.current_user(FakeRequest({"authorization": "Bearer secret-key"}))
@@ -89,6 +96,87 @@ def test_the_admin_dependency_refuses_and_allows(service):
 
     admin = service.update_user(user.id, is_admin=True)
     assert api.admin(admin).id == user.id
+
+
+# --------------------------------------------------------- personal tokens --
+
+def signed_in(user) -> FakeRequest:
+    return FakeRequest(session={"user_id": user.id, "epoch": user.session_epoch})
+
+
+def bearing(token: str) -> FakeRequest:
+    return FakeRequest({"authorization": f"Bearer {token}"})
+
+
+def test_a_personal_token_acts_as_its_owner(service):
+    member = service.create_user("member@example.com", "hash", display_name="Member")
+    made = api.create_token(api.NewToken(name="script"), signed_in(member), user=member)
+
+    assert api.current_user(bearing(made["token"])).id == member.id
+
+
+def test_a_bad_token_is_refused_even_alongside_a_valid_session(service):
+    """Presenting a credential means to be identified by it -- a dead token
+    doesn't quietly fall back to whatever cookie came along."""
+    member = service.create_user("member@example.com", "hash", display_name="Member")
+    request = signed_in(member)
+    request.headers = {"authorization": "Bearer rsk_revoked-or-made-up"}
+
+    with pytest.raises(HTTPException) as exc:
+        api.current_user(request)
+    assert exc.value.status_code == 401
+
+
+def test_a_token_is_returned_once_and_listed_without_it(service):
+    member = service.create_user("member@example.com", "hash", display_name="Member")
+    made = api.create_token(api.NewToken(name="script", expires_in_days=30), signed_in(member), user=member)
+
+    [listed] = api.list_tokens(user=member)["tokens"]
+    assert listed["id"] == made["id"] and "token" not in listed
+    assert listed["expires_at"] is not None
+
+
+def test_a_token_cannot_create_another_token(service):
+    member = service.create_user("member@example.com", "hash", display_name="Member")
+    token = api.create_token(api.NewToken(name="script"), signed_in(member), user=member)["token"]
+
+    with pytest.raises(HTTPException) as exc:
+        api.create_token(api.NewToken(name="copy"), bearing(token), user=member)
+    assert exc.value.status_code == 403
+
+
+def test_a_user_only_sees_and_revokes_their_own_tokens(service):
+    member = service.create_user("member@example.com", "hash", display_name="Member")
+    other = service.create_user("other@example.com", "hash", display_name="Other")
+    made = api.create_token(api.NewToken(name="script"), signed_in(member), user=member)
+
+    assert api.list_tokens(user=other)["tokens"] == []
+    with pytest.raises(HTTPException) as exc:
+        api.revoke_token(made["id"], user=other)
+    assert exc.value.status_code == 404
+
+    api.revoke_token(made["id"], user=member)
+    with pytest.raises(HTTPException):
+        api.current_user(bearing(made["token"]))
+
+
+def test_a_token_carries_its_users_current_standing_not_a_snapshot(service):
+    admin = service.create_user("admin@example.com", "hash", display_name="Admin", is_admin=True)
+    token = api.create_token(api.NewToken(name="script"), signed_in(admin), user=admin)["token"]
+    assert api.admin(api.current_user(bearing(token))).id == admin.id
+
+    service.update_user(admin.id, is_admin=False)
+
+    with pytest.raises(HTTPException) as exc:
+        api.admin(api.current_user(bearing(token)))
+    assert exc.value.status_code == 403
+
+
+def test_a_token_needs_a_name(service):
+    member = service.create_user("member@example.com", "hash", display_name="Member")
+    with pytest.raises(HTTPException) as exc:
+        api.create_token(api.NewToken(name="  "), signed_in(member), user=member)
+    assert exc.value.status_code == 400
 
 
 # ------------------------------------------------- the streaming turn path --

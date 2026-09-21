@@ -339,8 +339,10 @@ ingest and embed run automatically whenever a file lands in `data/inbox/`.
 `ragctl up` starts the query service (`services/query/api.py`) on
 `http://127.0.0.1:$QUERY_PORT` (default 8088). Interactive API docs are at
 `/docs`. Every endpoint but `/api/health` and `/api/auth/login` needs a
-signed-in caller (see "Accounts, groups and libraries"), and `QUERY_API_KEY`
-authenticates scripts as a service account. It still binds to 127.0.0.1: the
+signed-in caller (see "Accounts, groups and libraries"). Scripts and API
+clients authenticate as a person with a personal token
+(`Authorization: Bearer rsk_...`), or as a shared service account with
+`QUERY_API_KEY`. It still binds to 127.0.0.1: the
 accounts are real, but passwords over a LAN want TLS in front first.
 
 **Each answer:**
@@ -388,6 +390,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
 | `GET /api/documents` | processed documents you can read (admins: all), your files waiting in the inbox (admins: everyone's), upload-ingest status |
 | `POST /api/upload` | multipart `files` + `library_id` (required) → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
+| `GET /api/uploads` · `DELETE /api/uploads/{id}` | your uploads (each `waiting`, `processed` or `failed`); delete one, which purges the document from every library, the index and the disk -- unless another user uploaded the same file too, when only yours goes (`{purged: true/false}`). Deleted uploads still count against the quota |
 | `GET /api/quota` | what's left of your upload allowance, and how busy the machine is |
 | `GET /api/libraries` | libraries the caller can read, each with `role` (`owner`/`write`/`read`), `owner_name`, and `source` (`owner`/`admin`/`user`/`group` — why the caller can see it) |
 | `POST /api/libraries` | any signed-in user creates a library (`{name, description?}`) and becomes its owner -- full access right away, no separate grant |
@@ -400,7 +403,8 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `POST /api/auth/login` · `POST /api/auth/logout` | `{email, password}` → sets the session cookie; clear it |
 | `GET /api/auth/me` | `{user, auth_mode}` — what a UI renders itself from; `user.is_admin` is the only global permission fact, everything else is per library |
 | `POST /api/auth/password` | `{current_password, new_password}`, which signs your other sessions out |
-| `/api/admin/users` · `/api/admin/groups` | users, groups and memberships (admin-only: `users.is_admin`); what the admin console calls |
+| `GET` · `POST /api/tokens` · `DELETE /api/tokens/{id}` | your personal API tokens: list them (never the tokens themselves), make one (`{name, expires_in_days?}` → the token, shown only this once; needs a signed-in session, not another token), revoke one |
+| `/api/admin/users` · `/api/admin/groups` | users, groups and memberships (admin-only: `users.is_admin`); what the admin console calls. Creates and manages members only -- any change to an admin account is a 403 (`ragctl user`) |
 | `GET /api/admin/documents` | every indexed document on the machine, unfiltered, for assigning into libraries (admin-only) |
 | `GET /api/health` | Ollama, the Qdrant collection, the database, reranker device, presets, current load |
 
@@ -419,7 +423,7 @@ not, so any OpenAI client works:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8088/v1", api_key="unused")  # or QUERY_API_KEY
+client = OpenAI(base_url="http://127.0.0.1:8088/v1", api_key="rsk_...")  # a personal token, or QUERY_API_KEY
 client.chat.completions.create(model="everyday", messages=[{"role": "user", "content": "What is a mini-perm loan?"}])
 ```
 
@@ -531,9 +535,17 @@ reboot (or run `launchctl unsetenv <VAR>` to clear it immediately).
 Everyone who uses the service has an account: an email, a name, a password,
 and (unless they're an admin) whatever libraries they own or were given
 access to. There is no self-registration — an admin creates accounts, from
-the command line today and from an admin page later. There are no partial
-admins and no permission to ask questions at all: every account can chat,
-and `users.is_admin` is the only global privilege there is.
+the command line or the admin console at `/admin`. Admin accounts are the
+exception: making, demoting, renaming, re-passwording, disabling or deleting
+one is only ever done at the terminal (`ragctl user ...`), never over HTTP —
+the API and admin console refuse any change to an admin account, the
+caller's own included, and signing in first through a proxy or with the
+service key never makes anyone an admin. So a stolen admin session can
+manage members, but can't mint admins or lock the real ones out. An admin's
+own self-service (`POST /api/auth/password`, their tokens) works as it does
+for anyone. There are no partial admins and no permission to ask questions
+at all: every account can chat, and `users.is_admin` is the only global
+privilege there is.
 
 ```
 ragctl user add you@example.com --name "Your Name" --admin     # the first admin (prompts for a password)
@@ -541,6 +553,8 @@ ragctl user add alice@example.com --name "Alice"                # a colleague
 ragctl user group add Analysts
 ragctl user member add Analysts alice@example.com
 ragctl user passwd alice@example.com         # reset a password (signs them out)
+ragctl user rename alice@example.com --name "Alice Smith"
+ragctl user admin alice@example.com [--revoke]   # promote or demote -- terminal only
 ragctl user list                            # who exists, and their groups
 ```
 
@@ -569,9 +583,19 @@ argon2id by `pwdlib`, and the cookie is signed by Starlette's session
 middleware — no scheme is invented here. There is no session table: the
 cookie carries the user id and a `session_epoch`, both checked against the
 row on every request, so disabling a user or changing a password takes effect
-at once. `QUERY_API_KEY` still works for scripts and the OpenAI-compatible
-endpoint, as a service account with its own row rather than a way past
-anything.
+at once.
+
+**Personal API tokens** are how a script or an OpenAI-compatible client acts
+as a particular person, with that person's libraries, queue share and upload
+quota. Make one with `POST /api/tokens` while signed in, or
+`ragctl user token add alice@example.com --name "laptop script"`. It's shown
+once; only a sha256 of it is stored. A token has no permissions of its own:
+every request re-reads its user, so disabling, demoting or deleting them
+applies to their tokens at once. Changing a password doesn't revoke tokens --
+revoke them explicitly (`DELETE /api/tokens/{id}`, which works with the token
+itself, or `ragctl user token revoke`). A token can't make more tokens, so a
+leaked one can't mint replacements. `QUERY_API_KEY` still works too, as one
+shared service account with its own row rather than a way past anything.
 
 **SSO later.** Identity arrives through one seam, so `QUERY_AUTH_MODE=proxy`
 switches the service to trusting an authenticating reverse proxy's header
@@ -599,6 +623,9 @@ ragctl user library list
 ragctl user library share "Project finance" alice@example.com read   # or write; a user or a group
 ragctl user library unshare "Project finance" alice@example.com
 ragctl user library delete "Project finance"      # its access list and chat attachments go too
+ragctl user token add alice@example.com --name "laptop script" --expires-days 90   # prints it once
+ragctl user token list alice@example.com
+ragctl user token revoke alice@example.com <token id>
 ```
 
 `GET /api/libraries` lists the libraries the caller can read, each with its
@@ -639,6 +666,30 @@ takes effect on the next question, not the next attach:
   fresh chat isn't silently mute until someone picks something.
 - Someone who can read **no** library gets no results, not an unfiltered
   search — an empty selection and no selection are different states.
+
+**Deleting an upload** (`DELETE /api/uploads/{id}`) takes the document back
+completely: out of every library — including any a reader copied it into
+from one it was shared through — out of Qdrant, and off the disk (the
+original, its markdown and docling JSON). The manifest gets a `deleted` row,
+which ingest, embed and the query service all read as cancelling the
+`processed` rows before it, so the same file can be uploaded again later.
+The one exception is a document another user uploaded too, independently:
+only your upload goes then, and the document leaves your own libraries but
+stays in theirs. Old chat answers that cited it keep their copy of the
+passages, as they do across a re-ingest.
+
+**Deleting a user** (`ragctl user delete`, or the admin console for a member)
+removes everything about them — their conversations, workspaces, tokens,
+group memberships and the access they'd been given — except their libraries
+and documents. Those become unowned, keep their sharing, and are attached to
+the **Admin Workspace**: a workspace every admin sees and nobody else does,
+created with the database and impossible to rename or delete. Each admin's
+chats inside it are still their own. The deleted user's upload records pass
+to the admins, so their documents still count as held and can't be purged by
+someone else deleting an identical upload.
+
+The `uploads` table gained a `doc_sha` column for this; as with any schema
+change here (see `db.py`), drop `data/chat.db` in a dev install to recreate it.
 
 ## Several sessions at once
 

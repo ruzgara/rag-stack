@@ -213,6 +213,16 @@ class Retriever:
             raise RuntimeError(f"qdrant {method} {path} failed ({resp.status_code}): {resp.text[:500]}")
         return resp.json()["result"]
 
+    def delete_document(self, doc_sha: str) -> None:
+        """Drops every point of one document from the index. A collection
+        that doesn't exist yet holds nothing to drop, so that isn't an error."""
+        try:
+            self._qdrant("POST", f"/collections/{self.cfg.collection}/points/delete?wait=true",
+                         {"filter": {"must": [{"key": "doc_sha", "match": {"value": doc_sha}}]}})
+        except RuntimeError as exc:
+            if "doesn't exist" not in str(exc):
+                raise
+
     def _check_index(self) -> None:
         """Query vectors must come from the model the index was built with;
         a mismatch doesn't error, it just returns nonsense."""

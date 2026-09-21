@@ -49,7 +49,8 @@ class Document:
 
 
 def manifest_documents() -> dict[str, dict]:
-    """Latest processed manifest row per sha256."""
+    """Latest processed manifest row per sha256, leaving out documents
+    deleted since (a "deleted" row -- see purge.py)."""
     latest: dict[str, dict] = {}
     if not MANIFEST.exists():
         return latest
@@ -61,6 +62,8 @@ def manifest_documents() -> dict[str, dict]:
                 continue
             if rec.get("status") == "processed":
                 latest[rec["sha256"]] = rec
+            elif rec.get("status") == "deleted":
+                latest.pop(rec["sha256"], None)
     return latest
 
 
