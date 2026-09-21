@@ -1242,22 +1242,24 @@ def _sha256(path: Path) -> str:
 
 
 @app.post("/api/upload", status_code=202)
-def upload(files: list[UploadFile] = File(...), library_id: Annotated[str | None, Form()] = None,
+def upload(files: list[UploadFile] = File(...), *, library_id: Annotated[str, Form()],
           user: User = CurrentUser) -> dict:
     """Save files into data/inbox and start ingest + embed, within this user's
     ingest quota (see limits.UploadLimits). A file that doesn't fit is
     rejected by name with the reason, and the rest still go through.
 
-    `library_id`, if given, assigns every saved file to that library by the
-    sha256 it will be ingested under -- computed here, before ingest ever
-    runs, so the assignment is already in place by the time embedding makes
-    the document searchable. Requires write on it."""
+    `library_id` is required: every saved file is assigned to that library
+    by the sha256 it will be ingested under -- computed here, before ingest
+    ever runs, so the assignment is already in place by the time embedding
+    makes the document searchable. Requires write on it. Without one, the
+    document would be in no library, which only an admin can read -- not
+    even the person who uploaded it (every account starts with a library of
+    its own for this; see Accounts.create_user)."""
     INBOX.mkdir(parents=True, exist_ok=True)
-    if library_id:
-        if not state.accounts.can_write(user.id, library_id):
-            raise HTTPException(403, f"{user.email} can't add documents to library {library_id}")
-        if library_id not in {lib["id"] for lib in state.accounts.libraries()}:
-            raise HTTPException(404, "no such library")
+    if not state.accounts.can_write(user.id, library_id):
+        raise HTTPException(403, f"{user.email} can't add documents to library {library_id}")
+    if library_id not in {lib["id"] for lib in state.accounts.libraries()}:
+        raise HTTPException(404, "no such library")
     limits = state.uploads.for_user(user.is_admin)
     files_used, bytes_used = state.db.upload_usage(limits.window_seconds, user_id=user.id)
     saved, rejected = [], []
@@ -1276,8 +1278,7 @@ def upload(files: list[UploadFile] = File(...), library_id: Annotated[str | None
             os.unlink(tmp.name)
             rejected.append({"filename": name, "reason": reason})
             continue
-        if library_id:
-            state.accounts.add_document(library_id, _sha256(Path(tmp.name)))
+        state.accounts.add_document(library_id, _sha256(Path(tmp.name)))
         dest = _claim_inbox_name(name, tmp.name)
         files_used, bytes_used = files_used + 1, bytes_used + size
         state.db.record_upload(dest.name, size, user_id=user.id)

@@ -387,7 +387,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error` |
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
 | `GET /api/documents` | processed documents you can read (admins: all), your files waiting in the inbox (admins: everyone's), upload-ingest status |
-| `POST /api/upload` | multipart `files` (+ optional `library_id`) → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
+| `POST /api/upload` | multipart `files` + `library_id` (required) → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
 | `GET /api/quota` | what's left of your upload allowance, and how busy the machine is |
 | `GET /api/libraries` | libraries the caller can read, each with `role` (`owner`/`write`/`read`), `owner_name`, and `source` (`owner`/`admin`/`user`/`group` — why the caller can see it) |
 | `POST /api/libraries` | any signed-in user creates a library (`{name, description?}`) and becomes its owner -- full access right away, no separate grant |
@@ -605,14 +605,17 @@ ragctl user library delete "Project finance"      # its access list and chat att
 `role` and why they can see it (`source`), for a UI to offer when starting or
 editing a chat (`POST/PATCH /api/conversations` take `library_ids`). Any
 signed-in user can start their own library with `POST /api/libraries` -- they
-become its owner, full access right away, no separate grant step. The owner
+become its owner, full access right away, no separate grant step. Every
+account also starts with one: a library called "Default Library", attached to
+a workspace called "<name>'s Workspace", both created with the account. The owner
 (or an admin) manages sharing through `GET/PUT /api/libraries/{id}/access`
 and `DELETE /api/libraries/{id}/access/{subject_type}/{subject_id}`.
 
 **No re-embedding.** The document → library mapping lives in SQLite; Qdrant
 is filtered on `doc_sha`, which every point already carries. Assigning a
-document to a library at `/api/upload` time (its `library_id` field, needing
-write access) works before ingest has even run: the sha is computed from
+document to a library at `/api/upload` time (its `library_id` field, required,
+needing write access -- a document in no library would be readable by admins
+only, not even by whoever uploaded it) works before ingest has even run: the sha is computed from
 the uploaded bytes right there, identically to how ingest will hash the same
 file, so the mapping is already in place once embedding makes the document
 searchable. Assigning one directly (`PUT /api/libraries/{id}/documents/{sha}`)
@@ -651,15 +654,15 @@ The backend assumes more than one session at a time:
   the same line — they reach the same GPU.
 - **`QUERY_MAX_PER_USER` is per account**, so one person can't fill the
   machine while colleagues wait.
-- **One turn per conversation.** Two sends to the same conversation are
-  serialised, and the question is stored once its turn is admitted, not when
-  the request arrives, so two tabs can't read each other's half-written
 - **The line is fair between users**, not first come, first served: a freed
   slot goes to whoever has the least running or already waiting, so ten
   questions sent at once by one person interleave with everyone else's
   rather than going first. One user can hold at most
   `QUERY_MAX_QUEUED_PER_USER` places in line, so nobody can fill the queue
   and have everyone else turned away.
+- **One turn per conversation.** Two sends to the same conversation are
+  serialised, and the question is stored once its turn is admitted, not when
+  the request arrives, so two tabs can't read each other's half-written
   history.
 - **Ingest quotas.** Converting a document is the most expensive thing here,
   so `/api/upload` is capped per user over a rolling window

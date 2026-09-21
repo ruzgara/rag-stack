@@ -38,12 +38,13 @@ def other_member(acc):
 # --------------------------------------------------------------------- CRUD --
 
 def test_a_user_creates_lists_gets_and_deletes_their_own_workspace(member):
+    starter = [w["id"] for w in api.list_workspaces(user=member)["workspaces"]]  # see Accounts.create_user
     ws = api.create_workspace(api.NewWorkspace(name="Research"), user=member)
     assert api.list_workspaces(user=member)["workspaces"][0]["id"] == ws["id"]
     assert api.get_workspace(ws["id"], user=member)["name"] == "Research"
 
     api.delete_workspace(ws["id"], user=member)
-    assert api.list_workspaces(user=member)["workspaces"] == []
+    assert [w["id"] for w in api.list_workspaces(user=member)["workspaces"]] == starter
 
 
 def test_a_workspace_needs_a_name(member):
@@ -77,14 +78,15 @@ def test_deleting_an_unknown_workspace_is_404(member):
 
 
 def test_a_deleted_workspace_can_be_restored(member):
+    starter = [w["id"] for w in api.list_workspaces(user=member)["workspaces"]]  # see Accounts.create_user
     ws = api.create_workspace(api.NewWorkspace(name="Research"), user=member)
     api.delete_workspace(ws["id"], user=member)
-    assert api.list_workspaces(user=member)["workspaces"] == []
+    assert [w["id"] for w in api.list_workspaces(user=member)["workspaces"]] == starter
 
     restored = api.restore_workspace(ws["id"], user=member)
 
     assert restored["id"] == ws["id"]
-    assert [w["id"] for w in api.list_workspaces(user=member)["workspaces"]] == [ws["id"]]
+    assert [w["id"] for w in api.list_workspaces(user=member)["workspaces"]] == [ws["id"], *starter]
     assert api.list_workspaces(deleted=True, user=member)["workspaces"] == []
 
 

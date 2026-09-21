@@ -6,7 +6,7 @@ who a library has been shared with, and how the two combine (library_role).
 from __future__ import annotations
 
 import pytest
-from accounts import Accounts, Denied, Invalid, User
+from accounts import DEFAULT_LIBRARY, Accounts, Denied, Invalid, User
 from db import LOCAL_USER, ChatDB, NotFound
 
 
@@ -18,6 +18,11 @@ def acc(tmp_path):
 def user(acc: Accounts, email: str = "member@example.com", **kw) -> User:
     kw.setdefault("display_name", "Test User")
     return acc.create_user(email, password_hash="hash", **kw)
+
+
+def default_library(acc: Accounts, owner: User) -> str:
+    """The library every account starts with (see Accounts.create_user)."""
+    return next(lib["id"] for lib in acc.libraries() if lib["owner_id"] == owner.id and lib["name"] == DEFAULT_LIBRARY)
 
 
 # ------------------------------------------------------------------ users --
@@ -33,6 +38,24 @@ def test_a_user_is_stored_with_a_lowercased_email(acc):
 def test_a_bad_email_is_refused(acc, email):
     with pytest.raises(Invalid):
         user(acc, email)
+
+
+def test_a_new_user_starts_with_a_library_inside_a_workspace_of_their_own(acc):
+    created = user(acc, display_name="Ada Lovelace")
+
+    library_id = default_library(acc, created)
+    [workspace] = acc.db.list_workspaces(created.id)
+    assert workspace["name"] == "Ada Lovelace's Workspace"
+    assert workspace["library_ids"] == [library_id]
+    assert acc.library_role(created.id, library_id) == "owner"
+
+
+def test_every_user_gets_their_own_default_library_and_workspace(acc):
+    a, b = user(acc, "a@example.com"), user(acc, "b@example.com")
+
+    assert default_library(acc, a) != default_library(acc, b)
+    assert acc.readable_libraries(a.id) == {default_library(acc, a)}  # not b's
+    assert len(acc.db.list_workspaces(b.id)) == 1
 
 
 def test_the_same_email_cannot_be_registered_twice(acc):
@@ -292,7 +315,7 @@ def test_the_owner_alone_has_full_access_no_row_needed(acc):
 
     assert acc.library_role(owner.id, lib["id"]) == "owner"
     assert acc.library_access(lib["id"]) == []
-    assert acc.readable_libraries(owner.id) == {lib["id"]}
+    assert acc.readable_libraries(owner.id) == {lib["id"], default_library(acc, owner)}
 
 
 def test_updating_a_library_renames_it_and_checks_uniqueness(acc):
@@ -353,7 +376,7 @@ def test_deleting_a_library_drops_its_access_list_and_document_memberships(acc):
 
     acc.delete_library(lib["id"])
 
-    assert acc.libraries() == []
+    assert [lib["name"] for lib in acc.libraries()] == [DEFAULT_LIBRARY]  # the user's own
     with pytest.raises(NotFound):
         acc.library(lib["id"])
 
@@ -476,7 +499,7 @@ def test_readable_libraries_is_owned_plus_shared(acc):
     acc.create_library("Locked")  # no access -- must not appear
     acc.set_library_access(shared["id"], "user", owner.id, "read")
 
-    assert acc.readable_libraries(owner.id) == {owned["id"], shared["id"]}
+    assert acc.readable_libraries(owner.id) == {owned["id"], shared["id"], default_library(acc, owner)}
 
 
 # ---------------------------------------------------------------- sharing --
@@ -638,7 +661,7 @@ def test_library_overview_omits_libraries_the_user_cannot_read(acc):
 
     overview = {o["name"]: o for o in acc.library_overview(created.id, [attached["id"]])}
 
-    assert set(overview) == {"Attached", "Readable only"}
+    assert set(overview) == {"Attached", "Readable only", DEFAULT_LIBRARY}
     assert overview["Attached"]["in_scope"] and overview["Attached"]["document_count"] == 1
     assert not overview["Readable only"]["in_scope"]
 
@@ -651,7 +674,7 @@ def test_library_overview_with_nothing_selected_is_in_scope_for_every_readable_l
 
     overview = {o["name"]: o for o in acc.library_overview(created.id)}
 
-    assert set(overview) == {"Readable"}
+    assert set(overview) == {"Readable", DEFAULT_LIBRARY}
     assert overview["Readable"]["in_scope"]
 
 
@@ -662,7 +685,7 @@ def test_library_overview_for_an_admin_is_every_library_in_scope_by_default(acc)
 
     overview = acc.library_overview(admin.id)
 
-    assert {o["name"] for o in overview} == {"A", "B"}
+    assert {o["name"] for o in overview} == {"A", "B", DEFAULT_LIBRARY}
     assert all(o["in_scope"] for o in overview)
 
 

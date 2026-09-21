@@ -12,7 +12,7 @@ import threading
 import accounts as accounts_module
 import api
 import pytest
-from accounts import Accounts
+from accounts import DEFAULT_LIBRARY, Accounts, User
 from db import ChatDB
 from fastapi import HTTPException, UploadFile
 from limits import Gate, GateConfig, UploadLimits
@@ -39,12 +39,18 @@ def user(inbox):
     return api.state.accounts.create_user("member@example.com", display_name="Member")
 
 
+def own(user: User) -> str:
+    """The library every account starts with (see Accounts.create_user)."""
+    return next(lib["id"] for lib in api.state.accounts.libraries()
+                if lib["owner_id"] == user.id and lib["name"] == DEFAULT_LIBRARY)
+
+
 def pdf(name: str, size: int = 1_000) -> UploadFile:
     return UploadFile(file=io.BytesIO(b"x" * size), filename=name)
 
 
 def test_a_file_within_the_quota_is_saved_and_counted(inbox, user):
-    result = api.upload(user=user, files=[pdf("book.pdf")])
+    result = api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
 
     assert result["saved"] == ["book.pdf"] and result["rejected"] == []
     assert (inbox / "book.pdf").read_bytes() == b"x" * 1_000
@@ -53,7 +59,7 @@ def test_a_file_within_the_quota_is_saved_and_counted(inbox, user):
 
 
 def test_an_oversized_file_is_rejected_and_nothing_is_written(inbox, user):
-    result = api.upload(user=user, files=[pdf("huge.pdf", size=2_000_000)])
+    result = api.upload(user=user, library_id=own(user), files=[pdf("huge.pdf", size=2_000_000)])
 
     assert result["saved"] == []
     assert "limit is 1 MB per file" in result["rejected"][0]["reason"]
@@ -63,32 +69,32 @@ def test_an_oversized_file_is_rejected_and_nothing_is_written(inbox, user):
 
 
 def test_the_window_allowance_stops_the_file_that_would_cross_it(inbox, user):
-    api.upload(user=user, files=[pdf("a.pdf", size=900_000), pdf("b.pdf", size=900_000)])
+    api.upload(user=user, library_id=own(user), files=[pdf("a.pdf", size=900_000), pdf("b.pdf", size=900_000)])
 
-    result = api.upload(user=user, files=[pdf("c.pdf", size=900_000)])
+    result = api.upload(user=user, library_id=own(user), files=[pdf("c.pdf", size=900_000)])
 
     assert result["saved"] == [] and "2 MB per 24h" in result["rejected"][0]["reason"]
     assert result["quota"]["mb_left"] == 0.2
 
 
 def test_the_file_count_stops_further_uploads(inbox, user):
-    api.upload(user=user, files=[pdf("a.pdf"), pdf("b.pdf"), pdf("c.pdf")])
+    api.upload(user=user, library_id=own(user), files=[pdf("a.pdf"), pdf("b.pdf"), pdf("c.pdf")])
 
-    result = api.upload(user=user, files=[pdf("d.pdf")])
+    result = api.upload(user=user, library_id=own(user), files=[pdf("d.pdf")])
 
     assert "3 files per 24h" in result["rejected"][0]["reason"]
 
 
 def test_an_unsupported_file_type_never_reaches_the_quota(inbox, user):
-    result = api.upload(user=user, files=[pdf("notes.exe")])
+    result = api.upload(user=user, library_id=own(user), files=[pdf("notes.exe")])
 
     assert result["rejected"] == [{"filename": "notes.exe", "reason": "unsupported file type"}]
     assert api.state.db.upload_usage(3600, user_id=user.id) == (0, 0)
 
 
 def test_a_repeated_filename_gets_its_own_name(inbox, user):
-    first = api.upload(user=user, files=[pdf("book.pdf")])
-    second = api.upload(user=user, files=[pdf("book.pdf")])
+    first = api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    second = api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
 
     assert (first["saved"], second["saved"]) == (["book.pdf"], ["book (1).pdf"])
     assert {p.name for p in inbox.iterdir()} == {"book.pdf", "book (1).pdf"}
@@ -98,7 +104,7 @@ def test_two_sessions_uploading_the_same_name_dont_overwrite_each_other(inbox, u
     """The name is claimed with a hard link, which fails rather than replacing,
     so the loser tries the next name instead of clobbering the winner."""
     results = []
-    threads = [threading.Thread(target=lambda n=i: results.append(api.upload(user=user, files=[pdf("book.pdf", size=500 + n)])))
+    threads = [threading.Thread(target=lambda n=i: results.append(api.upload(user=user, library_id=own(user), files=[pdf("book.pdf", size=500 + n)])))
                for i in range(4)]
     for t in threads:
         t.start()
@@ -117,7 +123,7 @@ def admin(inbox):
 
 def test_an_admin_can_upload_past_every_limit(inbox, admin):
     """The fixture's limits are 1 MB per file, 3 files, 2 MB per window."""
-    result = api.upload(user=admin, files=[pdf("huge.pdf", size=5_000_000),
+    result = api.upload(user=admin, library_id=own(admin), files=[pdf("huge.pdf", size=5_000_000),
                                            pdf("a.pdf"), pdf("b.pdf"), pdf("c.pdf"), pdf("d.pdf")])
 
     assert len(result["saved"]) == 5 and result["rejected"] == []
@@ -131,7 +137,7 @@ def test_an_admins_quota_reads_as_unlimited(inbox, admin):
 
 
 def test_the_quota_endpoint_reports_what_is_left(inbox, user):
-    api.upload(user=user, files=[pdf("book.pdf")])
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
 
     body = api.quota(user)
 
@@ -153,6 +159,27 @@ def test_an_upload_with_a_library_id_is_assigned_by_its_future_sha(inbox, user):
     import hashlib
     sha = hashlib.sha256(b"x" * size).hexdigest()
     assert api.state.accounts.libraries_of(sha) == [lib["id"]]
+
+
+def test_an_upload_must_name_a_library():
+    """Without one the document would be in no library, which only an admin
+    can read -- not even the person who uploaded it."""
+    schema = api.app.openapi()["paths"]["/api/upload"]["post"]["requestBody"]["content"]["multipart/form-data"]
+    body = api.app.openapi()["components"]["schemas"][schema["schema"]["$ref"].rsplit("/", 1)[1]]
+    assert "library_id" in body["required"]
+
+
+def test_an_upload_to_your_own_library_is_listed_back_to_you(inbox, user, monkeypatch):
+    size = 1_000
+    import hashlib
+    sha = hashlib.sha256(b"x" * size).hexdigest()
+    manifest = inbox.parent / "manifest.jsonl"
+    manifest.write_text(f'{{"sha256": "{sha}", "filename": "book.pdf", "status": "processed"}}\n')
+    monkeypatch.setattr(api, "MANIFEST", manifest)
+
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf", size=size)])
+
+    assert [d["filename"] for d in api.documents(user=user)["documents"]] == ["book.pdf"]
 
 
 def test_an_upload_to_a_library_without_write_is_refused(inbox, user):
@@ -213,8 +240,8 @@ def test_a_member_is_only_listed_documents_they_can_read(manifest, user, admin):
 
 def test_a_member_only_sees_their_own_files_waiting_in_the_inbox(inbox, user, admin):
     other = api.state.accounts.create_user("other@example.com", display_name="Other")
-    api.upload(user=user, files=[pdf("mine.pdf")])
-    api.upload(user=other, files=[pdf("theirs.pdf")])
+    api.upload(user=user, library_id=own(user), files=[pdf("mine.pdf")])
+    api.upload(user=other, library_id=own(other), files=[pdf("theirs.pdf")])
     (inbox / "dropped-in-by-hand.pdf").write_bytes(b"x")  # ragctl/Finder: no uploader
 
     assert api.documents(user=user)["inbox"] == ["mine.pdf"]
@@ -226,9 +253,9 @@ def test_a_reused_inbox_name_belongs_to_its_newest_uploader(inbox, user):
     """Once ingest moves a file out, its name is free again -- the earlier
     uploader of that name mustn't see the next person's file under it."""
     other = api.state.accounts.create_user("other@example.com", display_name="Other")
-    api.upload(user=user, files=[pdf("report.pdf")])
+    api.upload(user=user, library_id=own(user), files=[pdf("report.pdf")])
     (inbox / "report.pdf").unlink()  # ingested
-    api.upload(user=other, files=[pdf("report.pdf")])
+    api.upload(user=other, library_id=own(other), files=[pdf("report.pdf")])
 
     assert api.documents(user=user)["inbox"] == []
     assert api.documents(user=other)["inbox"] == ["report.pdf"]

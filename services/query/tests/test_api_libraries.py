@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import api
 import pytest
-from accounts import Accounts
+from accounts import DEFAULT_LIBRARY, Accounts, User
 from conftest import SEARCH_ENV, FakeQdrant, point
 from db import ChatDB
 from fastapi import HTTPException
@@ -39,6 +39,12 @@ def member(acc):
     return acc.create_user("member@example.com", display_name="Member")
 
 
+def own(user: User) -> str:
+    """The library every account starts with (see Accounts.create_user)."""
+    return next(lib["id"] for lib in api.state.accounts.libraries()
+                if lib["owner_id"] == user.id and lib["name"] == DEFAULT_LIBRARY)
+
+
 # --------------------------------------------------------------- creation --
 
 def test_any_signed_in_user_creates_a_library_and_becomes_its_owner(member):
@@ -51,7 +57,7 @@ def test_any_signed_in_user_creates_a_library_and_becomes_its_owner(member):
 def test_a_member_created_library_appears_in_their_own_list_and_is_usable(acc, member):
     lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
 
-    assert {l["id"] for l in api.list_libraries(user=member)["libraries"]} == {lib["id"]}
+    assert {l["id"] for l in api.list_libraries(user=member)["libraries"]} == {lib["id"], own(member)}
 
     detail = api.library_detail(lib["id"], user=member)
     assert detail["id"] == lib["id"]
@@ -65,9 +71,9 @@ def test_another_user_cannot_see_a_library_they_did_not_create_or_receive(acc, m
     api.create_library(api.NewLibrary(name="Project finance"), user=member)
     other = acc.create_user("other@example.com", display_name="Other")
 
-    assert api.list_libraries(user=other)["libraries"] == []
+    assert [l["id"] for l in api.list_libraries(user=other)["libraries"]] == [own(other)]
     with pytest.raises(HTTPException) as exc:
-        api.library_detail((acc.libraries()[0])["id"], user=other)
+        api.library_detail(own(member), user=other)
     assert exc.value.status_code == 403
 
 
@@ -89,8 +95,9 @@ def test_an_admin_sees_every_library_a_member_sees_only_readable_ones(acc, admin
     other = api.create_library(api.NewLibrary(name="Other"), user=admin)
     acc.set_library_access(readable["id"], "user", member.id, "read")
 
-    assert {l["id"] for l in api.list_libraries(user=admin)["libraries"]} == {readable["id"], other["id"]}
-    assert {l["id"] for l in api.list_libraries(user=member)["libraries"]} == {readable["id"]}
+    assert {l["id"] for l in api.list_libraries(user=admin)["libraries"]} == \
+        {readable["id"], other["id"], own(admin), own(member)}
+    assert {l["id"] for l in api.list_libraries(user=member)["libraries"]} == {readable["id"], own(member)}
 
 
 def test_list_libraries_reports_role_source_and_owner_name(acc, admin, member):
@@ -160,7 +167,7 @@ def test_the_owner_can_rename_and_delete_their_library(member):
     assert updated["name"] == "Renamed"
 
     api.delete_library(lib["id"], user=member)
-    assert api.list_libraries(user=member)["libraries"] == []
+    assert [l["id"] for l in api.list_libraries(user=member)["libraries"]] == [own(member)]
 
 
 def test_an_admin_can_rename_and_delete_any_library(acc, admin, member):
@@ -169,7 +176,7 @@ def test_an_admin_can_rename_and_delete_any_library(acc, admin, member):
     api.update_library(lib["id"], api.LibraryUpdate(name="Renamed"), user=admin)
     api.delete_library(lib["id"], user=admin)
 
-    assert acc.libraries() == []
+    assert {l["id"] for l in acc.libraries()} == {own(admin), own(member)}
 
 
 def test_a_writer_who_is_not_the_owner_cannot_rename_or_delete(acc, member):

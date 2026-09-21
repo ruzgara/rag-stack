@@ -68,6 +68,13 @@ class User:
                 "created_at": self.created_at, "last_login_at": self.last_login_at}
 
 
+DEFAULT_LIBRARY = "Default Library"
+
+
+def default_workspace_name(display_name: str) -> str:
+    return f"{display_name}'s Workspace"
+
+
 def normalise_email(email: str) -> str:
     cleaned = (email or "").strip().lower()
     if not EMAIL_RE.match(cleaned):
@@ -137,17 +144,31 @@ class Accounts:
 
     def create_user(self, email: str, password_hash: str | None = None, display_name: str | None = None,
                     is_admin: bool = False) -> User:
-        """Creates a user. The first admin also adopts anything stored before
+        """Creates a user, starting them off with a library of their own
+        ("Default Library") inside a workspace of their own ("<name>'s Workspace"), so
+        there's somewhere to put an upload and a chat that searches it from
+        the first sign-in. The first admin also adopts anything stored before
         there were accounts, so existing conversations aren't orphaned."""
         email = normalise_email(email)
         display_name = normalise_display_name(display_name)
         user_id = uuid.uuid4().hex
+        now = time.time()
         with self.db._conn() as db:
             if db.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
                 raise Invalid(f"{email} already has an account")
             db.execute("INSERT INTO users (id, email, password_hash, display_name, is_admin, created_at) "
                        "VALUES (?, ?, ?, ?, ?, ?)",
-                       (user_id, email, password_hash, display_name, int(is_admin), time.time()))
+                       (user_id, email, password_hash, display_name, int(is_admin), now))
+            # Same rows create_library and ChatDB.create_workspace write, but
+            # in this transaction: a user never exists without them.
+            library_id, workspace_id = uuid.uuid4().hex, uuid.uuid4().hex
+            db.execute("INSERT INTO libraries (id, name, description, owner_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (library_id, DEFAULT_LIBRARY, None, user_id, now))
+            db.execute("INSERT INTO workspaces (id, owner_id, name, description, created_at, updated_at, last_used_at) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (workspace_id, user_id, default_workspace_name(display_name), None, now, now, now))
+            db.execute("INSERT INTO workspace_libraries (workspace_id, library_id, added_at) VALUES (?, ?, ?)",
+                       (workspace_id, library_id, now))
             if is_admin and not db.execute("SELECT 1 FROM users WHERE is_admin = 1 AND id != ?",
                                            (user_id,)).fetchone():
                 for table in ("conversations", "messages", "uploads"):
