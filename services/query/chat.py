@@ -240,7 +240,7 @@ class ChatService:
         self.retriever = retriever
         self.library = library or Library(retriever)
         self.client = client or httpx.Client()
-        self._tool_support: dict[str, bool] = {}
+        self._model_info: dict[str, dict] = {}
 
     # --------------------------------------------------------------- ollama --
 
@@ -273,17 +273,35 @@ class ChatService:
                     raise ChatError(f"ollama: {chunk['error']}")
                 yield chunk
 
-    def supports_tools(self, model: str) -> bool:
-        """Ollama reports each model's capabilities; a model without tool
-        support gets the auto-search only instead of a failed request."""
-        if model not in self._tool_support:
+    def _show(self, model: str) -> dict | None:
+        """Ollama's model metadata (capabilities, context length, ...),
+        cached per model. Returns None on a transient failure without
+        caching it, so the next call tries again."""
+        if model not in self._model_info:
             try:
                 resp = self.client.post(f"{self.cfg.ollama_url}/api/show", json={"model": model}, timeout=30)
                 resp.raise_for_status()
-                self._tool_support[model] = "tools" in (resp.json().get("capabilities") or [])
+                self._model_info[model] = resp.json()
             except httpx.HTTPError:
-                return False  # don't cache a transient failure
-        return self._tool_support[model]
+                return None
+        return self._model_info[model]
+
+    def supports_tools(self, model: str) -> bool:
+        """Ollama reports each model's capabilities; a model without tool
+        support gets the auto-search only instead of a failed request."""
+        info = self._show(model)
+        return "tools" in (info.get("capabilities") or []) if info else False
+
+    def context_length(self, model: str) -> int | None:
+        """The model's maximum context window, from Ollama's model_info
+        (e.g. `qwen3vl.context_length`). None if it can't be determined."""
+        info = self._show(model)
+        if not info:
+            return None
+        for key, value in (info.get("model_info") or {}).items():
+            if key.endswith(".context_length"):
+                return value
+        return None
 
     # ------------------------------------------------------------ pipeline --
 
@@ -407,6 +425,7 @@ class ChatService:
         available_tools = [SEARCH_TOOL, DOCUMENTS_TOOL] + ([LIBRARIES_TOOL] if library_overview is not None else [])
         rounds = 0
         prompt_tokens = eval_tokens = 0
+        round_prompt_tokens = round_eval_tokens = 0
         t_first_token = None
         parts: list[str] = []
         while True:
@@ -424,8 +443,10 @@ class ChatService:
                     yield {"type": "token", "text": msg["content"]}
                 tool_calls.extend(msg.get("tool_calls") or [])
                 if chunk.get("done"):
-                    prompt_tokens += chunk.get("prompt_eval_count", 0)
-                    eval_tokens += chunk.get("eval_count", 0)
+                    round_prompt_tokens = chunk.get("prompt_eval_count", 0)
+                    round_eval_tokens = chunk.get("eval_count", 0)
+                    prompt_tokens += round_prompt_tokens
+                    eval_tokens += round_eval_tokens
             if content:
                 parts.append(content)
             if not (tool_calls and offer_tools):
@@ -481,6 +502,8 @@ class ChatService:
         # 4. Resolve citations.
         result.answer = "\n\n".join(p.strip() for p in parts if p.strip())
         result.cited, result.invalid_citations = resolve_citations(result.answer, result.sources)
+        context_limit = self.context_length(preset.model)
+        context_used = round_prompt_tokens + round_eval_tokens
         result.stats.update(
             tool_rounds=rounds,
             prompt_tokens=prompt_tokens,
@@ -488,6 +511,13 @@ class ChatService:
             first_token_s=round(t_first_token - t_start, 2) if t_first_token else None,
             total_s=round(time.monotonic() - t_start, 2),
             source_tokens=self.cfg.max_source_tokens - budget[0],
+            # The final round's own prompt + completion tokens -- how much of
+            # the model's context window this turn actually occupied, as
+            # opposed to prompt_tokens/completion_tokens above which sum
+            # every tool round in the turn.
+            context_used=context_used,
+            context_limit=context_limit,
+            context_used_pct=round(100 * context_used / context_limit, 1) if context_limit else None,
         )
         yield {"type": "done", "result": result}
 

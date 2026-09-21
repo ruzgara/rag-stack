@@ -187,6 +187,23 @@ def test_a_question_is_answered_from_its_sources_with_citations():
     assert result.stats["source_tokens"] > 0
 
 
+def test_context_usage_is_reported_against_the_models_window():
+    ollama = FakeOllama(rewrite='{"search": false, "query": "hi"}', streams=[answer("Hi", "!", prompt_tokens=200)],
+                        context_length=8192)
+    svc, _, _ = service(ollama=ollama)
+    _, result = run(svc, "hi")
+    assert result.stats["context_used"] == 200 + 2  # prompt + the two answer tokens
+    assert result.stats["context_limit"] == 8192
+    assert result.stats["context_used_pct"] == round(100 * 202 / 8192, 1)
+
+
+def test_context_limit_is_none_when_ollama_cant_report_it():
+    ollama = FakeOllama(rewrite='{"search": false, "query": "hi"}', streams=[answer("Hi")], context_length=None)
+    svc, _, _ = service(ollama=ollama)
+    _, result = run(svc, "hi")
+    assert result.stats["context_limit"] is None and result.stats["context_used_pct"] is None
+
+
 def test_no_relevant_sources_is_said_plainly():
     ollama = FakeOllama(streams=[answer("Not covered.")])
     svc, _, _ = service({}, ollama)

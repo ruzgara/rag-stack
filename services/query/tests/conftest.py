@@ -84,16 +84,19 @@ class FakeOllama:
     /api/chat plays the next script in `streams` as NDJSON."""
 
     def __init__(self, rewrite: str | None = '{"search": true, "query": ""}', streams: list[list[dict]] | None = None,
-                 tools: bool = True):
+                 tools: bool = True, context_length: int | None = 8192):
         self.rewrite = rewrite
         self.streams = list(streams or [])
         self.tools = tools
+        self.context_length = context_length
         self.chat_requests: list[dict] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         if request.url.path == "/api/show":
-            return httpx.Response(200, json={"capabilities": ["completion"] + (["tools"] if self.tools else [])})
+            model_info = {"fake.context_length": self.context_length} if self.context_length else {}
+            return httpx.Response(200, json={"capabilities": ["completion"] + (["tools"] if self.tools else []),
+                                             "model_info": model_info})
         self.chat_requests.append(body)
         if not body.get("stream"):
             if self.rewrite is None:
