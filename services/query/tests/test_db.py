@@ -63,6 +63,21 @@ def test_conversation_lifecycle(db):
         db.delete_conversation(conv["id"])
 
 
+def test_a_new_conversation_starts_read_and_opening_it_bumps_last_read_at(db):
+    conv = db.create_conversation("everyday")
+    assert conv["last_read_at"] == conv["created_at"]
+
+    listed = db.list_conversations()[0]
+    assert listed["last_read_at"] == conv["created_at"]
+
+    got_without_messages = db.get_conversation(conv["id"], with_messages=False)
+    assert got_without_messages["last_read_at"] == conv["created_at"]  # a peek, not a real open
+
+    opened = db.get_conversation(conv["id"])
+    assert opened["last_read_at"] >= conv["created_at"]
+    assert opened["last_read_at"] == db.list_conversations()[0]["last_read_at"]
+
+
 def test_messages_and_sources_round_trip(db):
     conv = db.create_conversation("everyday")
     db.add_user_message(conv["id"], "who are the parties?")

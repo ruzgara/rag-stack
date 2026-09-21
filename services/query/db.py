@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS conversations (
     workspace_id TEXT REFERENCES workspaces (id) ON DELETE CASCADE,
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
+    -- When this user last opened the chat (get_conversation with_messages,
+    -- i.e. actually viewing it -- not every touch). Starts equal to
+    -- created_at, same reasoning as workspaces.last_used_at: a chat you
+    -- just created isn't "unread". Compare against updated_at to tell if a
+    -- chat has activity the user hasn't seen yet.
+    last_read_at REAL NOT NULL,
     -- Soft delete, same shape as workspaces.deleted: set instead of
     -- removing the row, so nothing about the chat is actually lost.
     -- updated_at doubles as the deleted-at time, same as workspaces'
@@ -371,14 +377,14 @@ class ChatDB:
                             library_ids: list[str] | None = None, workspace_id: str | None = None) -> dict:
         now = time.time()
         conv = {"id": uuid.uuid4().hex, "title": title, "preset": preset, "workspace_id": workspace_id,
-                "created_at": now, "updated_at": now, "deleted": 0, "archived": 0}
+                "created_at": now, "updated_at": now, "last_read_at": now, "deleted": 0, "archived": 0}
         if workspace_id is not None and library_ids is not None:
             raise WorkspaceLibraries("a chat in a workspace uses the workspace's libraries")
         with self._conn() as db:
             db.execute(
-                "INSERT INTO conversations (id, user_id, title, preset, workspace_id, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (conv["id"], user_id, title, preset, workspace_id, now, now),
+                "INSERT INTO conversations (id, user_id, title, preset, workspace_id, created_at, updated_at, "
+                "last_read_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (conv["id"], user_id, title, preset, workspace_id, now, now, now),
             )
             if library_ids:
                 db.executemany("INSERT INTO conversation_libraries (conversation_id, library_id) VALUES (?, ?)",
@@ -419,8 +425,8 @@ class ChatDB:
                 where += " AND c.workspace_id = ?"
                 params += (workspace_id,)
             rows = db.execute(
-                f"""SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.archived,
-                          COUNT(m.id) AS message_count
+                f"""SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.last_read_at,
+                          c.archived, COUNT(m.id) AS message_count
                    FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id
                         LEFT JOIN workspaces w ON w.id = c.workspace_id
                    WHERE {where} GROUP BY c.id ORDER BY c.updated_at DESC""",
@@ -444,11 +450,16 @@ class ChatDB:
                  else libs.get(r["id"], [])} for r in rows]
 
     def get_conversation(self, conv_id: str, user_id: str, with_messages: bool = True) -> dict:
+        """`with_messages=True` (the default) is a real open of the chat --
+        it counts as reading it, so last_read_at is bumped to now.
+        `with_messages=False` is used for internal existence/ownership
+        checks (update, add-message, retry) and must not affect it."""
         with self._conn() as db:
             # Same deleted/soft-deleted-workspace exclusion as
             # list_conversations(deleted=False).
             row = db.execute(
-                """SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.archived
+                """SELECT c.id, c.title, c.preset, c.workspace_id, c.created_at, c.updated_at, c.last_read_at,
+                          c.archived
                    FROM conversations c LEFT JOIN workspaces w ON w.id = c.workspace_id
                    WHERE c.id = ? AND c.user_id = ? AND NOT c.deleted
                          AND (c.workspace_id IS NULL OR NOT w.deleted)""",
@@ -460,6 +471,8 @@ class ChatDB:
             conv["library_ids"] = self._library_ids(db, conv_id, conv["workspace_id"])
             if not with_messages:
                 return conv
+            conv["last_read_at"] = time.time()
+            db.execute("UPDATE conversations SET last_read_at = ? WHERE id = ?", (conv["last_read_at"], conv_id))
             messages = [self._message_dict(r) for r in db.execute(
                 "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at", (conv_id,))]
             sources: dict[str, list[dict]] = {}

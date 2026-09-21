@@ -121,3 +121,14 @@ def test_a_user_cannot_archive_or_unarchive_someone_elses_chat(member, other_mem
     with pytest.raises(HTTPException) as exc:
         api.unarchive_conversation(conv["id"], user=other_member)
     assert exc.value.status_code == 404
+
+
+def test_opening_a_chat_bumps_its_last_read_at(member):
+    conv = api.create_conversation(api.NewConversation(preset="everyday"), user=member)
+    assert conv["last_read_at"] == conv["created_at"]
+    assert api.list_conversations(user=member)[0]["last_read_at"] == conv["created_at"]
+
+    opened = api.get_conversation(conv["id"], user=member)
+
+    assert opened["last_read_at"] >= conv["created_at"]
+    assert api.list_conversations(user=member)[0]["last_read_at"] == opened["last_read_at"]
