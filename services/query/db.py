@@ -652,6 +652,22 @@ class ChatDB:
                 (user_id, time.time() - window_seconds)).fetchone()
         return row["files"], row["total"]
 
+    def inbox_uploaders(self, filenames: list[str]) -> dict[str, str]:
+        """Who uploaded each of these inbox files: the newest upload recorded
+        under each name. A name is only ever held by one file in the inbox at
+        a time (api._claim_inbox_name), but it's reused once ingest has moved
+        that file out -- so an older upload of the same name isn't this
+        file's, and only the newest row counts."""
+        if not filenames:
+            return {}
+        placeholders = ",".join("?" * len(filenames))
+        with self._conn() as db:
+            rows = db.execute(
+                f"""SELECT filename, user_id FROM uploads u WHERE filename IN ({placeholders})
+                    AND created_at = (SELECT MAX(created_at) FROM uploads WHERE filename = u.filename)""",
+                tuple(filenames)).fetchall()
+        return {r["filename"]: r["user_id"] for r in rows}
+
     # ------------------------------------------------------------- helpers --
 
     @staticmethod

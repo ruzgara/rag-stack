@@ -674,7 +674,7 @@ def library_detail(library_id: str, user: User = CurrentUser) -> dict:
     """A library's own documents (name, pages, ingest status/route), for
     anyone who can read it -- unlike /api/admin/documents, this isn't
     admin-only, and unlike /api/documents, it's scoped to the one library
-    instead of every document on the machine."""
+    instead of every document the caller can read."""
     try:
         lib = state.accounts.library(library_id)
     except NotFound:
@@ -1192,10 +1192,19 @@ def _document_row(rec: dict) -> dict:
 
 @app.get("/api/documents")
 def documents(user: User = CurrentUser) -> dict:
-    """Latest manifest row per document, plus files waiting in the inbox."""
-    docs = [_document_row(r) for r in _manifest_documents().values()]
+    """Latest manifest row per document the caller can read, plus the files
+    waiting in the inbox that they uploaded. Filenames alone can say a lot,
+    so this is scoped like search is: an admin sees everything, anyone else
+    only documents in a library they can read -- same as can_read_document
+    -- and only their own uploads still waiting to be ingested."""
+    readable = state.accounts.readable_libraries(user.id)
+    docs = [_document_row(r) for r in _manifest_documents().values()
+            if readable is None or readable & set(state.accounts.libraries_of(r["sha256"]))]
     docs.sort(key=lambda d: d["processed_at"] or 0, reverse=True)
     inbox = sorted(p.name for p in INBOX.iterdir() if p.is_file() and not p.name.startswith(".")) if INBOX.exists() else []
+    if not user.is_admin:
+        uploaders = state.db.inbox_uploaders(inbox)
+        inbox = [name for name in inbox if uploaders.get(name) == user.id]
     return {"documents": docs, "inbox": inbox, "ingest": state.ingest.status()}
 
 
@@ -1203,9 +1212,8 @@ def documents(user: User = CurrentUser) -> dict:
 def document_chunks(sha256: str, offset: int = 0, limit: int | None = None, user: User = CurrentUser) -> dict:
     """One document's chunks, in order, with the document's total chunk
     count -- the source viewer's prev/next through a citation and the "n of
-    total" it shows alongside. Unlike /api/documents (filenames only), this
-    hands back passage text, so it needs read access to a library the
-    document belongs to (or admin)."""
+    total" it shows alongside. Needs read access to a library the document
+    belongs to (or admin) -- the same scope /api/documents lists."""
     rec = _manifest_documents().get(sha256)
     if rec is None:
         raise HTTPException(404, "no such document")

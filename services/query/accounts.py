@@ -345,9 +345,8 @@ class Accounts:
                 "SELECT library_id FROM library_documents WHERE doc_sha = ?", (doc_sha,))]
 
     def can_read_document(self, user_id: str, doc_sha: str) -> bool:
-        """Whether this user may read one document's content (its chunks),
-        as opposed to just knowing it exists via /api/documents: an admin
-        always can, everyone else only through read (or write, or
+        """Whether this user may read one document -- its chunks, and its
+        row in /api/documents: an admin always can, everyone else only through read (or write, or
         ownership) on a library the document belongs to. A document in no
         library is unreadable by anyone but an admin, same as document_scope
         leaves it out of every non-admin search."""

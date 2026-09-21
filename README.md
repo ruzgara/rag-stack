@@ -386,7 +386,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete |
 | `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error` |
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
-| `GET /api/documents` | processed documents, files waiting in the inbox, upload-ingest status |
+| `GET /api/documents` | processed documents you can read (admins: all), your files waiting in the inbox (admins: everyone's), upload-ingest status |
 | `POST /api/upload` | multipart `files` (+ optional `library_id`) → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
 | `GET /api/quota` | what's left of your upload allowance, and how busy the machine is |
 | `GET /api/libraries` | libraries the caller can read, each with `role` (`owner`/`write`/`read`), `owner_name`, and `source` (`owner`/`admin`/`user`/`group` — why the caller can see it) |

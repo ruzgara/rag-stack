@@ -30,7 +30,7 @@ def inbox(tmp_path, monkeypatch):
     monkeypatch.setattr(api.state, "accounts", Accounts(db), raising=False)
     monkeypatch.setattr(api.state, "uploads", UploadLimits(max_file_mb=1, max_files=3, max_mb=2, window_hours=24), raising=False)
     monkeypatch.setattr(api.state, "gate", Gate(GateConfig()), raising=False)
-    monkeypatch.setattr(api.state, "ingest", type("Stub", (), {"trigger": lambda self: "started"})(), raising=False)
+    monkeypatch.setattr(api.state, "ingest", type("Stub", (), {"trigger": lambda self: "started", "status": lambda self: {}})(), raising=False)
     return box
 
 
@@ -183,3 +183,52 @@ def test_a_hopeless_name_clash_is_reported_rather_than_looping(inbox, user, monk
     with pytest.raises(HTTPException) as exc:
         api._claim_inbox_name("book.pdf", str(written))
     assert exc.value.status_code == 409
+
+
+# ------------------------------------------------------ document visibility --
+
+@pytest.fixture
+def manifest(inbox, monkeypatch):
+    path = inbox.parent / "manifest.jsonl"
+    path.write_text(
+        '{"sha256": "sha-shared", "filename": "shared.pdf", "status": "processed", "timestamp": 2}\n'
+        '{"sha256": "sha-private", "filename": "someone-elses-layoffs.pdf", "status": "processed", "timestamp": 1}\n'
+        '{"sha256": "sha-loose", "filename": "in-no-library.pdf", "status": "processed", "timestamp": 3}\n')
+    monkeypatch.setattr(api, "MANIFEST", path)
+    return path
+
+
+def test_a_member_is_only_listed_documents_they_can_read(manifest, user, admin):
+    acc = api.state.accounts
+    shared = acc.create_library("Shared", owner_id=admin.id)
+    acc.add_document(shared["id"], "sha-shared")
+    acc.set_library_access(shared["id"], "user", user.id, "read")
+    private = acc.create_library("Private", owner_id=admin.id)
+    acc.add_document(private["id"], "sha-private")
+
+    assert [d["filename"] for d in api.documents(user=user)["documents"]] == ["shared.pdf"]
+    assert [d["filename"] for d in api.documents(user=admin)["documents"]] == \
+        ["in-no-library.pdf", "shared.pdf", "someone-elses-layoffs.pdf"]
+
+
+def test_a_member_only_sees_their_own_files_waiting_in_the_inbox(inbox, user, admin):
+    other = api.state.accounts.create_user("other@example.com", display_name="Other")
+    api.upload(user=user, files=[pdf("mine.pdf")])
+    api.upload(user=other, files=[pdf("theirs.pdf")])
+    (inbox / "dropped-in-by-hand.pdf").write_bytes(b"x")  # ragctl/Finder: no uploader
+
+    assert api.documents(user=user)["inbox"] == ["mine.pdf"]
+    assert api.documents(user=other)["inbox"] == ["theirs.pdf"]
+    assert api.documents(user=admin)["inbox"] == ["dropped-in-by-hand.pdf", "mine.pdf", "theirs.pdf"]
+
+
+def test_a_reused_inbox_name_belongs_to_its_newest_uploader(inbox, user):
+    """Once ingest moves a file out, its name is free again -- the earlier
+    uploader of that name mustn't see the next person's file under it."""
+    other = api.state.accounts.create_user("other@example.com", display_name="Other")
+    api.upload(user=user, files=[pdf("report.pdf")])
+    (inbox / "report.pdf").unlink()  # ingested
+    api.upload(user=other, files=[pdf("report.pdf")])
+
+    assert api.documents(user=user)["inbox"] == []
+    assert api.documents(user=other)["inbox"] == ["report.pdf"]
