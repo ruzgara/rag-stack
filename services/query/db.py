@@ -736,6 +736,23 @@ class ChatDB:
             return db.execute("SELECT 1 FROM uploads WHERE doc_sha = ? AND user_id != ? AND deleted_at IS NULL",
                               (doc_sha, user_id)).fetchone() is not None
 
+    def document_filenames(self, doc_sha: str) -> list[str]:
+        """The inbox names every live upload of this document was given,
+        whoever made them -- so a purge can find a copy of it still waiting
+        in the inbox under any of them (see purge.purge_document)."""
+        with self._conn() as db:
+            return [r["filename"] for r in db.execute(
+                "SELECT filename FROM uploads WHERE doc_sha = ? AND deleted_at IS NULL", (doc_sha,))]
+
+    def delete_all_uploads(self, doc_sha: str) -> None:
+        """Marks every live upload of this document deleted, whoever made it
+        -- for a purge that takes the document away from everyone (see
+        api.remove_document), after which no upload of it is left to list or
+        to delete a second time. The rows stay, for the quota."""
+        with self._conn() as db:
+            db.execute("UPDATE uploads SET deleted_at = ? WHERE doc_sha = ? AND deleted_at IS NULL",
+                       (time.time(), doc_sha))
+
     def delete_uploads(self, doc_sha: str, user_id: str) -> list[str]:
         """Marks every live upload this user made of this document deleted --
         uploading the same file twice is still one document -- and returns

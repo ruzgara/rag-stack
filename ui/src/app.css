@@ -1,187 +1,284 @@
-/* ---------------------------------------------------------------- tokens --
-   Copied byte-for-byte from services/query/static/admin.html:11-12 so the
-   chat UI and the admin console read as one product. admin.html is frozen;
-   if these ever need to change, change both files together. */
-:root { --bg:#fff; --fg:#1b1b1b; --muted:#6b6b6b; --line:#e2e2e2; --soft:#f5f5f4; --accent:#2f5bd3; --err:#b3261e; --ok:#1a7f37; --warn:#9a6700; }
-@media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#e8e8e8; --muted:#9a9a9a; --line:#2e2e2e; --soft:#202020; --accent:#7ea0ff; --err:#ff8a80; --ok:#5fd98a; --warn:#e3b341; } }
+/* Broadsheet -- the design system the UI was drawn in (design/_ds/broadsheet-
+   .../styles.css). Tokens and component classes are copied from there; the
+   print treatments (halftone, CMYK plates) are left out, since nothing here
+   uses them. Retune the look in this block. */
 
-/* New tokens, not present in admin.html -- kept in a separate block so the
-   copy above stays diffable against its source forever. */
-:root { --radius:6px; --radius-lg:10px; --pill:99px; }
+/* Self-hosted rather than Google Fonts: the app promises nothing leaves the
+   machine, and that includes a font request. These are the weight-axis-only
+   files, the same cut Google serves the design: the "opsz" variants add an
+   optical-size axis that browsers apply automatically by font size, which
+   reshapes the letters away from the mockup. */
+@import "@fontsource-variable/source-serif-4/index.css";
+@import "@fontsource-variable/source-serif-4/wght-italic.css";
+
+:root {
+  color-scheme: light;
+  --color-bg: #f3f2f2;
+  --color-surface: #eae9e9;
+  --color-text: #201e1d;
+  --color-accent: #0088b0;
+  --color-accent-2: #d6006c;
+  --color-divider: color-mix(in srgb, #201e1d 16%, transparent);
+
+  --color-neutral-100: #f8f4f4;
+  --color-neutral-200: #eae7e7;
+  --color-neutral-300: #d7d3d3;
+  --color-neutral-400: #bab6b6;
+  --color-neutral-500: #9b9797;
+  --color-neutral-600: #7d7979;
+  --color-neutral-700: #605d5d;
+  --color-neutral-800: #444141;
+  --color-neutral-900: #2d2b2b;
+
+  --color-accent-100: #e9f8ff;
+  --color-accent-200: #cbeeff;
+  --color-accent-300: #99e0ff;
+  --color-accent-400: #62c5ee;
+  --color-accent-500: #38a6cf;
+  --color-accent-600: #1186ac;
+  --color-accent-700: #006786;
+  --color-accent-800: #004961;
+  --color-accent-900: #0a303e;
+
+  --color-accent-2-100: #fff1f4;
+  --color-accent-2-200: #ffdee6;
+  --color-accent-2-300: #ffc0d0;
+  --color-accent-2-400: #ff90b1;
+  --color-accent-2-500: #ff458e;
+  --color-accent-2-600: #d82071;
+  --color-accent-2-700: #aa0b56;
+  --color-accent-2-800: #790e3d;
+  --color-accent-2-900: #4b1528;
+
+  --font-heading: "Source Serif 4 Variable", "Source Serif 4", Georgia, serif;
+  --font-heading-weight: 600;
+  --font-body: "Source Serif 4 Variable", "Source Serif 4", Georgia, serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --space-1: 5px;
+  --space-2: 10px;
+  --space-3: 15px;
+  --space-4: 20px;
+  --space-6: 30px;
+  --space-8: 40px;
+
+  --radius-sm: 1px;
+  --radius-md: 2px;
+  --radius-lg: 4px;
+
+  --shadow-sm: 0 1px 2px color-mix(in srgb, #2d2b2b 14%, transparent);
+  --shadow-md: 0 3px 10px color-mix(in srgb, #2d2b2b 16%, transparent);
+  --shadow-lg: 0 12px 32px color-mix(in srgb, #2d2b2b 22%, transparent);
+
+  /* Library kinds, as the design colours them. */
+  --kind-mine: var(--color-accent-2-500);
+  --kind-shared: var(--color-accent);
+  --kind-group: var(--color-neutral-500);
+}
+
+/* Dark: not in the mockup. The ramps are mirrored (100 <-> 900) so every
+   "neutral-700 for muted text" or "accent-100 for a highlight" in the
+   components keeps its meaning on a dark ground; elevation becomes a
+   hairline edge plus ambient darkness, as the system's own comment says. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --color-bg: #1c1b1a;
+    --color-surface: #252322;
+    --color-text: #ebe8e6;
+    --color-accent: #38a6cf;
+    --color-accent-2: #ff458e;
+    --color-divider: color-mix(in srgb, #ebe8e6 16%, transparent);
+
+    --color-neutral-100: #2d2b2b;
+    --color-neutral-200: #444141;
+    --color-neutral-300: #605d5d;
+    --color-neutral-400: #7d7979;
+    --color-neutral-500: #9b9797;
+    --color-neutral-600: #a9a5a5;
+    --color-neutral-700: #c2bebe;
+    --color-neutral-800: #d7d3d3;
+    --color-neutral-900: #eae7e7;
+
+    --color-accent-100: #0f2a35;
+    --color-accent-200: #0a303e;
+    --color-accent-300: #004961;
+    --color-accent-400: #006786;
+    --color-accent-500: #1186ac;
+    --color-accent-600: #38a6cf;
+    --color-accent-700: #62c5ee;
+    --color-accent-800: #99e0ff;
+    --color-accent-900: #cbeeff;
+
+    --color-accent-2-100: #3a1422;
+    --color-accent-2-200: #4b1528;
+    --color-accent-2-300: #790e3d;
+    --color-accent-2-400: #aa0b56;
+    --color-accent-2-500: #ff458e;
+    --color-accent-2-600: #ff5e9c;
+    --color-accent-2-700: #ff90b1;
+    --color-accent-2-800: #ffc0d0;
+    --color-accent-2-900: #ffdee6;
+
+    --shadow-sm: 0 0 0 1px color-mix(in srgb, #ebe8e6 8%, transparent), 0 1px 2px rgb(0 0 0 / 40%);
+    --shadow-md: 0 0 0 1px color-mix(in srgb, #ebe8e6 10%, transparent), 0 3px 10px rgb(0 0 0 / 45%);
+    --shadow-lg: 0 0 0 1px color-mix(in srgb, #ebe8e6 10%, transparent), 0 12px 32px rgb(0 0 0 / 55%);
+  }
+
+  select.input {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23c2bebe' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
+}
 
 /* ------------------------------------------------------------------ base -- */
-* { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
   margin: 0;
-  font: 14px/1.5 system-ui, sans-serif;
-  background: var(--bg);
-  color: var(--fg);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+  font-weight: 400;
 }
-h1, h2, h3, h4, p { margin: 0; }
-h2 { font-size: 15px; }
-h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 8px 0; }
-p.hint { color: var(--muted); max-width: 70ch; }
-code, pre, kbd, samp {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  line-height: 1.12; letter-spacing: -0.015em; margin: 0 0 var(--space-2);
 }
-a { color: var(--accent); }
+h1 { font-size: 42px; }
+h2 { font-size: 32px; }
+h3 { font-size: 25px; }
+h4 { font-size: 20px; }
+h5 { font-size: 16px; }
+h6 { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }
+p { margin: 0 0 var(--space-3); }
+a { color: var(--color-accent-700); text-underline-offset: 3px; }
+code, pre, kbd, samp { font-family: var(--font-mono); font-size: 0.88em; }
+button { font: inherit; color: inherit; }
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+::selection { background: color-mix(in srgb, var(--color-accent) 30%, transparent); }
 
-/* --------------------------------------------------------------- controls --
-   Base shared with admin.html:24, variants (hover/disabled/.primary/.danger/
-   .small) with admin.html:25-28. */
-button, select, input, textarea {
-  font: inherit;
-  color: inherit;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 6px 8px;
+/* ------------------------------------------------------------ components -- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  cursor: pointer; text-decoration: none; white-space: nowrap;
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 14px; line-height: 1.2; color: var(--color-text);
+  background: transparent; border: 1px solid transparent;
+  padding: var(--space-2) calc(var(--space-3) * 1.2);
+  border-radius: var(--radius-md);
 }
-button { cursor: pointer; }
-button:hover:not(:disabled) { background: var(--soft); }
-button:disabled { opacity: .5; cursor: default; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.primary:hover:not(:disabled) { filter: brightness(1.1); background: var(--accent); }
-button.danger { color: var(--err); border-color: var(--err); }
-button.small { padding: 2px 6px; font-size: 12px; }
-textarea { resize: vertical; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-primary { background: var(--color-accent); color: var(--color-bg); }
+.btn-primary:hover:not(:disabled) { background: var(--color-accent-600); }
+.btn-primary:active:not(:disabled) { background: var(--color-accent-700); }
+.btn-secondary { border-color: var(--color-divider); }
+.btn-secondary:hover:not(:disabled) { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+.btn-ghost { color: var(--color-accent-700); padding-inline: var(--space-1); }
+.btn-ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
+.btn-danger { color: var(--color-accent-2-700); border-color: var(--color-accent-2-300); }
+.btn-danger:hover:not(:disabled) { background: var(--color-accent-2-100); }
+.btn-ghost.btn-danger { border-color: transparent; }
+.btn-sm { font-size: 12.5px; padding: 5px 10px; }
 
-.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.small { font-size: 12px; color: var(--muted); }
-.tag { font-size: 11px; border: 1px solid var(--line); border-radius: var(--pill); padding: 1px 7px; color: var(--muted); }
-.tag.admin { color: var(--accent); border-color: var(--accent); }
-.tag.off { color: var(--err); border-color: var(--err); }
-/* A placeholder that breaks mid-phrase reads as broken text. admin.html:39. */
-.none { white-space: nowrap; font-size: 12px; color: var(--muted); }
-
-.note { border: 1px solid var(--line); border-left-width: 3px; border-radius: var(--radius); padding: 8px 10px; white-space: pre-wrap; }
-.note.err { border-left-color: var(--err); color: var(--err); }
-.note.ok { border-left-color: var(--ok); }
-.note.warn { border-left-color: var(--warn); }
-
-/* -------------------------------------------------------------- dialog --
-   admin.html:47-49,152-158,199-229. */
-dialog {
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--bg);
-  color: var(--fg);
-  padding: 18px;
-  min-width: min(420px, 92vw);
+.field > label, .label {
+  display: block; font-size: 12px; margin-bottom: 5px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
 }
-dialog::backdrop { background: rgba(0, 0, 0, .45); }
-dialog label { display: block; margin: 10px 0 2px; font-size: 12px; color: var(--muted); }
-dialog input, dialog select, dialog textarea { width: 100%; }
-
-/* --------------------------------------------------------------- toast --
-   admin.html:50-53,184-190. */
-#toast {
-  position: fixed;
-  right: 16px;
-  bottom: 16px;
-  max-width: min(460px, 92vw);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  z-index: 10;
+.input {
+  width: 100%; min-height: 36px; padding: 6px 10px; font: inherit;
+  font-size: 14px; color: var(--color-text); caret-color: var(--color-accent);
+  background: var(--color-surface);
+  border: 1px solid var(--color-divider); border-radius: var(--radius-md);
 }
-#toast .item {
-  display: block;
-  width: 100%;
-  text-align: left;
-  border: 1px solid var(--line);
-  border-left-width: 3px;
-  border-radius: var(--radius);
-  padding: 8px 12px;
-  background: var(--bg);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, .12);
-  white-space: pre-wrap;
-  cursor: pointer;
-}
-#toast .item.err { border-left-color: var(--err); color: var(--err); }
-#toast .item.ok { border-left-color: var(--ok); }
-
-/* --------------------------------------------------------------- shell --
-   Three-pane layout, matching test-ui.html's grid but with the defects
-   (unconditional autoscroll, dead citation highlight) fixed structurally
-   in the components rather than the CSS. */
-#gate { padding: 40px 20px; max-width: 340px; margin: 0 auto; }
-
-.shell {
-  height: 100vh;
-  display: grid;
-  grid-template-columns: 240px 1fr 340px;
-}
-@media (max-width: 900px) {
-  .shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; height: auto; min-height: 100vh; }
-  .shell > aside, .shell > .sources { border: 0 !important; border-bottom: 1px solid var(--line) !important; }
+.input::placeholder { color: color-mix(in srgb, var(--color-text) 65%, transparent); opacity: 1; }
+.input:hover { border-color: color-mix(in srgb, var(--color-text) 45%, transparent); }
+/* Ring drawn inside the border box: fields often sit flush against a
+   scrolling container (the popup body), which clips anything painted
+   outside them, so an outline or outer shadow lost whichever sides
+   touched the edge. */
+.input:focus-visible { outline: none; border-color: var(--color-accent); box-shadow: inset 0 0 0 1px var(--color-accent); }
+/* A select keeps focus after a mouse pick; only ring it for keyboard use
+   (data-modality is set in main.ts). */
+:root[data-modality="pointer"] select.input:focus-visible { border-color: var(--color-divider); box-shadow: none; }
+textarea.input { min-height: 90px; resize: vertical; }
+/* Chrome's native appearance:auto arrow sits flush against the border,
+   so we draw our own inset from the edge instead. Two ink colours (here
+   and in the dark-mode block below) since a data-URI fill can't follow
+   --color-neutral-700 across the theme switch. */
+select.input {
+  appearance: none;
+  padding-right: 30px;
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23605d5d' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
-aside {
-  border-right: 1px solid var(--line);
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  overflow: auto;
+.seg {
+  display: inline-flex; overflow: hidden;
+  border: 1px solid var(--color-divider); border-radius: var(--radius-md);
 }
-.sources {
-  border-left: 1px solid var(--line);
-  padding: 12px;
-  overflow: auto;
+.seg > button {
+  border: 0; background: transparent; cursor: pointer;
+  padding: 4px 10px; font-family: var(--font-heading); font-size: 12.5px;
 }
-main.chat { display: flex; flex-direction: column; min-width: 0; }
+.seg > button + button { border-left: 1px solid var(--color-divider); }
+.seg > button[aria-pressed="true"] { background: var(--color-accent); color: var(--color-bg); }
+.seg > button:not([aria-pressed="true"]):hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
 
-.conv-row { position: relative; border-radius: var(--radius); }
-.conv-row:hover, .conv-row.active { background: var(--soft); }
-.conv { padding: 6px 28px 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; color: inherit; text-decoration: none; }
-.conv-row .del {
-  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
-  border: 0; background: none; color: var(--muted); padding: 2px 6px; visibility: hidden;
+.tag {
+  display: inline-flex; align-items: center; font-size: 11px; white-space: nowrap;
+  letter-spacing: 0.02em; padding: 3px 10px; border: 0; font-family: inherit;
+  border-radius: calc(var(--radius-md) * 0.75);
 }
-.conv-row:hover .del, .conv-row .del:focus-visible { visibility: visible; }
+.tag-accent { background: var(--color-accent-100); color: var(--color-accent-800); }
+.tag-accent-2 { background: var(--color-accent-2-100); color: var(--color-accent-2-800); }
+.tag-neutral { background: var(--color-neutral-100); color: var(--color-neutral-800); }
+button.tag { cursor: pointer; }
 
-#log { flex: 1; overflow: auto; padding: 16px 20px; position: relative; }
-.msg { margin: 0 0 18px; max-width: 820px; }
-.msg .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
-.msg .body { white-space: normal; }
-.msg.user .body { background: var(--soft); padding: 8px 12px; border-radius: 8px; display: inline-block; white-space: pre-wrap; }
-.msg .body p:first-child { margin-top: 0; }
-.msg .body p:last-child { margin-bottom: 0; }
-.msg .body pre { background: var(--soft); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; overflow: auto; }
-.msg .body code { background: var(--soft); padding: 1px 4px; border-radius: 4px; font-size: 12.5px; }
-.msg .body pre code { background: none; padding: 0; }
-.msg .body table { border-collapse: collapse; width: 100%; margin: 8px 0; }
-.msg .body th, .msg .body td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th {
+  text-align: left; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 400;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  padding: var(--space-2); border-bottom: 1px solid var(--color-divider);
+  position: sticky; top: 0; background: var(--color-bg); z-index: 1;
+}
+.table td {
+  padding: var(--space-2);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-text) 8%, transparent);
+  vertical-align: top;
+}
+.table tbody tr:hover { background: color-mix(in srgb, var(--color-text) 4%, transparent); }
 
-.status-line { font-size: 12px; color: var(--muted); margin: 2px 0 6px; }
-.cite { color: var(--accent); cursor: pointer; font-weight: 600; border-radius: 3px; }
-.cite:focus-visible, .cite.flash { outline: 2px solid var(--accent); outline-offset: 1px; }
-.cite.invalid { color: var(--err); text-decoration: line-through; cursor: help; }
-.err-text { color: var(--err); }
+/* The small uppercase label above a heading ("Workspace", "Library"...). */
+.kicker {
+  font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--color-accent-700); margin-bottom: 4px;
+}
+.muted { color: var(--color-neutral-600); }
+.dot { width: 5px; height: 5px; flex: none; border-radius: 50%; display: inline-block; }
+.nowrap { white-space: nowrap; }
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.empty-note { font-size: 13px; color: var(--color-neutral-600); padding: 6px 0; }
+.err-text { color: var(--color-accent-2-700); }
 
-details.think { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-details.think pre { white-space: pre-wrap; margin: 4px 0; font-size: 12px; }
-
-form#ask { display: flex; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--line); }
-form#ask textarea { flex: 1; min-height: 44px; }
-
-.stick-pill {
-  position: absolute;
-  bottom: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  border-radius: var(--pill);
-  padding: 4px 12px;
-  font-size: 12px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, .12);
+@keyframes rag-pulse { 0%,100% { opacity: 1; transform: scale(1) } 50% { opacity: .4; transform: scale(.7) } }
+.pulse {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--color-accent); flex: none;
+  animation: rag-pulse 1.2s ease-in-out infinite;
 }
 
-.src { border: 1px solid var(--line); border-radius: var(--radius); padding: 8px; margin-bottom: 8px; font-size: 13px; }
-.src.cited { border-color: var(--accent); }
-.src.flash { outline: 2px solid var(--accent); outline-offset: 1px; }
-.src .meta { font-size: 12px; color: var(--muted); }
-.src .text { white-space: pre-wrap; max-height: 220px; overflow: auto; margin-top: 4px; }
+.rag-scroll { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--color-text) 25%, transparent) transparent; }
+.rag-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.rag-scroll::-webkit-scrollbar-track { background: transparent; }
+.rag-scroll::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--color-text) 22%, transparent); border-radius: 4px; }
 
-.footer-actions { display: flex; gap: 10px; align-items: center; margin-top: 4px; }
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse, .cursor-block { animation: none !important; }
+}

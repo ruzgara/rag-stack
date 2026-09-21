@@ -1,25 +1,39 @@
-// Who's signed in, what they can do, and the two poll-driven pieces of
-// server state (health, quota/load) that the whole shell reads from.
+// Who's signed in, and the poll-driven server state the whole shell reads:
+// health (models, index) and quota/load (the queue meter).
 
-import { get, post, ApiError } from "../lib/api";
-import type { AuthMode, HealthResponse, Me, QuotaResponse } from "../lib/types";
-import { can, type GlobalPermission } from "../lib/permissions";
+import { get, post, ApiError, setUnauthorizedHandler } from "../lib/api";
+import type { AuthMode, HealthResponse, Me, PresetInfo, QuotaResponse } from "../lib/types";
 
 class Session {
   me = $state<Me | null>(null);
-  booted = $state(false); // true once the first /api/auth/me attempt has resolved (either way)
-  authMode = $state<AuthMode>("password"); // best guess before boot(); real value is on `me` once signed in
+  booted = $state(false);
+  authMode = $state<AuthMode>("password");
   health = $state<HealthResponse | null>(null);
   quota = $state<QuotaResponse | null>(null);
   loginError = $state<string | null>(null);
   loginRetryAfter = $state<number | null>(null);
+  /** Set by chat state while any turn streams, so the meter polls faster. */
+  busy = $state(false);
 
   signedIn = $derived(this.me !== null);
-  canChat = $derived(can(this.me, "chat.use"));
-  canManageUsers = $derived(can(this.me, "users.manage"));
-  canManageLibraries = $derived(can(this.me, "libraries.manage"));
+  isAdmin = $derived(this.me?.user.is_admin ?? false);
+  displayName = $derived(this.me ? this.me.user.display_name || this.me.user.email : "");
 
   private healthTimer: ReturnType<typeof setInterval> | null = null;
+  private quotaTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor() {
+    setUnauthorizedHandler(() => {
+      this.me = null;
+      this.quota = null;
+    });
+  }
+
+  /** The model a preset runs, from /api/health. */
+  presetInfo(name: string): PresetInfo | null {
+    const v = this.health?.presets?.[name];
+    return v && typeof v === "object" ? (v as PresetInfo) : null;
+  }
 
   async boot(): Promise<void> {
     try {
@@ -30,21 +44,11 @@ class Session {
     } finally {
       this.booted = true;
     }
-    // Learn auth_mode even when signed out, so the gate can hide the sign-in
-    // form in proxy mode instead of offering a form that can never succeed.
-    // /api/auth/me 401s exactly when we'd need this, so it comes from
-    // /api/health instead (api.py health(): checks["auth"]).
-    if (!this.me) {
-      try {
-        const health = await get<HealthResponse>("/api/health");
-        if (health.auth) this.authMode = health.auth.mode;
-      } catch {
-        // Unreachable API -- HealthLine will report this; the gate just
-        // keeps its default guess.
-      }
-    }
-    this.startHealthPoll();
-    if (this.signedIn) await this.refreshQuota();
+    this.startPolls();
+  }
+
+  async refreshMe(): Promise<void> {
+    this.me = await get<Me>("/api/auth/me");
   }
 
   async login(email: string, password: string): Promise<void> {
@@ -53,7 +57,7 @@ class Session {
     try {
       this.me = await post<Me>("/api/auth/login", { email, password });
       this.authMode = this.me.auth_mode;
-      await this.refreshQuota();
+      void this.refreshQuota();
     } catch (e) {
       if (e instanceof ApiError) {
         this.loginError = e.message;
@@ -81,9 +85,18 @@ class Session {
   async refreshHealth(): Promise<void> {
     try {
       this.health = await get<HealthResponse>("/api/health");
-    } catch {
+    } catch (e) {
+      // 503 still carries the checks; anything else means unreachable.
       this.health = null;
+      void e;
+      try {
+        const res = await fetch("/api/health");
+        this.health = (await res.json()) as HealthResponse;
+      } catch {
+        this.health = null;
+      }
     }
+    if (this.health?.auth) this.authMode = this.health.auth.mode;
   }
 
   async refreshQuota(): Promise<void> {
@@ -91,19 +104,20 @@ class Session {
     try {
       this.quota = await get<QuotaResponse>("/api/quota");
     } catch {
-      // transient; LoadMeter just shows nothing this tick
+      // transient; the meter shows nothing this tick
     }
   }
 
-  private startHealthPoll(): void {
+  private startPolls(): void {
     if (this.healthTimer) return;
     void this.refreshHealth();
-    this.healthTimer = setInterval(() => void this.refreshHealth(), 15_000);
+    this.healthTimer = setInterval(() => void this.refreshHealth(), 30_000);
+    const tick = async () => {
+      if (document.visibilityState === "visible") await this.refreshQuota();
+      this.quotaTimer = setTimeout(tick, this.busy ? 3_000 : 15_000);
+    };
+    void tick();
   }
 }
 
 export const session = new Session();
-
-export function canPerm(perm: GlobalPermission): boolean {
-  return can(session.me, perm);
-}

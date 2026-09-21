@@ -292,6 +292,13 @@ def test_deleting_from_a_collection_that_does_not_exist_yet_is_not_an_error(sear
     Retriever(search_cfg(), client=httpx.Client(transport=httpx.MockTransport(handler))).delete_document("sha-1")
 
 
+def test_searching_before_anything_is_embedded_finds_nothing(search_cfg):
+    handler = lambda request: httpx.Response(404, text="Collection `ragstack_chunks` doesn't exist!")  # noqa: E731
+    r = Retriever(search_cfg(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert r.search("anything", mode="bm25") == []
+    assert r.document_chunks("sha-1") == ([], 0)
+
+
 def test_deleting_when_qdrant_fails_raises(search_cfg):
     handler = lambda request: httpx.Response(500, text="boom")  # noqa: E731
     with pytest.raises(RuntimeError):

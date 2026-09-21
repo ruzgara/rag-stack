@@ -1,9 +1,5 @@
-// Cross-cutting UI state: toasts, the citation<->source cross-highlight, and
-// the promise-based <dialog> idiom ported from admin.html:199-229. Simple
-// yes/no confirmations use window.confirm() directly in components, matching
-// admin.html's own confirmed() (admin.html:196) -- only prompt()-style text
-// entry and alert()-style result reporting are what test-ui.html got wrong
-// (plan defect 5), not confirm() itself.
+// Cross-cutting UI state: toasts, the popup stack, the promise-based
+// confirm/ask dialogs, and which turn the sources panel is showing.
 
 export interface Toast {
   id: number;
@@ -11,81 +7,146 @@ export interface Toast {
   kind: "ok" | "err";
 }
 
-export type DialogFieldType = "text" | "password" | "email" | "select" | "checkbox";
-export interface DialogField {
+/** Every popup the app has. Opening one pushes it; Escape / the backdrop /
+ *  × pops the top; closeAll clears the stack (the design's closeAll). */
+export type Modal =
+  | { kind: "workspaces" }
+  | { kind: "libraries" }
+  | { kind: "library"; id: string }
+  | { kind: "sharing"; id: string }
+  | { kind: "source"; turnKey: string; number: number }
+  | { kind: "upload"; libraryId?: string; folder?: boolean }
+  | { kind: "groups" }
+  | { kind: "settings" }
+  | { kind: "trash"; tab?: "chats" | "workspaces" | "archived" };
+
+export type FieldType = "text" | "password" | "email" | "textarea" | "select" | "checkbox";
+export interface Field {
   name: string;
   label: string;
-  type?: DialogFieldType;
+  type?: FieldType;
   value?: string | boolean;
   options?: { value: string; label: string }[];
   required?: boolean;
   placeholder?: string;
+  hint?: string;
 }
+export type FormResult = Record<string, string | boolean>;
 
-export type DialogResult = Record<string, string | boolean>;
-
-interface DialogRequest {
+interface DialogBase {
   title: string;
-  fields: DialogField[];
+  kicker?: string;
+  body?: string;
   okLabel: string;
-  resolve: (result: DialogResult | null) => void;
+  danger?: boolean;
+}
+export type Dialog =
+  | (DialogBase & { kind: "confirm"; resolve: (ok: boolean) => void })
+  | (DialogBase & { kind: "ask"; fields: Field[]; resolve: (r: FormResult | null) => void });
+
+export const RAIL_WIDTH = 268;
+export const SOURCES_WIDTH = 336;
+const WIDTHS_KEY = "rag.columnWidths";
+
+function readWidth(key: "rail" | "sources", fallback: number): number {
+  try {
+    const w = JSON.parse(localStorage.getItem(WIDTHS_KEY) ?? "{}")[key];
+    return typeof w === "number" && w > 0 ? w : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 class UiState {
   toasts = $state<Toast[]>([]);
-  focusedSources = $state<number[]>([]);
-  /** Which turn's sources the SourcesPanel is showing. Set by a turn's
-   *  "Sources (N)" footer button (defect 8: this works even on an errored
-   *  turn, unlike test-ui.html's onclick bound only at `done`) and by
-   *  clicking a [n] citation. */
+  modals = $state<Modal[]>([]);
+  dialog = $state<Dialog | null>(null);
+  /** Which turn's sources the right panel shows; null = the last turn. */
   selectedTurnKey = $state<string | null>(null);
-  dialogRequest = $state<DialogRequest | null>(null);
+  /** Source numbers to flash in the panel (hovering/clicking a citation). */
+  focusedSources = $state<number[]>([]);
+  /** Narrow screens: the rail and the sources panel become drawers. */
+  railOpen = $state(false);
+  sourcesOpen = $state(false);
+  userMenuOpen = $state(false);
+  /** Wide screens: user-dragged column widths, remembered per browser. */
+  railWidth = $state(readWidth("rail", RAIL_WIDTH));
+  sourcesWidth = $state(readWidth("sources", SOURCES_WIDTH));
 
   private toastSeq = 0;
+
+  saveWidths(): void {
+    try {
+      localStorage.setItem(WIDTHS_KEY, JSON.stringify({ rail: this.railWidth, sources: this.sourcesWidth }));
+    } catch {
+      /* storage unavailable: widths just don't persist */
+    }
+  }
 
   toast(message: string, kind: Toast["kind"] = "ok"): void {
     const id = ++this.toastSeq;
     this.toasts.push({ id, message, kind });
-    setTimeout(() => this.dismissToast(id), kind === "err" ? 9000 : 4000);
+    setTimeout(() => this.dismissToast(id), kind === "err" ? 9000 : 4500);
   }
 
   dismissToast(id: number): void {
     this.toasts = this.toasts.filter((t) => t.id !== id);
   }
 
-  focusSources(nums: number[], turnKey?: string): void {
-    this.focusedSources = nums;
-    if (turnKey) this.selectedTurnKey = turnKey;
+  open(m: Modal): void {
+    this.userMenuOpen = false;
+    this.railOpen = false;
+    this.modals.push(m);
   }
 
-  clearFocus(): void {
-    this.focusedSources = [];
+  /** Replaces the top popup (e.g. prev/next inside the source viewer). */
+  replace(m: Modal): void {
+    if (this.modals.length) this.modals[this.modals.length - 1] = m;
+    else this.modals.push(m);
   }
 
-  showTurnSources(turnKey: string): void {
-    this.selectedTurnKey = turnKey;
-    this.focusedSources = [];
+  close(): void {
+    this.modals.pop();
   }
 
-  /** A small modal form, mirroring admin.html:199-229's ask(title, fields,
-   *  okLabel). Resolves null on cancel. */
-  ask(title: string, fields: DialogField[], okLabel = "Save"): Promise<DialogResult | null> {
+  closeAll(): void {
+    this.modals = [];
+    this.userMenuOpen = false;
+  }
+
+  confirm(opts: { title: string; body?: string; okLabel?: string; danger?: boolean; kicker?: string }): Promise<boolean> {
     return new Promise((resolve) => {
-      this.dialogRequest = { title, fields, okLabel, resolve };
+      this.dialog?.kind === "confirm" ? this.dialog.resolve(false) : this.dialog?.resolve(null);
+      this.dialog = { kind: "confirm", okLabel: "OK", ...opts, resolve };
     });
   }
 
-  resolveDialog(result: DialogResult | null): void {
-    this.dialogRequest?.resolve(result);
-    this.dialogRequest = null;
+  ask(opts: { title: string; fields: Field[]; okLabel?: string; body?: string; kicker?: string }): Promise<FormResult | null> {
+    return new Promise((resolve) => {
+      this.dialog?.kind === "confirm" ? this.dialog.resolve(false) : this.dialog?.resolve(null);
+      this.dialog = { kind: "ask", okLabel: "Save", ...opts, resolve };
+    });
+  }
+
+  settleDialog(result: boolean | FormResult | null): void {
+    const d = this.dialog;
+    this.dialog = null;
+    if (!d) return;
+    if (d.kind === "confirm") d.resolve(result === true || (typeof result === "object" && result !== null));
+    else d.resolve(typeof result === "object" ? result : null);
+  }
+
+  focusSources(nums: number[], turnKey?: string): void {
+    if (turnKey) this.selectedTurnKey = turnKey;
+    this.focusedSources = nums;
   }
 }
 
 export const ui = new UiState();
 
-/** guard(fn): wraps a handler so a rejection becomes a toast instead of an
- *  unhandled console error -- admin.html's convention (admin.html:192-195). */
-export function guard<A extends unknown[]>(fn: (...args: A) => Promise<void>): (...args: A) => void {
+/** Wraps a handler so a rejection becomes a toast rather than an unhandled
+ *  console error. */
+export function guard<A extends unknown[]>(fn: (...args: A) => Promise<unknown>): (...args: A) => void {
   return (...args: A) => {
     fn(...args).catch((e: unknown) => {
       ui.toast(e instanceof Error ? e.message : String(e), "err");

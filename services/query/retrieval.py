@@ -69,6 +69,11 @@ RETRYABLE_STATUS = {429, 502, 503, 504}
 SECTION_FETCH_LIMIT = 64
 
 
+class NoCollection(RuntimeError):
+    """The Qdrant collection doesn't exist yet -- a fresh install before the
+    first `ragctl embed`. Readers treat it as an empty index."""
+
+
 def estimate_tokens(text: str) -> int:
     # Rough (≈4 characters per token for English); only used for budgets.
     return len(text) // 4 + 1
@@ -208,7 +213,7 @@ class Retriever:
     def _qdrant(self, method: str, path: str, body: dict | None = None) -> dict:
         resp = self._client.request(method, f"{self.cfg.qdrant_url}{path}", json=body, timeout=60)
         if resp.status_code == 404 and "doesn't exist" in resp.text:
-            raise RuntimeError(f"Qdrant collection {self.cfg.collection!r} doesn't exist. Run `./ragctl embed` first.")
+            raise NoCollection(f"Qdrant collection {self.cfg.collection!r} doesn't exist. Run `./ragctl embed` first.")
         if resp.is_error:
             raise RuntimeError(f"qdrant {method} {path} failed ({resp.status_code}): {resp.text[:500]}")
         return resp.json()["result"]
@@ -219,9 +224,8 @@ class Retriever:
         try:
             self._qdrant("POST", f"/collections/{self.cfg.collection}/points/delete?wait=true",
                          {"filter": {"must": [{"key": "doc_sha", "match": {"value": doc_sha}}]}})
-        except RuntimeError as exc:
-            if "doesn't exist" not in str(exc):
-                raise
+        except NoCollection:
+            pass
 
     def _check_index(self) -> None:
         """Query vectors must come from the model the index was built with;
@@ -296,7 +300,10 @@ class Retriever:
         question = question.strip()
         if not question or doc_shas is not None and not doc_shas:
             return []
-        self._check_index()
+        try:
+            self._check_index()
+        except NoCollection:
+            return []  # nothing embedded yet
         mode = mode or self.cfg.mode
         vector = None if mode == "bm25" else self.embed_query(question)
         points = self._qdrant("POST", f"/collections/{self.cfg.collection}/points/query",
@@ -331,7 +338,10 @@ class Retriever:
         }
         points: list[dict] = []
         while True:
-            result = self._qdrant("POST", f"/collections/{self.cfg.collection}/points/scroll", body)
+            try:
+                result = self._qdrant("POST", f"/collections/{self.cfg.collection}/points/scroll", body)
+            except NoCollection:
+                return [], 0
             points.extend(result["points"])
             next_offset = result.get("next_page_offset")
             if not next_offset:

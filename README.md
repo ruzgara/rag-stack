@@ -20,9 +20,12 @@ API, storing chat history — natively and OpenAI-compatibly. It has
 rather than granted, manageable from `ragctl user` or the admin console at
 `/admin`. Several
 sessions can use it at once, with turns queueing for the GPU. There is now
-a **chat UI** (`ui/`, Svelte + Vite, served at `/`): sign-in, conversations,
-streaming markdown answers with citations beside the sources they cite, and
-per-library filtering.
+a **chat UI** (`ui/`, Svelte + Vite, served at `/`, drawn from the
+Broadsheet mockup in `design/`): workspaces holding libraries and chats,
+streaming markdown answers with their searches and reasoning shown, citations
+beside the sources they cite and a chunk-by-chunk source viewer, stop and
+retry, library management and sharing, uploads, groups, API tokens, and a
+Recently deleted tray.
 
 **You provide the models.** What's wired up and pinned to specific
 versions: OCR, document parsing, the Ollama-backed VLM OCR fallback, and
@@ -404,7 +407,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `POST /api/libraries` | any signed-in user creates a library (`{name, description?}`) and becomes its owner -- full access right away, no separate grant |
 | `GET /api/libraries/{id}` | a library's own documents, for anyone who can read it |
 | `PATCH` · `DELETE /api/libraries/{id}` | rename / change `description`, or delete -- the owner or an admin (`can_manage`) |
-| `PUT` · `DELETE /api/libraries/{id}/documents/{sha}` | assign / unassign an already-indexed document -- needs write on the library, and adding also needs the caller to already be able to read that document elsewhere (otherwise a writer could pull any indexed document into their own library and read it from there) |
+| `PUT` · `DELETE /api/libraries/{id}/documents/{sha}` | assign / unassign an already-indexed document -- needs write on the library, and adding also needs the caller to already be able to read that document elsewhere (otherwise a writer could pull any indexed document into their own library and read it from there). Unassigning it from its *last* library purges the document itself -- index, disk and the uploads it came from (`{purged: true/false}`) -- rather than leaving it indexed where nobody can reach it |
 | `GET /api/libraries/{id}/access` | `{owner: {id, name} \| null, access: [{subject_type, subject_id, name, role}]}` -- the owner or an admin |
 | `PUT /api/libraries/{id}/access` | `{subject_type, subject_id, role}` (`read`/`write`) -- upsert; owner or admin |
 | `DELETE /api/libraries/{id}/access/{subject_type}/{subject_id}` | revoke -- owner or admin |
@@ -469,8 +472,10 @@ leave the service writing to an unlinked inode until its next restart.
 
 `ragctl clean --yes` wipes `data/inbox`, `work`, `processed`, `failed`,
 `markdown`, `docling` and `manifest.jsonl`, deletes the Qdrant collection,
-and clears `data/chat.db` entirely — conversations, uploads, users, groups,
-libraries and access. It's a full reset: after running it, sign-in needs a fresh
+and deletes `data/chat.db` — conversations, uploads, users, groups,
+libraries and access — restarting the query service around it so the
+database comes back empty with the current schema (there are no migrations,
+so this is also the way onto a changed schema). It's a full reset: after running it, sign-in needs a fresh
 `ragctl user add you@example.com --name "Your Name" --admin`. Model caches (`data/hf-cache`,
 `data/docling-artifacts`) are left alone since they're expensive to
 redownload and aren't "your data."
@@ -666,7 +671,11 @@ file, so the mapping is already in place once embedding makes the document
 searchable. Assigning one directly (`PUT /api/libraries/{id}/documents/{sha}`)
 needs write on the target library *and* that the caller can already read that
 document somewhere -- otherwise a writer could pull any indexed document on
-the machine into their own library and read it from there.
+the machine into their own library and read it from there. Unassigning works
+the other way round: taking a document out of the last library holding it
+purges the document (`purge.py`, the same path `DELETE /api/uploads/{id}`
+takes), since what no library holds is reachable by nobody but an admin --
+and every upload it came from is marked deleted with it, whoever made them.
 
 **What a search actually sees**, resolved fresh on every question rather than
 trusted from when a conversation attached its libraries — losing read access
@@ -770,8 +779,10 @@ cd services/ingest && uv run pytest   # or directly, per service
 
 The UI's tests (`ui/src/tests/`) cover the SSE frame parser (chunked at
 several byte sizes, to catch boundary bugs), the streaming-markdown fence
-tracker, citation parsing and linkification, conversation-to-turn pairing,
-and the permissions-map shapes -- all pure TypeScript, no browser needed.
+tracker, citation parsing and linkification, turn building (live events and
+the trace rebuilt from a stored answer), and a smoke test that mounts the
+whole app in jsdom against a fake API -- sign in, open a chat, stream and
+stop a turn, open every popup. No browser needed.
 `./ragctl ui check` runs `svelte-check`.
 
 Most need no running services, network, `.env` or `data/`, and take a few

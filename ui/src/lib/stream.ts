@@ -10,19 +10,22 @@ export type TurnOutcome =
   | { kind: "complete" } // `done` seen (a `title` may follow)
   | { kind: "rejected"; error: string } // `error` with NO preceding `user` -- gate busy, nothing stored
   | { kind: "failed"; error: string } // `error` AFTER `user` -- a partial was persisted
+  | { kind: "stopped" } // POST .../stop ended it; a partial may be stored
   | { kind: "truncated" } // neither -- network died mid-stream; the turn may still finish server-side
   | { kind: "aborted" }; // we called abort(); the server turn keeps going
 
+/** `body` null is a retry (POST .../retry takes none); otherwise a new
+ *  message (POST .../messages). Both stream the same event kinds. */
 export async function runTurn(
   convId: string,
-  body: { content: string; preset?: string },
+  body: { content: string; preset?: string } | null,
   onEvent: (ev: TurnEvent) => void,
   signal: AbortSignal,
 ): Promise<TurnOutcome> {
-  const res = await fetch(`/api/conversations/${convId}/messages`, {
+  const res = await fetch(`/api/conversations/${convId}/${body ? "messages" : "retry"}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    headers: body ? { "content-type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
     signal,
   });
   // 401/403/404/422 arrive here, before any stream exists. Once the stream is
@@ -34,6 +37,7 @@ export async function runTurn(
   const decoder = new TextDecoder();
   let sawUser = false;
   let sawDone = false;
+  let sawStopped = false;
   let failure: string | null = null;
 
   const dispatch = (frames: SseFrame[]) => {
@@ -48,6 +52,7 @@ export async function runTurn(
       if (ev.type === "user") sawUser = true;
       if (ev.type === "done") sawDone = true; // do NOT stop reading: `title` comes after
       if (ev.type === "error") failure = ev.error;
+      if (ev.type === "stopped") sawStopped = true;
       onEvent(ev);
     }
   };
@@ -69,5 +74,6 @@ export async function runTurn(
   if (failure !== null) {
     return sawUser ? { kind: "failed", error: failure } : { kind: "rejected", error: failure };
   }
-  return sawDone ? { kind: "complete" } : { kind: "truncated" };
+  if (sawDone) return { kind: "complete" };
+  return sawStopped ? { kind: "stopped" } : { kind: "truncated" };
 }

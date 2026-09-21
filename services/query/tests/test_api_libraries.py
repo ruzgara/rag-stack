@@ -15,12 +15,29 @@ from fastapi import HTTPException
 from retrieval import Retriever, SearchConfig
 
 
+class FakeRetriever:
+    """Only what a purge asks of it (see test_api_uploads.py)."""
+
+    def __init__(self):
+        self.deleted: list[str] = []
+
+    def delete_document(self, doc_sha: str) -> None:
+        self.deleted.append(doc_sha)
+
+
 @pytest.fixture
 def acc(tmp_path, monkeypatch):
     db = ChatDB(tmp_path / "chat.db")
     accounts = Accounts(db)
     monkeypatch.setattr(api.state, "db", db, raising=False)
     monkeypatch.setattr(api.state, "accounts", accounts, raising=False)
+    # Taking a document out of its last library purges it (api.remove_document),
+    # so these tests need an index to delete from and a data directory to
+    # delete in -- neither of them the real one.
+    monkeypatch.setattr(api.state, "retriever", FakeRetriever(), raising=False)
+    monkeypatch.setattr(api, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(api, "INBOX", tmp_path / "inbox")
+    monkeypatch.setattr(api, "MANIFEST", tmp_path / "manifest.jsonl")
     # create_conversation/update_conversation check the preset name against
     # this; nothing here runs an actual turn.
     fake_chat = type("Chat", (), {"cfg": type("Cfg", (), {
@@ -339,10 +356,12 @@ def test_a_reader_cannot_add_documents(acc, member):
 def test_a_writer_can_remove_a_document_without_needing_to_read_it_elsewhere(acc, member):
     lib = api.create_library(api.NewLibrary(name="Project finance"), user=member)
     acc.add_document(lib["id"], "sha-1")
+    acc.add_document(own(member), "sha-1")  # elsewhere too, so this only unassigns
 
-    api.remove_document(lib["id"], "sha-1", user=member)
+    assert api.remove_document(lib["id"], "sha-1", user=member) == {"purged": False}
 
-    assert acc.libraries_of("sha-1") == []
+    assert acc.libraries_of("sha-1") == [own(member)]
+    assert api.state.retriever.deleted == []
 
 
 def test_a_reader_cannot_remove_documents(acc, member):

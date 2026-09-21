@@ -1,5 +1,5 @@
-// The verified API contract for services/query. No logic here -- see
-// docs/plan §2 for the file:line citations each shape was checked against.
+// The API contract for services/query, as api.py / db.py / accounts.py
+// return it. No logic here.
 
 export type Preset = "everyday" | "hard";
 export type AuthMode = "password" | "proxy";
@@ -12,36 +12,192 @@ export interface PublicUser {
   display_name: string | null;
   is_admin: boolean;
   disabled: boolean;
+  /** Group NAMES (accounts.py _row_to_user), not ids. */
   groups: string[];
   created_at: number;
   last_login_at: number | null;
 }
 
-/** api.py:291. Keyed by permission name. Values are ["*"] for an admin, the
- *  LITERAL STRING "None" for a non-admin holding a global permission, or an
- *  array of library ids for library.read / library.write. See permissions.ts. */
-export type Permissions = Record<string, string[]>;
-
+/** api.py me(): what a caller may do is per library now (Library.role),
+ *  so there is no permissions map -- is_admin is the only global fact. */
 export interface Me {
   user: PublicUser;
-  permissions: Permissions;
   auth_mode: AuthMode;
+}
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  hint: string;
+  created_at: number;
+  last_used_at: number | null;
+  expires_at: number | null;
+}
+
+export interface UserHit {
+  id: string;
+  name: string | null;
+  email: string;
+}
+
+export interface Group {
+  id: string;
+  name: string;
+  description: string | null;
+  type: "open" | "locked";
+  member_count: number;
+}
+
+// ------------------------------------------------------------- libraries --
+
+export type LibraryRole = "owner" | "write" | "read";
+/** Why the caller can see it: they own it, they're an admin, it was shared
+ *  with them directly, or via one of their groups. */
+export type LibrarySource = "owner" | "admin" | "user" | "group";
+
+export interface Library {
+  id: string;
+  name: string;
+  description: string | null;
+  owner_id: string | null;
+  owner_name: string | null;
+  created_at: number;
+  document_count: number;
+  role: LibraryRole | null;
+  source: LibrarySource | null;
+}
+
+export interface DocumentInfo {
+  sha256: string;
+  filename: string;
+  status: string | null; // "processed" | "failed"
+  route: string | null;
+  pages: number | null;
+  chars: number | null;
+  error: string | null;
+  processed_at: number | null;
+}
+
+export interface LibraryDetail extends Omit<Library, "source"> {
+  documents: DocumentInfo[];
+}
+
+export interface AccessEntry {
+  subject_type: "user" | "group";
+  subject_id: string;
+  name: string;
+  role: "read" | "write";
+}
+
+export interface LibraryAccess {
+  owner: { id: string; name: string | null } | null;
+  access: AccessEntry[];
+}
+
+export interface IngestStatus {
+  autorun: boolean;
+  running: boolean;
+  pending: boolean;
+  last_run: { started_at: number; finished_at: number; exit_code: number } | null;
+}
+
+export interface DocumentsResponse {
+  documents: DocumentInfo[];
+  inbox: string[];
+  ingest: IngestStatus;
+}
+
+export interface Chunk {
+  chunk_index: number;
+  headings: string[];
+  pages: number[];
+  text: string;
+}
+
+export interface ChunksResponse {
+  sha256: string;
+  filename: string;
+  total: number;
+  chunks: Chunk[];
+}
+
+export interface UploadRejection {
+  filename: string | null;
+  reason: string;
+}
+
+export type UploadQuota =
+  | { unlimited: true; files_used: number; mb_used: number }
+  | {
+      unlimited: false;
+      files_left: number;
+      mb_left: number;
+      files_per_window: number;
+      mb_per_window: number;
+      max_file_mb: number;
+      window_hours: number;
+    };
+
+export interface UploadResponse {
+  saved: string[];
+  rejected: UploadRejection[];
+  ingest: string;
+  quota: UploadQuota;
+}
+
+export interface UploadRecord {
+  id: string;
+  filename: string;
+  bytes: number;
+  doc_sha: string;
+  created_at: number;
+  status: string; // "waiting" | "processed" | "failed" | "unknown"
+}
+
+export interface LoadStats {
+  running: number;
+  queued: number;
+  max_concurrent: number;
+  max_per_user: number;
+}
+
+export interface QuotaResponse {
+  uploads: UploadQuota;
+  load: LoadStats;
+}
+
+// ------------------------------------------------------------ workspaces --
+
+export interface Workspace {
+  id: string;
+  name: string;
+  description: string | null;
+  created_at: number;
+  updated_at: number;
+  last_used_at: number;
+  library_ids: string[];
+  /** Only on the list endpoint. */
+  conversation_count?: number;
 }
 
 // ------------------------------------------------------------- conversations --
 
-/** Three distinct shapes. Do not collapse into one interface -- see plan §2. */
 export interface ConversationBase {
   id: string;
   title: string | null;
   preset: Preset;
+  workspace_id: string | null;
   created_at: number;
   updated_at: number;
+  last_read_at: number;
+  last_message_at?: number;
+  archived: number | boolean;
   library_ids: string[];
 }
 
 export interface ConversationListItem extends ConversationBase {
   message_count: number;
+  last_message_at: number;
 }
 
 export interface ConversationDetail extends ConversationBase {
@@ -49,23 +205,23 @@ export interface ConversationDetail extends ConversationBase {
 }
 
 export interface TurnStats {
-  auto_search: boolean;
-  tool_rounds: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  first_token_s: number | null;
-  total_s: number;
-  source_tokens: number;
+  auto_search?: boolean;
+  tool_rounds?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  first_token_s?: number | null;
+  total_s?: number;
+  source_tokens?: number;
   rewrite_s?: number;
   search_s?: number;
   listed_documents?: number;
+  context_used?: number;
+  context_limit?: number | null;
+  context_used_pct?: number | null;
 }
 
-/** chat.py:163-176, asdict(Source) -- 11 fields, no `cited` on the wire from
- *  the incremental `sources` SSE event. `cited` is declared optional here
- *  (rather than only on DoneSource) so a Turn's `sources` array can hold
- *  either shape without a cast: it starts as bare Source[] mid-stream and is
- *  wholesale-replaced by DoneSource[] once `done` arrives. */
+/** chat.py Source. `cited` is absent on the incremental `sources` SSE event
+ *  and present once `done` (or the stored copy) arrives. */
 export interface Source {
   number: number;
   found_by: "auto" | "tool";
@@ -82,7 +238,8 @@ export interface Source {
 }
 
 export type DoneSource = Source & { cited: boolean };
-export type StoredSource = DoneSource;
+
+export type AnswerStatus = "complete" | "error" | "stopped";
 
 export type Message =
   | { id: string; role: "user"; content: string; created_at: number }
@@ -94,10 +251,10 @@ export type Message =
       model: string | null;
       preset: string | null;
       search_queries: string[];
-      status: "complete" | "error";
+      status: AnswerStatus;
       error: string | null;
       stats: TurnStats;
-      sources: StoredSource[];
+      sources: DoneSource[];
     };
 
 // -------------------------------------------------------------------- sse --
@@ -125,83 +282,17 @@ export type TurnEvent =
       sources: DoneSource[];
     }
   | { type: "title"; title: string }
-  | { type: "error"; error: string };
-
-// ------------------------------------------------------------- libraries --
-
-export interface Library {
-  id: string;
-  name: string;
-  description: string | null;
-  created_at: number;
-  document_count: number;
-}
-
-export interface DocumentInfo {
-  sha256: string;
-  filename: string;
-  status: string | null;
-  route: string | null;
-  pages: number | null;
-  chars: number | null;
-  error: string | null;
-  processed_at: number | null;
-}
-
-export interface IngestStatus {
-  autorun: boolean;
-  running: boolean;
-  pending: boolean;
-  last_run: { started_at: number; finished_at: number; exit_code: number } | null;
-}
-
-export interface DocumentsResponse {
-  documents: DocumentInfo[];
-  inbox: string[];
-  ingest: IngestStatus;
-}
-
-export interface UploadRejection {
-  filename: string | null;
-  reason: string;
-}
-
-export type UploadQuota =
-  | { unlimited: true; files_used: number; mb_used: number }
-  | {
-      unlimited: false;
-      files_left: number;
-      mb_left: number;
-      files_per_window: number;
-      mb_per_window: number;
-      max_file_mb: number;
-      window_hours: number;
-    };
-
-export interface UploadResponse {
-  saved: string[];
-  rejected: UploadRejection[];
-  ingest: string;
-  quota: UploadQuota;
-}
-
-export interface LoadStats {
-  running: number;
-  queued: number;
-  max_concurrent: number;
-  max_per_user: number;
-}
-
-export interface QuotaResponse {
-  uploads: UploadQuota;
-  load: LoadStats;
-}
+  | { type: "error"; error: string }
+  /** Empty ({}) when stopped while still queued -- nothing was stored. */
+  | { type: "stopped"; message_id?: string; answer?: string; cited?: number[] };
 
 // ----------------------------------------------------------------- health --
 
 export interface HealthCheckOk { ok: true; [k: string]: unknown }
 export interface HealthCheckErr { ok: false; error: string }
 export type HealthCheck = HealthCheckOk | HealthCheckErr;
+
+export interface PresetInfo { model: string; tools: boolean; think: boolean }
 
 export interface HealthResponse {
   ok: boolean;
@@ -210,8 +301,7 @@ export interface HealthResponse {
   database: HealthCheck;
   reranker?: { ok: true; model: string; device: string } | { ok: true; loading: true };
   load: { ok: true } & LoadStats;
-  presets: { ok: true; [preset: string]: unknown };
-  /** Added alongside this UI -- see plan §8(d). Absent on an older server. */
+  presets: { ok: true } & Record<string, PresetInfo | boolean>;
   auth?: { ok: true; mode: AuthMode };
 }
 

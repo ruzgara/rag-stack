@@ -376,3 +376,68 @@ def test_nobody_can_delete_someone_elses_upload(inbox, user, retriever):
 
     assert exc.value.status_code == 404
     assert retriever.deleted == [] and (inbox / "book.pdf").exists()
+
+
+# --------------------------------- taking a document out of its last library --
+
+
+def test_removing_a_document_from_its_last_library_purges_it(inbox, user, retriever):
+    import json
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    sha = ingested(inbox, "book.pdf", b"x" * 1_000)
+
+    assert api.remove_document(own(user), sha, user=user) == {"purged": True}
+
+    data = inbox.parent
+    assert retriever.deleted == [sha]
+    assert not (data / "processed" / "book.pdf").exists()
+    assert not (data / "markdown" / f"{sha}.md").exists() and not (data / "docling" / f"{sha}.json").exists()
+    last = json.loads((data / "manifest.jsonl").read_text().splitlines()[-1])
+    assert (last["sha256"], last["status"]) == (sha, "deleted")
+    assert api.state.accounts.libraries_of(sha) == []
+    assert api.list_uploads(user=user)["uploads"] == []  # the upload it came from goes with it
+    assert api.state.db.upload_usage(3600, user_id=user.id) == (1, 1_000)  # the quota isn't refunded
+
+
+def test_a_document_another_library_still_has_is_only_unassigned(inbox, user, retriever):
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    sha = ingested(inbox, "book.pdf", b"x" * 1_000)
+    shared = api.create_library(api.NewLibrary(name="Shared"), user=user)["id"]
+    api.state.accounts.add_document(shared, sha)
+
+    assert api.remove_document(own(user), sha, user=user) == {"purged": False}
+
+    assert retriever.deleted == []
+    assert api.state.accounts.libraries_of(sha) == [shared]
+    assert (inbox.parent / "markdown" / f"{sha}.md").exists()
+    assert len(api.list_uploads(user=user)["uploads"]) == 1
+
+
+def test_the_last_library_wins_even_over_someone_elses_upload(inbox, user, retriever):
+    """Whoever uploaded it, a document no library holds is reachable by
+    nobody but an admin -- so it goes, and their upload goes with it."""
+    other = api.state.accounts.create_user("other@example.com", display_name="Other")
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    api.upload(user=other, library_id=own(other), files=[pdf("same-bytes.pdf")])  # identical content
+    sha = ingested(inbox, "book.pdf", b"x" * 1_000)
+    api.remove_document(own(other), sha, user=other)  # their library was one of the two
+
+    assert api.remove_document(own(user), sha, user=user) == {"purged": True}
+
+    assert retriever.deleted == [sha]
+    assert not (inbox / "same-bytes.pdf").exists()  # their copy still waiting in the inbox
+    assert api.list_uploads(user=other)["uploads"] == []
+
+
+def test_nothing_is_removed_from_the_library_when_the_index_cant_be_reached(inbox, user, retriever):
+    retriever.down = True
+    api.upload(user=user, library_id=own(user), files=[pdf("book.pdf")])
+    sha = ingested(inbox, "book.pdf", b"x" * 1_000)
+
+    with pytest.raises(HTTPException) as exc:
+        api.remove_document(own(user), sha, user=user)
+
+    assert exc.value.status_code == 503
+    assert api.state.accounts.libraries_of(sha) == [own(user)]  # still there to retry
+    assert (inbox.parent / "markdown" / f"{sha}.md").exists()
+    assert len(api.list_uploads(user=user)["uploads"]) == 1

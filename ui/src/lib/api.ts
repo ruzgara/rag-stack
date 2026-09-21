@@ -15,6 +15,14 @@ export class ApiError extends Error {
   }
 }
 
+let onUnauthorized: (() => void) | null = null;
+
+/** Registered by session.svelte.ts: a 401 from any call means the session
+ *  ended (signed out elsewhere, password changed, account disabled). */
+export function setUnauthorizedHandler(fn: () => void): void {
+  onUnauthorized = fn;
+}
+
 /** 401 = not signed in. The caller (session.svelte.ts) reacts by showing the
  *  gate; this module has no dependency on Svelte or app state, so it just
  *  throws a typed error and lets state modules decide what a 401 means. */
@@ -32,7 +40,10 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}): Pr
 
   const res = await fetch(path, { ...init, headers, body: body as BodyInit | null | undefined });
 
-  if (!res.ok) throw await toApiError(res);
+  if (!res.ok) {
+    if (res.status === 401 && !path.startsWith("/api/auth/")) onUnauthorized?.();
+    throw await toApiError(res);
+  }
   if (res.status === 204) return null as T;
   const text = await res.text();
   return (text ? JSON.parse(text) : null) as T;

@@ -802,11 +802,28 @@ def add_document(library_id: str, doc_sha: str, user: User = CurrentUser) -> Non
         raise HTTPException(404, "no such library") from None
 
 
-@app.delete("/api/libraries/{library_id}/documents/{doc_sha}", status_code=204)
-def remove_document(library_id: str, doc_sha: str, user: User = CurrentUser) -> None:
+@app.delete("/api/libraries/{library_id}/documents/{doc_sha}")
+def remove_document(library_id: str, doc_sha: str, user: User = CurrentUser) -> dict:
+    """Takes a document out of one library. If this was the last library
+    holding it, the document itself goes too -- out of the index and off the
+    disk (see purge.py), and every upload it came from is marked deleted with
+    it: nothing is kept indexed that no library reaches any more. `purged`
+    says which happened. Needs write on the library."""
     if not state.accounts.can_write(user.id, library_id):
         raise HTTPException(403, f"{user.email} can't remove documents from library {library_id}")
+    if state.accounts.libraries_of(doc_sha) != [library_id]:
+        state.accounts.remove_document(library_id, doc_sha)
+        return {"purged": False}
+    # The index goes first, same as delete_upload: if Qdrant can't be reached
+    # the membership stays, and the caller can try again.
+    try:
+        purge_document(doc_sha, retriever=state.retriever, data_dir=DATA_DIR, inbox=INBOX, manifest=MANIFEST,
+                       inbox_names=state.db.document_filenames(doc_sha))
+    except (RuntimeError, httpx.HTTPError) as exc:
+        raise HTTPException(503, f"couldn't remove it from the index, nothing was deleted: {exc}") from None
+    state.db.delete_all_uploads(doc_sha)
     state.accounts.remove_document(library_id, doc_sha)
+    return {"purged": True}
 
 
 @app.get("/api/libraries/{library_id}/access")
@@ -1493,7 +1510,10 @@ def health() -> JSONResponse:
         try:
             resp = client.post(f"{cfg.qdrant_url}/collections/{cfg.collection}/points/count", json={"exact": False})
             if resp.status_code == 404:
-                checks["qdrant"] = {"ok": False, "error": f"collection {cfg.collection} doesn't exist; run ragctl embed"}
+                # A fresh install has no collection until the first embed
+                # creates it; that's an empty index, not a fault.
+                checks["qdrant"] = {"ok": True, "collection": cfg.collection, "chunks": 0,
+                                    "note": "no documents embedded yet"}
             else:
                 resp.raise_for_status()
                 checks["qdrant"] = {"ok": True, "collection": cfg.collection, "chunks": resp.json()["result"]["count"]}

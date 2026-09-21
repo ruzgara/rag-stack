@@ -38,6 +38,9 @@ export default defineConfig({
       "/admin": { target: "http://127.0.0.1:8088", changeOrigin: false },
     },
   },
+  // Tests mount real components (tests/app.smoke.test.ts), which needs
+  // Svelte's browser build rather than the server one Node would resolve.
+  resolve: process.env.VITEST ? { conditions: ["browser"] } : undefined,
   test: {
     environment: "jsdom",
     include: ["src/tests/**/*.test.ts"],

@@ -612,14 +612,32 @@ cmd_clean() {
 
     echo "== Chat history =="
     if [[ -f "$DATA_DIR/chat.db" ]]; then
-        # Delete rows rather than the file: a running query service keeps
-        # using it, and would otherwise recreate it without its tables.
-        # Everything goes, including accounts -- this is a full reset. The
-        # next login has to be `ragctl user add ... --admin` again.
-        sqlite3 "$DATA_DIR/chat.db" \
-            "PRAGMA foreign_keys=ON; DELETE FROM conversations; DELETE FROM uploads; DELETE FROM library_access; DELETE FROM group_members; DELETE FROM groups; DELETE FROM libraries; DELETE FROM users;" \
-            && ok "Deleted all conversations, uploads, users, groups, libraries and access" \
-            || warn "Could not clear data/chat.db"
+        # Delete the file, not just its rows: there are no migrations
+        # (see services/query/db.py), so only a fresh file picks up the
+        # current schema -- a row-cleared one keeps its old tables and the
+        # service fails to start once the schema has moved on. Everything
+        # goes, including accounts; the next login needs `ragctl user add
+        # ... --admin` again.
+        #
+        # The query service opens the file per request, so a running one
+        # would recreate it empty, without tables. It's stopped first and
+        # started again after, and its startup builds the schema.
+        local query_was_running=false
+        if launchd_label_loaded "com.ragstack.query"; then
+            query_was_running=true
+            launchctl bootout "gui/$(id -u)/com.ragstack.query" >/dev/null 2>&1 || true
+            for _ in $(seq 1 30); do
+                launchd_label_loaded "com.ragstack.query" || break
+                sleep 0.1
+            done
+        fi
+        rm -f "$DATA_DIR/chat.db" "$DATA_DIR/chat.db-wal" "$DATA_DIR/chat.db-shm"
+        ok "Deleted data/chat.db: all conversations, uploads, users, groups, libraries and access"
+        if $query_was_running; then
+            render_all
+            load_agent "com.ragstack.query"
+            ok "Restarted the query service; it recreated data/chat.db with the current schema"
+        fi
     else
         info "No chat history yet"
     fi
