@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import httpx
 import pypdfium2 as pdfium
 import pytest
 from conftest import BODY, PAGE_H, PAGE_W, H, add_image, add_text, levels_of
@@ -480,3 +481,95 @@ def test_a_deleted_document_is_converted_again_when_re_uploaded(dirs):
     with ingest.MANIFEST.open("a") as f:
         f.write(json.dumps({"sha256": "aaa", "filename": "a.pdf", "status": "processed"}) + "\n")
     assert ingest.already_processed("aaa")  # converted again after the delete
+
+
+# ------------------------------------------------- surviving docling deaths --
+
+def docling_server(script, md="converted text"):
+    """A fake docling-serve whose /v1/convert/file/async raises whatever
+    `script` pops next (an exception to raise, or None to serve the file
+    normally). Health answers 200 only once the script is exhausted, which is
+    how a launchd-restarted server behaves: down, then back."""
+    calls = {"convert": 0, "health": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            calls["health"] += 1
+            if script:
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(200, json={"status": "ok"})
+        if request.url.path.endswith("/convert/file/async"):
+            calls["convert"] += 1
+            if script:
+                raise script.pop(0)(request)
+            return httpx.Response(200, json={"task_id": "t1"})
+        if "/status/poll/" in request.url.path:
+            return httpx.Response(200, json={"task_status": "success"})
+        if "/result/" in request.url.path:
+            return httpx.Response(200, json={"status": "success", "document": {
+                "md_content": md, "json_content": {"texts": []}}})
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    return httpx.Client(transport=httpx.MockTransport(handler)), calls
+
+
+@pytest.fixture
+def instant_retries(monkeypatch):
+    """No real waiting: the retry logic is what's under test, not the clock."""
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ingest, "DOCLING_HEALTH_POLL", 0)
+    monkeypatch.setattr(ingest, "DOCLING_RESTART_WAIT", 0.05)
+
+
+def test_a_docling_restart_mid_file_is_retried_not_failed(instant_retries):
+    """The crash that cost a whole 19-file batch: docling dies, launchd brings
+    it back seconds later, and the file must convert rather than fail."""
+    gone = [lambda r: httpx.RemoteProtocolError("Server disconnected without sending a response.", request=r)]
+    client, calls = docling_server(gone)
+
+    md, doc = ingest.docling_convert(client, config(), Path(__file__), {}, "digital")
+
+    assert md == "converted text"
+    assert calls["convert"] == 2       # died once, retried once
+    assert calls["health"] >= 1        # waited for it to come back first
+
+
+def test_each_file_survives_its_own_restart(instant_retries):
+    """The real batch failure mode: the server dies again on the next file.
+    Every file gets its own budget, so one death does not doom the rest."""
+    for err in (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.PoolTimeout):
+        client, calls = docling_server([lambda r, e=err: e("server went away", request=r)
+                                        if e is not httpx.PoolTimeout else e("pool timeout")])
+        md, _ = ingest.docling_convert(client, config(), Path(__file__), {}, "digital")
+        assert md == "converted text", err
+        assert calls["convert"] == 2, err
+
+
+def test_a_server_that_never_comes_back_fails_that_file_clearly(instant_retries):
+    """Distinct from a crash loop: the message must point at the server, not
+    at the document, so the operator knows what to go and look at."""
+    client, _ = docling_server([lambda r: httpx.ConnectError("refused", request=r)] * 10)
+
+    with pytest.raises(RuntimeError, match="did not come back"):
+        ingest.docling_convert(client, config(), Path(__file__), {}, "digital")
+
+
+def test_a_document_that_kills_docling_every_time_gives_up(instant_retries, monkeypatch):
+    """Health recovers each time but the conversion keeps killing it: stop
+    after the attempt budget instead of restarting the server forever."""
+    monkeypatch.setattr(ingest, "wait_for_docling", lambda *a, **k: True)
+    client, calls = docling_server([lambda r: httpx.RemoteProtocolError("boom", request=r)] * 10)
+
+    with pytest.raises(RuntimeError, match="crashing on this document"):
+        ingest.docling_convert(client, config(), Path(__file__), {}, "digital")
+    assert calls["convert"] == ingest.DOCLING_ATTEMPTS
+
+
+def test_a_slow_conversion_is_not_retried(instant_retries):
+    """A read timeout means the server is still working on it; retrying would
+    queue the same expensive conversion a second time."""
+    client, calls = docling_server([lambda r: httpx.ReadTimeout("too slow", request=r)])
+
+    with pytest.raises(httpx.ReadTimeout):
+        ingest.docling_convert(client, config(), Path(__file__), {}, "digital")
+    assert calls["convert"] == 1

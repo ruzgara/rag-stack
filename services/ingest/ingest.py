@@ -107,6 +107,34 @@ OSD_DPI = 150
 # measured 3.4-10; near-blank/show-through pages produce spurious guesses <1.
 OSD_MIN_CONFIDENCE = 2.0
 
+# docling-serve is a separate process kept alive by launchd, so a crash (it
+# segfaults if two conversions run at once -- see DOCLING_LOC_NUM_WORKERS in
+# .env) or a `ragctl reload` lands here as a dropped connection, and the
+# server is usually back within ~15s. Without these retries the whole batch
+# dies with it: every remaining file fails against a closed port in
+# milliseconds, so one crash costs the entire run.
+DOCLING_ATTEMPTS = 3
+# Long enough to cover launchd's ThrottleInterval (10s) plus docling's model
+# loading, with room for a machine under load.
+DOCLING_RESTART_WAIT = 180.0
+# At startup we only need to cover a server still booting -- the ingest
+# LaunchAgent fires on files landing in data/inbox, which can happen while
+# docling is restarting. A shorter wait so a genuinely dead server still
+# fails the run promptly.
+DOCLING_START_WAIT = 60.0
+DOCLING_HEALTH_POLL = 2.0
+# Errors meaning "the server went away", as opposed to "the server is slow".
+# Read/write timeouts are deliberately excluded: the conversion may still be
+# running server-side, and retrying would queue the same work twice.
+DOCLING_GONE = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.PoolTimeout,
+)
+
 VERBOSE = False
 
 # pdfium is not thread-safe, and two files are processed concurrently.
@@ -370,7 +398,51 @@ def apply_rotations(path: Path, sha: str, to_rotate: dict[int, int]) -> tuple[Pa
 
 # ------------------------------------------------------------------- docling --
 
+def wait_for_docling(client: httpx.Client, cfg: Config, deadline: float) -> bool:
+    """Block until docling-serve answers /health, or `deadline` seconds pass."""
+    t0 = time.monotonic()
+    while True:
+        try:
+            if client.get(f"{cfg.docling_url}/health", timeout=5).status_code == 200:
+                return True
+        except httpx.HTTPError:
+            pass  # still down; keep waiting until the deadline
+        if time.monotonic() - t0 >= deadline:
+            return False
+        time.sleep(DOCLING_HEALTH_POLL)
+
+
 def docling_convert(client: httpx.Client, cfg: Config, path: Path, options: dict, label: str) -> tuple[str, dict]:
+    """Convert, retrying from the start if docling-serve dies mid-conversion.
+
+    The retry redoes the whole conversion rather than resuming the poll: the
+    task lives in the server's in-memory orchestrator, so a restart takes the
+    task_id with it and polling it again would only ever 404."""
+    last: Exception | None = None
+    for attempt in range(1, DOCLING_ATTEMPTS + 1):
+        try:
+            return docling_convert_once(client, cfg, path, options, label)
+        except DOCLING_GONE as exc:
+            last = exc
+            if attempt == DOCLING_ATTEMPTS:
+                break
+            log(f"  docling {label}: server went away ({type(exc).__name__}: {exc or 'connection lost'}); "
+                f"waiting for it to come back")
+            if not wait_for_docling(client, cfg, DOCLING_RESTART_WAIT):
+                raise RuntimeError(
+                    f"docling {label}: server did not come back within {DOCLING_RESTART_WAIT:.0f}s "
+                    f"of dying ({type(exc).__name__}). Check data/logs/docling-serve.log and `./ragctl status`."
+                ) from exc
+            log(f"  docling {label}: server is back, retrying from the start "
+                f"(attempt {attempt + 1}/{DOCLING_ATTEMPTS})")
+    raise RuntimeError(
+        f"docling {label}: server died {DOCLING_ATTEMPTS} times converting this file "
+        f"(last: {type(last).__name__}: {last}). It may be crashing on this document; "
+        f"see data/logs/docling-serve.log."
+    ) from last
+
+
+def docling_convert_once(client: httpx.Client, cfg: Config, path: Path, options: dict, label: str) -> tuple[str, dict]:
     """Convert via docling-serve's async API: long documents would otherwise
     hit its synchronous wait limit (DOCLING_SERVE_MAX_SYNC_WAIT)."""
     vprint(f"  docling {label}: converting {path.name}")
@@ -724,10 +796,12 @@ def main() -> int:
         print("No files to process.")
         return 0
 
-    try:
-        httpx.get(f"{cfg.docling_url}/health", timeout=10).raise_for_status()
-    except Exception as exc:
-        sys.exit(f"docling-serve is not reachable at {cfg.docling_url}/health ({exc}). Run `./ragctl status` first.")
+    with httpx.Client() as probe:
+        if not wait_for_docling(probe, cfg, DOCLING_START_WAIT):
+            sys.exit(
+                f"docling-serve did not answer {cfg.docling_url}/health within "
+                f"{DOCLING_START_WAIT:.0f}s. Run `./ragctl status` first."
+            )
 
     total = len(targets)
     todo: list[tuple[Path, str, str]] = []
