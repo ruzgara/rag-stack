@@ -386,7 +386,8 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `GET /api/workspaces/{id}/conversations` | chats in this workspace |
 | `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?, workspace_id?}`; `library_ids` only outside a workspace, 422 otherwise), list |
 | `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete |
-| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error` |
+| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error`, `stopped` |
+| `POST /api/conversations/{id}/stop` | stops the conversation's turn -- the one streaming and any queued behind it → `{stopped: n}` (0 if it had already finished). The turn's own stream ends with `stopped` (`{message_id, answer, cited}`; `{}` if it never left the queue), and the partial answer is kept with status `stopped`. Closing the stream alone doesn't stop a turn |
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
 | `GET /api/documents` | processed documents you can read (admins: all), your files waiting in the inbox (admins: everyone's), upload-ingest status |
 | `POST /api/upload` | multipart `files` + `library_id` (required) → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |

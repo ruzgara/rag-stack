@@ -147,6 +147,18 @@ def test_history_leaves_out_failed_answers_and_their_questions(db):
     ]
 
 
+def test_a_stopped_answer_stays_in_history_unless_it_had_nothing_yet(db):
+    """The user read what streamed before they stopped it, and may follow up
+    on it; a stop before the first token leaves nothing to follow up on."""
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q1")
+    answer(db, conv["id"], "half of a1", status="stopped")
+    db.add_user_message(conv["id"], "q2")
+    answer(db, conv["id"], "", status="stopped")
+    assert db.history(conv["id"]) == [
+        {"role": "user", "content": "q1"}, {"role": "assistant", "content": "half of a1"}]
+
+
 def test_preparing_a_retry_deletes_the_last_answer_and_returns_its_question(db):
     conv = db.create_conversation("everyday")
     db.add_user_message(conv["id"], "q1")

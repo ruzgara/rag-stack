@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS messages (
     model           TEXT,
     preset          TEXT,
     search_queries  TEXT,   -- JSON list: the auto-search query, then each tool query
-    status          TEXT NOT NULL DEFAULT 'complete',  -- complete | error
+    status          TEXT NOT NULL DEFAULT 'complete',  -- complete | error | stopped
     error           TEXT,
     stats           TEXT,   -- JSON: timings, token counts
     created_at      REAL NOT NULL
@@ -618,7 +618,9 @@ class ChatDB:
 
     def history(self, conv_id: str, user_id: str) -> list[dict]:
         """The conversation as chat messages, for the model. Failed
-        answers are left out; so are their questions."""
+        answers are left out; so are their questions. A stopped answer
+        stays if it got anywhere -- the user read that much of it, and may
+        well follow up on it ("go on")."""
         with self._conn() as db:
             rows = db.execute(
                 "SELECT role, content, status FROM messages WHERE conversation_id = ? AND user_id = ? ORDER BY created_at",
@@ -626,7 +628,8 @@ class ChatDB:
             ).fetchall()
         out: list[dict] = []
         for r in rows:
-            if r["role"] == "assistant" and r["status"] != "complete":
+            if r["role"] == "assistant" and r["status"] != "complete" and not (
+                    r["status"] == "stopped" and r["content"]):
                 if out and out[-1]["role"] == "user":
                     out.pop()
                 continue

@@ -29,7 +29,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated, Iterator
+from typing import Annotated, Callable, Iterator
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -39,12 +39,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from chat import ChatConfig, ChatError, ChatService
+from chat import ChatConfig, ChatError, ChatService, Source, resolve_citations
 from accounts import Accounts, Denied, Invalid, User
 from auth import SESSION_MAX_AGE, Auth, as_http_error, bearer_token, hash_password, session_secret, verify_password
 import settings
 from db import ADMIN_WORKSPACE_ID, ChatDB, NotFound, WorkspaceLibraries
-from limits import Busy, Gate, GateConfig, UploadLimits
+from limits import Busy, Gate, GateConfig, Stopped, UploadLimits
 from purge import purge_document
 from retrieval import REPO_ROOT, Retriever, SearchConfig, load_env
 
@@ -1064,20 +1064,36 @@ def unarchive_conversation(conv_id: str, user: User = CurrentUser) -> dict:
 
 
 def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], preset: str, doc_shas,
-                 library_overview, *, first_turn: bool, has_title: bool) -> Iterator[str]:
+                 library_overview, stop: threading.Event, *, first_turn: bool, has_title: bool) -> Iterator[str]:
     """Runs one turn and streams it as the SSE kinds documented on
     send_message, storing the answer (or the error) as it finishes. Shared
     by send_message and retry_message -- they differ only in what happens
     before this: whether a new user message is stored and a `user` event
-    opens the stream."""
+    opens the stream.
+
+    `stop` is checked between the pipeline's events: once it's set, the
+    pipeline is closed (which drops the Ollama request, so the model stops
+    generating too) and what streamed so far is stored as "stopped". While
+    tokens stream that's immediate; a rewrite or search already underway
+    finishes first, since it has no events to stop between."""
     tokens: list[str] = []
     sources: list[dict] = []
     queries: list[str] = []
     finished = False
     try:
-        for ev in state.chat.run_turn(question, history, preset, doc_shas=doc_shas,
-                                      library_overview=library_overview):
+        turn = state.chat.run_turn(question, history, preset, doc_shas=doc_shas, library_overview=library_overview)
+        for ev in turn:
             kind = ev["type"]
+            if stop.is_set() and kind != "done":  # a finished answer is kept, however late the stop
+                turn.close()
+                finished = True
+                partial = "".join(tokens)
+                cited, _ = resolve_citations(partial, [Source(**s) for s in sources])
+                saved = state.db.add_assistant_message(
+                    conv_id, content=partial, model=state.chat.cfg.preset(preset).model, preset=preset,
+                    search_queries=queries, sources=sources, cited=set(cited), status="stopped", user_id=user.id)
+                yield sse("stopped", {"message_id": saved["id"], "answer": partial, "cited": cited})
+                return
             if kind == "done":
                 r = ev["result"]
                 saved = state.db.add_assistant_message(
@@ -1111,22 +1127,25 @@ def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], p
         yield sse("error", {"error": str(exc)})
 
 
-def _streamed(user_id: str, conv_id: str, gen: Iterator[str]) -> StreamingResponse:
+def _streamed(user_id: str, conv_id: str, gen: Callable[[threading.Event], Iterator[str]]) -> StreamingResponse:
     """The turn-runs-on-its-own-thread plumbing shared by send_message and
     retry_message: `gen` runs under the concurrency gate on a background
     thread and is relayed to the client as it produces SSE lines, so a
     disconnect only stops the relay -- the turn still finishes and is
-    stored."""
+    stored. Stopping it is a separate request (stop_generation); `gen` is
+    handed the event that request sets."""
     events: queue.Queue[str | None] = queue.Queue()
 
     def produce() -> None:
         try:
             with state.gate.admit(user_id, conv_id,
-                                  on_position=lambda n: events.put(sse("queued", {"position": n}))):
-                for item in gen:
+                                  on_position=lambda n: events.put(sse("queued", {"position": n}))) as stop:
+                for item in gen(stop):
                     events.put(item)
         except Busy as exc:
             events.put(sse("error", {"error": str(exc)}))
+        except Stopped:
+            events.put(sse("stopped", {}))
         finally:
             events.put(None)
 
@@ -1154,9 +1173,13 @@ def send_message(conv_id: str, body: NewMessage, user: User = CurrentUser) -> St
       done      {message_id, answer, cited, invalid_citations, sources, ...}
       title     {title}: after the first answer, a generated conversation title
       error     {error}: the turn failed; partial output is stored with status "error"
+      stopped   {message_id, answer, cited}: stop_generation ended the turn; the partial answer
+                is stored with status "stopped". Just {} if it was stopped while
+                still queued -- then nothing was stored, not even the question.
 
     The turn runs in its own thread and is stored when it finishes, even if
     the client disconnects halfway: reopening the conversation shows it.
+    Disconnecting doesn't stop it; POST .../stop does.
 
     Only so many turns run at once (see limits.py). The question is stored
     once this one is admitted, not when it arrives, so that two sends to the
@@ -1172,15 +1195,15 @@ def send_message(conv_id: str, body: NewMessage, user: User = CurrentUser) -> St
     if conv["workspace_id"]:
         state.db.touch_workspace(conv["workspace_id"], user_id=user.id, is_admin=user.is_admin)
 
-    def stream() -> Iterator[str]:
+    def stream(stop: threading.Event) -> Iterator[str]:
         history = state.db.history(conv_id, user_id=user.id)
         first_turn = not history
         user_msg = state.db.add_user_message(conv_id, body.content, user_id=user.id)
         yield sse("user", {"id": user_msg["id"]})
-        yield from _stream_turn(conv_id, user, body.content, history, preset, doc_shas, library_overview,
+        yield from _stream_turn(conv_id, user, body.content, history, preset, doc_shas, library_overview, stop,
                                 first_turn=first_turn, has_title=bool(conv["title"]))
 
-    return _streamed(user.id, conv_id, stream())
+    return _streamed(user.id, conv_id, stream)
 
 
 @app.post("/api/conversations/{conv_id}/retry")
@@ -1207,12 +1230,23 @@ def retry_message(conv_id: str, user: User = CurrentUser) -> StreamingResponse:
     if conv["workspace_id"]:
         state.db.touch_workspace(conv["workspace_id"], user_id=user.id, is_admin=user.is_admin)
 
-    def stream() -> Iterator[str]:
+    def stream(stop: threading.Event) -> Iterator[str]:
         history = state.db.history(conv_id, user_id=user.id)
-        yield from _stream_turn(conv_id, user, question, history, preset, doc_shas, library_overview,
+        yield from _stream_turn(conv_id, user, question, history, preset, doc_shas, library_overview, stop,
                                 first_turn=not history, has_title=bool(conv["title"]))
 
-    return _streamed(user.id, conv_id, stream())
+    return _streamed(user.id, conv_id, stream)
+
+
+@app.post("/api/conversations/{conv_id}/stop")
+def stop_generation(conv_id: str, user: User = CurrentUser) -> dict:
+    """Stops this conversation's turn -- the one streaming, and any sent
+    after it that are still queued. The turn's own stream reports it with a
+    `stopped` event (see send_message), so this only says how many turns it
+    reached: 0 if the turn had already finished, which isn't an error --
+    the stop button and the last token can easily cross."""
+    _get_conversation(conv_id, user, with_messages=False)
+    return {"stopped": state.gate.stop(conv_id)}
 
 
 # ------------------------------------------------------------------ search --

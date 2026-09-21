@@ -6,6 +6,7 @@ endpoints refusing callers they can't identify.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import api
 import pytest
@@ -295,3 +296,67 @@ def chat_fixture_run_turn(self, question, history, preset, **kw):
     yield {"type": "token", "text": "Two sources agree [1]."}
     yield {"type": "done", "result": TurnResult(answer="Two sources agree [1].", model="m", preset="everyday",
                                                 search_queries=["q"], sources=[], cited=[1], stats={})}
+
+
+# -------------------------------------------------------------------- stop --
+
+def test_stopping_a_turn_keeps_what_streamed_and_ends_the_pipeline(chat, monkeypatch):
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
+    conv = api.state.db.create_conversation("everyday", user_id=user.id)
+    closed = []
+
+    def long_answer(self, question, history, preset, **kw):
+        try:
+            yield {"type": "sources", "sources": [{"number": 1, "found_by": "auto", "query": "q", "point_id": "p",
+                                                   "doc_sha": "d", "filename": "f.pdf", "chunk_index": 0,
+                                                   "pages": [1], "headings": [], "text": "t",
+                                                   "rerank_score": 0.9}]}
+            yield {"type": "token", "text": "It says [1]"}
+            # The stop button, pressed while the answer streams.
+            assert api.stop_generation(conv["id"], user) == {"stopped": 1}
+            yield {"type": "token", "text": " and more"}
+            yield {"type": "done", "result": None}
+        finally:
+            closed.append(True)  # the Ollama request is dropped with it
+
+    monkeypatch.setattr(type(api.state.chat), "run_turn", long_answer)
+
+    events = drain(api.send_message(conv["id"], api.NewMessage(content="who pays?"), user))
+
+    assert closed == [True]
+    assert events[-1].startswith("event: stopped"), events
+    assert not any("and more" in e or e.startswith("event: done") for e in events)
+    answer = api.state.db.get_conversation(conv["id"], user_id=user.id)["messages"][-1]
+    assert (answer["status"], answer["content"]) == ("stopped", "It says [1]")
+    assert [s["cited"] for s in answer["sources"]] == [True]
+
+
+def test_stopping_a_turn_still_queued_stores_nothing(chat):
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
+    conv = api.state.db.create_conversation("everyday", user_id=user.id)
+    api.state.gate.cfg.max_concurrent = 1
+    with api.state.gate.admit("someone-else"):  # the machine is busy
+        response = api.send_message(conv["id"], api.NewMessage(content="who pays?"), user)
+        while api.state.gate.stats()["queued"] < 1:
+            time.sleep(0.005)
+        assert api.stop_generation(conv["id"], user) == {"stopped": 1}
+        events = drain(response)
+
+    assert events[-1].startswith("event: stopped"), events
+    assert api.state.db.get_conversation(conv["id"], user_id=user.id)["messages"] == []
+
+
+def test_stopping_with_nothing_running_is_not_an_error(chat):
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
+    conv = api.state.db.create_conversation("everyday", user_id=user.id)
+    assert api.stop_generation(conv["id"], user) == {"stopped": 0}
+
+
+def test_a_user_cannot_stop_someone_elses_chat(chat):
+    user = chat.create_user("member@example.com", "hash", display_name="Member")
+    other = chat.create_user("other@example.com", "hash", display_name="Other")
+    conv = api.state.db.create_conversation("everyday", user_id=user.id)
+
+    with pytest.raises(HTTPException) as exc:
+        api.stop_generation(conv["id"], other)
+    assert exc.value.status_code == 404

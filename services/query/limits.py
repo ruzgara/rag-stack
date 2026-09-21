@@ -15,6 +15,9 @@ Three limits, checked together:
                   the first, because it has to read the history the first
                   one is still writing
 
+Any turn with a conversation can also be stopped (stop()), whether it's
+running or still in line: the gate is the one place that knows both.
+
 The line is fair between users rather than first come, first served: a
 freed slot goes to whoever has the least already running or ahead of them
 in line (see _priority), so someone who sends ten questions at once gets
@@ -29,11 +32,15 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 
 class Busy(Exception):
     """The queue is full, or waiting in it took too long."""
+
+
+class Stopped(Exception):
+    """The turn was stopped (Gate.stop) while it was still waiting."""
 
 
 @dataclass
@@ -60,6 +67,7 @@ class _Ticket:
     seq: int
     user_id: str
     conv_id: str | None
+    stop: threading.Event = field(default_factory=threading.Event)
 
 
 class Gate:
@@ -114,12 +122,17 @@ class Gate:
 
     @contextmanager
     def admit(self, user_id: str, conv_id: str | None = None,
-              on_position: Callable[[int], None] | None = None) -> Iterator[None]:
+              on_position: Callable[[int], None] | None = None) -> Iterator[threading.Event]:
         """Blocks until this turn may run, then holds a slot for the body.
 
         on_position, if given, is called with this caller's 1-based place in
         the queue whenever it changes, and never for a turn that starts at
-        once. Raises Busy if the queue is full or max_wait passes first.
+        once. Raises Busy if the queue is full or max_wait passes first, and
+        Stopped if stop() is called for this conversation first.
+
+        Yields an event that stop() sets once the turn is running: the body
+        checks it and winds down on its own, since only it knows how to
+        leave its work in a sensible state.
         """
         with self._cond:
             if len(self._waiting) >= self.cfg.max_queued:
@@ -137,6 +150,8 @@ class Gate:
             reported = 0
             try:
                 while self._next() is not ticket:
+                    if ticket.stop.is_set():
+                        raise Stopped("stopped before it started")
                     position = self._position(ticket)
                     if position != reported and on_position:
                         reported = position
@@ -155,11 +170,23 @@ class Gate:
                 self._cond.notify_all()
                 raise
         try:
-            yield
+            yield ticket.stop
         finally:
             with self._cond:
                 self._running.remove(ticket)
                 self._cond.notify_all()
+
+    def stop(self, conv_id: str) -> int:
+        """Stops every turn in this conversation, running or waiting, and
+        returns how many there were. A waiting one leaves the line at once
+        (its admit raises Stopped); a running one is only asked to, through
+        the event admit yielded to it."""
+        with self._cond:
+            tickets = [t for t in self._waiting + self._running if t.conv_id == conv_id]
+            for t in tickets:
+                t.stop.set()
+            self._cond.notify_all()
+            return len(tickets)
 
     def stats(self) -> dict:
         with self._cond:

@@ -11,7 +11,7 @@ import threading
 import time
 
 import pytest
-from limits import Busy, Gate, GateConfig, UploadLimits
+from limits import Busy, Gate, GateConfig, Stopped, UploadLimits
 
 
 def gate(**overrides) -> Gate:
@@ -144,6 +144,37 @@ def test_a_failed_turn_still_frees_its_slot():
     assert g.stats()["running"] == 0
     with g.admit("u1"):  # the next one gets in
         pass
+
+
+def test_stopping_a_conversation_asks_its_running_turn_to_stop():
+    g = gate(max_concurrent=2, max_per_user=2)
+    with g.admit("u1", "c1") as stop, g.admit("u1", "c2") as other:
+        assert g.stop("c1") == 1
+        assert stop.is_set()
+        assert not other.is_set()  # another conversation's turn carries on
+    assert g.stats()["running"] == 0  # the body still ends it, as usual
+
+
+def test_stopping_takes_a_waiting_turn_out_of_line():
+    g = gate()
+    first = Runner(g, conv="c1").start()
+    assert first.admitted.wait(2)
+    waiting = Runner(g, conv="c1").start()
+    while g.stats()["queued"] < 1:
+        time.sleep(0.005)
+
+    assert g.stop("c1") == 2  # the running one and the one behind it
+
+    assert waiting.admitted.wait(2)
+    assert isinstance(waiting.error, Stopped)
+    assert g.stats()["queued"] == 0
+    first.finish()
+
+
+def test_stopping_a_conversation_with_nothing_running_is_a_no_op():
+    g = gate()
+    with g.admit("u1"):  # no conversation: a search, say
+        assert g.stop("c1") == 0
 
 
 def queue_up(g: Gate, *users: str) -> list[Runner]:
