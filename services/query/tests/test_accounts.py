@@ -59,6 +59,20 @@ def test_a_missing_user_is_not_found(acc):
     assert acc.by_email("nobody@example.com") is None
 
 
+def test_search_users_matches_email_or_name_case_insensitively(acc):
+    jane = user(acc, "jane@example.com", display_name="Jane Doe")
+    other = user(acc, "other@example.com", display_name="Someone Else")
+
+    assert [u.id for u in acc.search_users("jane")] == [jane.id]
+    assert {u.id for u in acc.search_users("EXAMPLE.COM")} == {jane.id, other.id}
+    assert [u.id for u in acc.search_users("doe")] == [jane.id]
+
+
+def test_search_users_finds_nothing_for_an_unmatched_query(acc):
+    user(acc)
+    assert acc.search_users("nobody-like-this") == []
+
+
 def test_the_first_admin_adopts_what_was_stored_before_accounts_existed(acc):
     """Conversations written under LOCAL_USER shouldn't disappear on upgrade."""
     conv = acc.db.create_conversation("everyday", "Old chat", user_id=LOCAL_USER)

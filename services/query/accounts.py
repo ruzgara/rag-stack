@@ -109,6 +109,15 @@ class Accounts:
         with self.db._conn() as db:
             return [self._row_to_user(db, r) for r in db.execute("SELECT * FROM users ORDER BY email")]
 
+    def search_users(self, query: str, limit: int = 20) -> list[User]:
+        """Finds users whose email or display name contains query (case-insensitive)."""
+        needle = f"%{query.strip().lower()}%"
+        with self.db._conn() as db:
+            rows = db.execute(
+                "SELECT * FROM users WHERE lower(email) LIKE ? OR lower(display_name) LIKE ? "
+                "ORDER BY email LIMIT ?", (needle, needle, limit)).fetchall()
+            return [self._row_to_user(db, r) for r in rows]
+
     def any_users(self) -> bool:
         with self.db._conn() as db:
             return db.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None

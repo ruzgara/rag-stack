@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Annotated, Iterator
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
@@ -336,6 +336,13 @@ def change_password(body: PasswordChange, user: User = CurrentUser) -> None:
         state.accounts.set_password(user.id, hash_password(body.new_password))
     except Invalid as exc:
         raise as_http_error(exc) from None
+
+
+@app.get("/api/users/search")
+def search_users(q: str = Query(..., min_length=1), user: User = CurrentUser) -> dict:
+    """Finds users by name or email, e.g. to pick who a library gets shared with."""
+    return {"users": [{"id": u.id, "name": u.display_name, "email": u.email}
+                       for u in state.accounts.search_users(q)]}
 
 
 # ------------------------------------------------------------------ admin --
