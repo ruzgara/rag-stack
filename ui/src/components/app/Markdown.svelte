@@ -54,7 +54,7 @@
 <div class="md" class:streaming={status === "streaming"} bind:this={container}></div>
 
 <style>
-  .md { font-size: 16px; line-height: 1.72; max-width: 66ch; overflow-wrap: anywhere; }
+  .md { font-size: 16px; line-height: 1.72; overflow-wrap: anywhere; }
   .md :global(p) { margin: 0 0 15px; }
   .md :global(ul), .md :global(ol) { margin: 0 0 15px; padding-left: 20px; }
   .md :global(li) { margin-bottom: 6px; }
