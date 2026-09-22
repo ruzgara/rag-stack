@@ -11,6 +11,9 @@ import type { Chunk, ChunksResponse } from "./types";
 /** Px below the view's top edge that decides which chunk you're on. */
 const READ_LINE = 24;
 
+/** A run of a document's chunks, and how many it has in all. */
+type ChunkRange = { chunks: Chunk[]; total: number | null };
+
 export class ChunkReader {
   docSha = $state<string | null>(null);
   /** Marked chunks in citation order -- the order prev/next walks. */
@@ -112,19 +115,27 @@ export class ChunkReader {
     if (this.byChunk.has(chunk)) this.lastMark = chunk;
   }
 
-  /** `count` chunks from `from` (Infinity: to the end), a page at a time. */
-  private async fetchRange(sha: string, from: number, count: number): Promise<Chunk[]> {
-    const all: Chunk[] = [];
+  /** `count` chunks from `from` (Infinity: to the end), a page at a time,
+   *  and the document's chunk total. Stops paging once load `seq` is
+   *  superseded; the caller drops what it got. */
+  private async fetchRange(
+    sha: string,
+    from: number,
+    count: number,
+    seq: number,
+  ): Promise<ChunkRange> {
+    const chunks: Chunk[] = [];
+    let total: number | null = null;
     let offset = from;
-    while (all.length < count) {
-      const limit = Math.min(200, count - all.length);
+    while (chunks.length < count && seq === this.loadSeq) {
+      const limit = Math.min(200, count - chunks.length);
       const res = await get<ChunksResponse>(`/api/documents/${sha}/chunks?offset=${offset}&limit=${limit}`);
-      all.push(...res.chunks);
-      this.total = res.total;
+      chunks.push(...res.chunks);
+      total = res.total;
       offset += res.chunks.length;
       if (!res.chunks.length || offset >= res.total) break;
     }
-    return all;
+    return { chunks, total };
   }
 
   /** Grow the loaded window to take in `target` and a chunk either side,
@@ -138,17 +149,18 @@ export class ChunkReader {
     const hi = Math.max(last, target + 1);
     const seq = ++this.loadSeq;
     this.loading = true;
-    let chunks: Chunk[] | null = null;
+    let got: ChunkRange | null = null;
     try {
-      chunks = await this.fetchRange(sha, lo, hi - lo + 1);
+      got = await this.fetchRange(sha, lo, hi - lo + 1, seq);
     } catch {
       /* handled below */
     }
     if (seq !== this.loadSeq) return;
     this.loading = false;
-    if (!chunks) return void this.load(target); // a plain reload around it reports the error
+    if (!got) return void this.load(target); // a plain reload around it reports the error
     const before = this.body?.querySelector(`[data-i="${first}"]`)?.getBoundingClientRect().top ?? 0;
-    this.chunks = chunks;
+    this.chunks = got.chunks;
+    this.total = got.total;
     await tick();
     const after = this.body?.querySelector(`[data-i="${first}"]`)?.getBoundingClientRect().top ?? before;
     if (this.body && after !== before) {
@@ -170,11 +182,12 @@ export class ChunkReader {
     this.loading = true;
     this.error = null;
     let chunks: Chunk[];
+    let total: number | null = null;
     let error: string | null = null;
     try {
-      chunks = whole
-        ? await this.fetchRange(sha, 0, Infinity)
-        : await this.fetchRange(sha, Math.max(0, center - 1), 3);
+      ({ chunks, total } = whole
+        ? await this.fetchRange(sha, 0, Infinity, seq)
+        : await this.fetchRange(sha, Math.max(0, center - 1), 3, seq));
     } catch (e) {
       // The document may have been deleted or re-indexed since the answer;
       // ChunkView falls back to the stored copy of the passage.
@@ -183,6 +196,7 @@ export class ChunkReader {
     }
     if (seq !== this.loadSeq) return;
     this.chunks = chunks;
+    this.total = total;
     this.error = error;
     this.loading = false;
     await tick();
