@@ -45,9 +45,32 @@
   // Stick to the bottom while an answer streams, unless the reader scrolled up.
   let scroller: HTMLDivElement | undefined = $state();
   let pinned = true;
+
+  // Which turn is "in focus" (sources panel + side-rule highlight) tracks
+  // scroll position: whichever turn's top has scrolled past a line roughly
+  // a third of the way down the viewport.
+  const turnEls: Record<string, HTMLElement> = {};
+  function turnRef(node: HTMLElement, key: string) {
+    turnEls[key] = node;
+    return { destroy() { if (turnEls[key] === node) delete turnEls[key]; } };
+  }
+  function updateFocusFromScroll(): void {
+    if (!scroller || !view?.turns.length) return;
+    const refY = scroller.getBoundingClientRect().top + scroller.clientHeight * 0.35;
+    let current = view.turns[0].key;
+    for (const t of view.turns) {
+      const el = turnEls[t.key];
+      if (!el) continue;
+      if (el.getBoundingClientRect().top <= refY) current = t.key;
+      else break;
+    }
+    ui.selectedTurnKey = current;
+  }
+
   function onScroll(): void {
     if (!scroller) return;
     pinned = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+    updateFocusFromScroll();
   }
   $effect(() => {
     // Re-run on any growth of the active transcript.
@@ -56,14 +79,59 @@
     void last?.thinking.length;
     void last?.trace.length;
     if (pinned && scroller) scroller.scrollTop = scroller.scrollHeight;
+    updateFocusFromScroll();
   });
-  // Opening a chat or sending: jump to the end.
+  // Opening a chat or sending: jump to the end, with the same glide a
+  // manual scroll would have -- eased, and a fixed 0.8s regardless of
+  // transcript length (native scrollTo's smooth behavior scales its
+  // duration with distance, which reads as an abrupt snap on a long chat).
+  // Sampling the live target every frame also absorbs late reflow growth
+  // (web font swap, citation content) without a separate correction pass.
+  const reduceMotion = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const easeInOutCubic = (t: number): number => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
+  let scrollAnimToken = 0;
+  function animateToBottom(duration = 800): void {
+    if (!scroller) return;
+    if (reduceMotion) { scroller.scrollTop = scroller.scrollHeight; return; }
+    const el = scroller;
+    const start = el.scrollTop;
+    const startTime = performance.now();
+    const myToken = ++scrollAnimToken;
+    function step(now: number): void {
+      if (myToken !== scrollAnimToken || !scroller) return;
+      const t = Math.min(1, (now - startTime) / duration);
+      const target = el.scrollHeight - el.clientHeight;
+      el.scrollTop = start + (target - start) * easeInOutCubic(t);
+      if (t < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  // A genuine open (not a re-run for the same chat from sending or turns
+  // finishing their async load) holds at the top for a beat first, then
+  // glides down -- but only the first time a given chat is opened during
+  // this page load; revisiting it afterwards (or during this same open,
+  // once turns finish loading) jumps straight there.
+  let lastOpenedId: string | null = null;
+  const animatedOnce = new Set<string>();
   $effect(() => {
-    void chat.activeId;
+    const id = chat.activeId;
     void view?.turns.length;
     void view?.loaded;
+    const opening = id !== lastOpenedId;
+    lastOpenedId = id;
     pinned = true;
-    void tick().then(() => { if (scroller) scroller.scrollTop = scroller.scrollHeight; });
+    const firstOpen = opening && id !== null && !animatedOnce.has(id);
+    if (id !== null) animatedOnce.add(id);
+    void tick().then(() => {
+      if (firstOpen && scroller) {
+        scroller.scrollTop = 0;
+        updateFocusFromScroll();
+        setTimeout(() => animateToBottom(), reduceMotion ? 0 : 100);
+      } else if (scroller) {
+        scroller.scrollTop = scroller.scrollHeight;
+        updateFocusFromScroll();
+      }
+    });
   });
 
   const cited = $derived.by(() => {
@@ -124,7 +192,9 @@
             <p class="muted">Loading…</p>
           {/if}
           {#each view.turns as t, i (t.key)}
-            <TurnView turn={t} isLast={i === view.turns.length - 1} preset={view.preset} busy={chat.activeStreaming} />
+            <div class="turn-wrap" use:turnRef={t.key}>
+              <TurnView turn={t} isLast={i === view.turns.length - 1} preset={view.preset} busy={chat.activeStreaming} />
+            </div>
           {/each}
         {:else if workspace.current}
           <div class="intro">
@@ -156,7 +226,7 @@
 <style>
   .pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; position: relative; }
   .scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 26px clamp(16px, 5vw, 64px) 8px; }
-  .column { max-width: 720px; margin: 0 auto; }
+  .column { max-width: 880px; margin: 0 auto; }
   .head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 26px; }
   .head h2 { font-size: 26px; margin: 0; min-width: 0; overflow-wrap: anywhere; }
   .meta { font-size: 11px; color: var(--color-neutral-600); margin-left: auto; text-align: right; flex: none; }

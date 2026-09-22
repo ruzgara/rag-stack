@@ -89,7 +89,7 @@
 
   function openSource(handle: string): void {
     ui.focusSources([handle], turn.key);
-    ui.open({ kind: "source", turnKey: turn.key, handle });
+    chat.openSource(turn.key, handle);
   }
 
   /** null for an invalid span too, since those carry no data-handle by
@@ -116,6 +116,16 @@
   function onAnswerOver(e: Event): void {
     const handle = citationHandle((e.target as Element).closest(".cite"));
     if (handle) ui.focusSources([handle], turn.key);
+  }
+
+  // Un-highlight once the pointer/focus leaves a citation, unless it moved
+  // straight to another one (whose own onAnswerOver will take over).
+  function onAnswerOut(e: MouseEvent | FocusEvent): void {
+    const handle = citationHandle((e.target as Element).closest(".cite"));
+    if (!handle) return;
+    const to = e.relatedTarget;
+    if (to instanceof Element && to.closest(".cite")) return;
+    if (ui.focusedSources.includes(handle)) ui.focusedSources = [];
   }
 
   let copied = $state(false);
@@ -200,7 +210,7 @@
 
     {#if turn.answer || !streaming}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="answer" onclick={onAnswerClick} onkeydown={onAnswerKey} onmouseover={onAnswerOver} onfocusin={onAnswerOver}>
+      <div class="answer" onclick={onAnswerClick} onkeydown={onAnswerKey} onmouseover={onAnswerOver} onfocusin={onAnswerOver} onmouseout={onAnswerOut} onfocusout={onAnswerOut}>
         {#if turn.answer}
           <Markdown answer={turn.answer} status={turn.status} {map} />
         {:else if turn.status === "complete"}
@@ -236,14 +246,6 @@
       {/if}
       {#if isLast}
         <button class="btn btn-ghost act" onclick={guard(() => chat.retry())} disabled={busy}>Retry</button>
-      {/if}
-      {#if turn.trace.length}
-        <button class="btn btn-ghost act" onclick={() => (processOpenSet = !processOpen)}>
-          {processOpen ? "Hide searches" : "Show searches"}
-        </button>
-      {/if}
-      {#if turn.sources.length && !showingSources}
-        <button class="btn btn-ghost act" onclick={() => { ui.focusSources([], turn.key); ui.sourcesOpen = true; }}>Show sources</button>
       {/if}
       {#if turn.stats?.completion_tokens}
         <span class="stat">{plural(turn.stats.completion_tokens, "token")}{turn.stats.first_token_s != null ? ` · first token ${turn.stats.first_token_s.toFixed(1)}s` : ""}</span>

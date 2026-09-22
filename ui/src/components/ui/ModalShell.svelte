@@ -96,7 +96,11 @@
 <style>
   .modal-backdrop {
     position: fixed; inset: 0; z-index: 60;
-    display: grid; place-items: center; padding: 36px;
+    /* Flex, not grid, to center the card: CSS Grid's auto-track sizing for
+       a place-items:center item has real caching bugs in some engines --
+       it can fail to re-shrink the track when the card's content later
+       gets shorter, leaving the card stuck at its tallest-ever size. */
+    display: flex; align-items: center; justify-content: center; padding: 36px;
     background: color-mix(in srgb, var(--color-neutral-900) 42%, transparent);
     animation: fade .12s ease-out;
   }
@@ -123,7 +127,14 @@
   }
   .modal-x:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
   .modal-body { min-height: 0; }
-  .scroll .modal-body { flex: 1; overflow-y: auto; }
+  .scroll .modal-body {
+    flex: 1; overflow-y: auto;
+    /* Explicit, not left to default "visible": a lone overflow-y:auto
+       implicitly makes the browser treat overflow-x as auto too, so a
+       few reserved px from the scrollbar gutter was enough to pop an
+       unwanted horizontal scrollbar. */
+    overflow-x: hidden;
+  }
   .modal-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-top: 14px; }
   @keyframes fade { from { opacity: 0 } }
   @keyframes rise { from { opacity: 0; transform: translateY(6px) } }

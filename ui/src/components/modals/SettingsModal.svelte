@@ -166,6 +166,10 @@
   {/snippet}
 
   {#snippet children()}
+    <!-- Keyed so a section swap fully remounts the body instead of patching
+         in place -- otherwise the modal card's flex-computed height can get
+         stuck at whichever section's content was tallest and not shrink back. -->
+    {#key section}
     {#if section === "account" && me}
       <section>
         <h6>Account</h6>
@@ -383,6 +387,7 @@
         </section>
       {/if}
     {/if}
+    {/key}
   {/snippet}
 
   {#snippet footer()}

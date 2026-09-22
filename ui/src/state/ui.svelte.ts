@@ -1,6 +1,8 @@
 // Cross-cutting UI state: toasts, the popup stack, the promise-based
 // confirm/ask dialogs, and which turn the sources panel is showing.
 
+import type { Mark } from "../lib/turns";
+
 export interface Toast {
   id: number;
   message: string;
@@ -14,7 +16,11 @@ export type Modal =
   | { kind: "libraries" }
   | { kind: "library"; id: string }
   | { kind: "sharing"; id: string }
-  | { kind: "source"; turnKey: string; handle: string }
+  /** One passage in context; `marks` are the chunks to highlight, in
+   *  citation order (chat.openSource fills them in). */
+  | { kind: "source"; turnKey: string; handle: string; marks?: Mark[] }
+  /** One of the active chat's cited documents, whole (the Sources tab). */
+  | { kind: "document"; docSha: string; chunk?: number }
   | { kind: "upload"; libraryId?: string; folder?: boolean }
   | { kind: "groups" }
   | { kind: "settings" }
@@ -65,6 +71,10 @@ class UiState {
   selectedTurnKey = $state<string | null>(null);
   /** Source handles to flash in the panel (hovering/clicking a citation). */
   focusedSources = $state<string[]>([]);
+  /** The document a viewer has open, highlighted on the Sources tab. */
+  focusedDoc = $state<string | null>(null);
+  /** The right panel's tab. */
+  panelTab = $state<"citations" | "sources">("citations");
   /** Narrow screens: the rail and the sources panel become drawers. */
   railOpen = $state(false);
   sourcesOpen = $state(false);

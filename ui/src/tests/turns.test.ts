@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toTurns, deriveInvalid, applyEvent, newTurn, traceFromStored, processSummary } from "../lib/turns";
+import { toTurns, deriveInvalid, applyEvent, newTurn, traceFromStored, processSummary, conversationDocuments, citedDocuments, passageMarks, documentMarks } from "../lib/turns";
 import type { DoneSource, Message } from "../lib/types";
 
 // A deterministic, HANDLE_RE-shaped handle per small integer -- distinct
@@ -298,5 +298,86 @@ describe("applyEvent: citation", () => {
     applyEvent(t, { type: "sources", sources: [src(1)] });
     applyEvent(t, { type: "citation", handle: handleFor(9), doc: 1, chunk: 1 });
     expect(t.sources).toHaveLength(1);
+  });
+});
+
+describe("conversationDocuments", () => {
+  function turnWith(key: string, sources: DoneSource[]) {
+    const t = newTurn(key, "q?");
+    t.sources = sources;
+    t.status = "complete";
+    return t;
+  }
+
+  it("folds a handle seen in several turns into one passage, opened at the turn that cited it", () => {
+    const retrieved = { ...src(1), cited: false, doc_number: null, chunk_number: null };
+    const carried = { ...src(1), found_by: "earlier" as const, cited: true, doc_number: 1, chunk_number: 1 };
+    const docs = conversationDocuments([turnWith("a1", [retrieved]), turnWith("a2", [carried])]);
+    expect(docs).toHaveLength(1);
+    expect(docs[0].passages).toHaveLength(1);
+    expect(docs[0].passages[0]).toMatchObject({ turnKey: "a2", cited: true, docNumber: 1, chunkNumber: 1 });
+    expect(docs[0].citedCount).toBe(1);
+    expect(docs[0].turnKeys).toEqual(["a2"]);
+  });
+
+  it("groups passages by document and counts the answers that cited it", () => {
+    const a = { ...src(1), doc_sha: "shaA", filename: "A.pdf", doc_number: 1, chunk_number: 1 };
+    const b = { ...src(2), doc_sha: "shaA", filename: "A.pdf", doc_number: 1, chunk_number: 2 };
+    const c = { ...src(3), doc_sha: "shaB", filename: "B.pdf", doc_number: 2, chunk_number: 1 };
+    const docs = conversationDocuments([turnWith("a1", [a]), turnWith("a2", [b, c])]);
+    expect(docs.map((d) => d.filename)).toEqual(["A.pdf", "B.pdf"]);
+    expect(docs[0]).toMatchObject({ docNumber: 1, citedCount: 2 });
+    expect(docs[0].turnKeys).toEqual(["a1", "a2"]);
+    expect(docs[1]).toMatchObject({ docNumber: 2, citedCount: 1 });
+  });
+
+  it("sorts cited documents by [doc], with never-cited ones after them", () => {
+    const second = { ...src(1), doc_sha: "shaA", filename: "A.pdf", doc_number: 2, chunk_number: 1 };
+    const first = { ...src(2), doc_sha: "shaB", filename: "B.pdf", doc_number: 1, chunk_number: 1 };
+    const never = { ...src(3), doc_sha: "shaC", filename: "C.pdf", cited: false, doc_number: null, chunk_number: null };
+    const docs = conversationDocuments([turnWith("a1", [second, never, first])]);
+    expect(docs.map((d) => d.filename)).toEqual(["B.pdf", "A.pdf", "C.pdf"]);
+    expect(docs[2]).toMatchObject({ citedCount: 0, docNumber: null, turnKeys: [] });
+  });
+
+  it("puts a document's cited passages ahead of its uncited ones", () => {
+    const uncited = { ...src(1), doc_sha: "shaA", chunk_index: 0, cited: false, doc_number: null, chunk_number: null };
+    const cited = { ...src(2), doc_sha: "shaA", chunk_index: 9, doc_number: 1, chunk_number: 1 };
+    const docs = conversationDocuments([turnWith("a1", [uncited, cited])]);
+    expect(docs[0].passages.map((p) => p.cited)).toEqual([true, false]);
+  });
+
+  it("is empty for a conversation that never retrieved anything", () => {
+    expect(conversationDocuments([turnWith("a1", [])])).toEqual([]);
+  });
+});
+
+describe("citation-ordered marks", () => {
+  function turnWith(key: string, sources: DoneSource[]) {
+    const t = newTurn(key, "q?");
+    t.sources = sources;
+    return t;
+  }
+  // [1:1] is chunk 9 and [1:2] chunk 3: citation order runs against the document.
+  const late = { ...src(1), doc_sha: "shaA", chunk_index: 9, doc_number: 1, chunk_number: 1 };
+  const early = { ...src(2), doc_sha: "shaA", chunk_index: 3, doc_number: 1, chunk_number: 2 };
+  const uncited = { ...src(3), doc_sha: "shaA", chunk_index: 5, cited: false, doc_number: null, chunk_number: null };
+
+  it("passageMarks keeps citation order, not document order", () => {
+    const [doc] = citedDocuments([turnWith("a1", [early, late])]);
+    expect(passageMarks(doc.passages)).toEqual([{ chunkIndex: 9, label: "[1:1]" }, { chunkIndex: 3, label: "[1:2]" }]);
+  });
+
+  it("citedDocuments drops uncited passages and never-cited documents", () => {
+    const other = { ...uncited, handle: handleFor(4), doc_sha: "shaB" };
+    const docs = citedDocuments([turnWith("a1", [late, uncited, other])]);
+    expect(docs.map((d) => d.docSha)).toEqual(["shaA"]);
+    expect(docs[0].passages.map((p) => p.chunkIndex)).toEqual([9]);
+  });
+
+  it("documentMarks adds the passage it was opened on, last, when it isn't cited", () => {
+    const turns = [turnWith("a1", [late, early, uncited])];
+    expect(documentMarks(turns, "shaA", 5).map((m) => m.chunkIndex)).toEqual([9, 3, 5]);
+    expect(documentMarks(turns, "shaA", 3).map((m) => m.chunkIndex)).toEqual([9, 3]);
   });
 });

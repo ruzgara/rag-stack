@@ -29,6 +29,12 @@
     return parts.join(" · ") || "idle";
   });
 
+  const contextPct = $derived.by(() => {
+    const turns = chat.active?.turns ?? [];
+    const last = [...turns].reverse().find((t) => t.stats?.context_used_pct != null)?.stats;
+    return last?.context_used_pct != null ? Math.round(last.context_used_pct) : null;
+  });
+
   // Autosize: grows with the text up to a cap, then scrolls.
   $effect(() => {
     void chat.draft;
@@ -78,7 +84,12 @@
         <button type="button" aria-pressed={chat.preset === "everyday"} onclick={() => setPreset("everyday")}>Everyday</button>
       </div>
       <button type="button" class="attach" onclick={() => ui.open({ kind: "upload" })}>＋ Attach documents</button>
-      <span class="load" aria-live="polite">{loadMeta}</span>
+      <div class="status">
+        {#if contextPct !== null}
+          <span class="context">context {contextPct}%</span>
+        {/if}
+        <span class="load" aria-live="polite">{loadMeta}</span>
+      </div>
       {#if streaming}
         <button type="button" class="btn btn-primary send stop" onclick={guard(() => chat.stop())}>Stop</button>
       {:else}
@@ -91,7 +102,7 @@
 <style>
   .composer-wrap { padding: 6px clamp(16px, 5vw, 64px) 22px; }
   .composer {
-    max-width: 720px; margin: 0 auto; background: var(--color-surface); border-radius: 3px;
+    max-width: 880px; margin: 0 auto; background: var(--color-surface); border-radius: 3px;
     padding: 12px 14px 10px; box-shadow: var(--shadow-sm);
   }
   .composer:focus-within { box-shadow: var(--shadow-md); }
@@ -112,7 +123,8 @@
     border-radius: var(--radius-md);
   }
   .attach:hover { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
-  .load { margin-left: auto; font-size: 11px; color: var(--color-neutral-600); }
+  .status { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .context, .load { font-size: 11px; color: var(--color-neutral-600); }
   .send { padding: 6px 16px; }
   .stop { background: var(--color-accent-2-600); }
   .stop:hover:not(:disabled) { background: var(--color-accent-2-700); }

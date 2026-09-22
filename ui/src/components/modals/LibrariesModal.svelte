@@ -90,6 +90,10 @@
     <input class="input" placeholder="Filter libraries…" bind:value={filterText} aria-label="Filter libraries" />
   </div>
 
+  <!-- Keyed so a tab swap fully remounts the table instead of patching in
+       place -- otherwise the modal card's flex-computed height can get
+       stuck at whichever tab's content was tallest and not shrink back. -->
+  {#key tab}
   {#if rows.length === 0}
     <p class="empty-note">
       {#if library.libraries.length === 0}You don't have any libraries yet.{:else}No libraries match this filter.{/if}
@@ -137,6 +141,7 @@
       </table>
     </div>
   {/if}
+  {/key}
 
   {#snippet footer()}
     <button class="btn btn-primary" onclick={newLibrary}>＋ New library</button>

@@ -72,6 +72,10 @@
   {/snippet}
 
   {#snippet children()}
+    <!-- Keyed so a tab swap fully remounts the body instead of patching in
+         place -- otherwise the modal card's flex-computed height can get
+         stuck at whichever tab's content was tallest and not shrink back. -->
+    {#key tab}
     {#if tab === "chats"}
       {#if workspace.deletedConversations.length === 0}
         <div class="empty-note">Nothing in Recently deleted.</div>
@@ -128,6 +132,7 @@
         </div>
       {/if}
     {/if}
+    {/key}
   {/snippet}
 
   {#snippet footer()}

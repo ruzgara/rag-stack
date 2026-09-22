@@ -321,3 +321,133 @@ export function processSummary(t: Turn): string {
   if (t.stats?.total_s !== undefined) parts.push(`${t.stats.total_s.toFixed(1)}s`);
   return parts.join(" · ");
 }
+
+/** One passage of a document, as the whole conversation saw it. A handle is
+ *  stable for the life of the conversation, so the same passage carried
+ *  forward into later turns is one entry here, opened through the turn that
+ *  first cited it (or, if it was never cited, first retrieved it). */
+export interface DocumentPassage {
+  handle: string;
+  /** A turn whose sources hold this handle -- what the viewer needs. */
+  turnKey: string;
+  cited: boolean;
+  docNumber: number | null;
+  chunkNumber: number | null;
+  chunkIndex: number;
+  pages: number[];
+  headings: string[];
+  text: string;
+}
+
+/** A document the conversation drew on, with its passages folded together. */
+export interface DocumentRef {
+  docSha: string;
+  filename: string;
+  /** The [doc] half of [doc:chunk], once anything from it has been cited. */
+  docNumber: number | null;
+  passages: DocumentPassage[];
+  citedCount: number;
+  /** The turns whose answers cited it -- "used in N answers". */
+  turnKeys: string[];
+}
+
+/** The passages of a document the source viewer marks: the ones the chat
+ *  cited, or every one retrieved if it never cited any. */
+export function markedPassages(d: DocumentRef): DocumentPassage[] {
+  return d.citedCount ? d.passages.filter((p) => p.cited) : d.passages;
+}
+
+/** The documents the chat cited, each with only its cited passages -- the
+ *  Sources tab, and the order the document viewer steps through. */
+export function citedDocuments(turns: Turn[]): DocumentRef[] {
+  return conversationDocuments(turns)
+    .filter((d) => d.citedCount > 0)
+    .map((d) => ({ ...d, passages: d.passages.filter((p) => p.cited) }));
+}
+
+/** A chunk the viewer highlights, and its [doc:chunk] if it was cited. */
+export interface Mark {
+  chunkIndex: number;
+  label: string | null;
+}
+
+/** A document's passages as marks, in citation order -- [4:1] before [4:2]
+ *  wherever each sits in the document -- which is the order prev/next
+ *  citation walks. */
+export function passageMarks(passages: DocumentPassage[]): Mark[] {
+  const marks: Mark[] = [];
+  for (const p of passages) {
+    if (marks.some((m) => m.chunkIndex === p.chunkIndex)) continue;
+    marks.push({ chunkIndex: p.chunkIndex, label: p.chunkNumber !== null ? `[${p.docNumber}:${p.chunkNumber}]` : null });
+  }
+  return marks;
+}
+
+/** What the source viewer marks in `docSha`: the chat's marked passages of
+ *  it, plus `alsoChunk` (the passage it was opened on, cited or not) last
+ *  if it isn't one of them. */
+export function documentMarks(turns: Turn[], docSha: string, alsoChunk?: number): Mark[] {
+  const doc = conversationDocuments(turns).find((d) => d.docSha === docSha);
+  const marks = passageMarks(doc ? markedPassages(doc) : []);
+  if (alsoChunk !== undefined && !marks.some((m) => m.chunkIndex === alsoChunk)) {
+    marks.push({ chunkIndex: alsoChunk, label: null });
+  }
+  return marks;
+}
+
+/** Every document the conversation has referenced, newest turn to oldest
+ *  folded into one list: cited documents first in [doc] order, then the ones
+ *  only retrieved, in the order they first turned up. Pure, so the Sources
+ *  panel is just a render of it. */
+export function conversationDocuments(turns: Turn[]): DocumentRef[] {
+  const docs = new Map<string, DocumentRef>();
+  const passages = new Map<string, DocumentPassage>();
+  const firstSeen = new Map<string, number>();
+
+  for (const turn of turns) {
+    for (const s of turn.sources) {
+      let doc = docs.get(s.doc_sha);
+      if (!doc) {
+        doc = { docSha: s.doc_sha, filename: s.filename, docNumber: null, passages: [], citedCount: 0, turnKeys: [] };
+        docs.set(s.doc_sha, doc);
+        firstSeen.set(s.doc_sha, firstSeen.size);
+      }
+      let p = passages.get(s.handle);
+      if (!p) {
+        p = { handle: s.handle, turnKey: turn.key, cited: false, docNumber: null, chunkNumber: null,
+              chunkIndex: s.chunk_index, pages: s.pages, headings: s.headings, text: s.text };
+        passages.set(s.handle, p);
+        doc.passages.push(p);
+      }
+      // The numbering arrives with whichever turn cited it; a carried-forward
+      // copy keeps it, so take it wherever it shows up.
+      if (s.doc_number !== null) {
+        p.docNumber = s.doc_number;
+        p.chunkNumber = s.chunk_number;
+        if (doc.docNumber === null) doc.docNumber = s.doc_number;
+      }
+      if (s.cited === true) {
+        // First turn to cite it is the one the viewer opens: that's where the
+        // reader met it.
+        if (!p.cited) {
+          p.cited = true;
+          p.turnKey = turn.key;
+        }
+        if (!doc.turnKeys.includes(turn.key)) doc.turnKeys.push(turn.key);
+      }
+    }
+  }
+
+  for (const doc of docs.values()) {
+    doc.citedCount = doc.passages.filter((p) => p.cited).length;
+    doc.passages.sort((a, b) =>
+      Number(b.cited) - Number(a.cited) ||
+      (a.chunkNumber ?? 0) - (b.chunkNumber ?? 0) ||
+      a.chunkIndex - b.chunkIndex);
+  }
+
+  return [...docs.values()].sort((a, b) =>
+    Number(b.citedCount > 0) - Number(a.citedCount > 0) ||
+    (a.docNumber ?? Infinity) - (b.docNumber ?? Infinity) ||
+    (firstSeen.get(a.docSha) ?? 0) - (firstSeen.get(b.docSha) ?? 0));
+}

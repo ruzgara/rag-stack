@@ -7,7 +7,7 @@
 import { SvelteMap } from "svelte/reactivity";
 import { get, patch, post } from "../lib/api";
 import { runTurn, type TurnOutcome } from "../lib/stream";
-import { applyEvent, newTurn, resetForRetry, toTurns, type Turn } from "../lib/turns";
+import { applyEvent, documentMarks, newTurn, resetForRetry, toTurns, type Mark, type Turn } from "../lib/turns";
 import type { ConversationBase, ConversationDetail, ConversationListItem, Preset } from "../lib/types";
 import { navigate } from "./route.svelte";
 import { session } from "./session.svelte";
@@ -56,6 +56,24 @@ class ChatState {
   private controllers = new Map<string, AbortController>();
   private turnSeq = 0;
   private openSeq = 0;
+
+  /** The one way into the source viewer: on `handle`'s passage, with every
+   *  passage of the same document this conversation referenced marked beside
+   *  it -- so it reads the same from a citation, either panel tab, or the
+   *  viewer's own prev/next. `replace` swaps the top popup instead of
+   *  stacking another. */
+  openSource(turnKey: string, handle: string, opts: { replace?: boolean } = {}): void {
+    let marks: Mark[] | undefined;
+    for (const view of this.views.values()) {
+      const src = view.turns.find((t) => t.key === turnKey)?.sources.find((s) => s.handle === handle);
+      if (!src) continue;
+      marks = documentMarks(view.turns, src.doc_sha, src.chunk_index);
+      break;
+    }
+    const m = { kind: "source", turnKey, handle, marks } as const;
+    if (opts.replace) ui.replace(m);
+    else ui.open(m);
+  }
 
   get draft(): string {
     return this.drafts[this.activeId ?? NEW] ?? "";

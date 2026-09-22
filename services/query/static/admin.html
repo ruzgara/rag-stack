@@ -177,7 +177,7 @@
   <b id="modalTitle"></b>
   <div id="modalBody"></div>
   <div class="row" style="margin-top:16px;justify-content:flex-end">
-    <button value="cancel">Cancel</button><button class="primary" value="ok" id="modalOk">OK</button>
+    <button value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok" id="modalOk">OK</button>
   </div>
 </form></dialog>
 
@@ -248,6 +248,7 @@ function ask(title, fields, okLabel = "Save") {
       resolve(out);
     };
     dialog.addEventListener("close", done);
+    dialog.returnValue = "";   // Esc keeps the previous value, which may be "ok"
     dialog.showModal();
     $("#modalBody").querySelector("input, select")?.focus();
   });

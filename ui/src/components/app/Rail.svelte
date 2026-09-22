@@ -2,9 +2,10 @@
   import { chat } from "../../state/chat.svelte";
   import { library, libraryKind, kindColor } from "../../state/library.svelte";
   import { navigate } from "../../state/route.svelte";
+  import { session } from "../../state/session.svelte";
   import { ui, guard } from "../../state/ui.svelte";
   import { workspace } from "../../state/workspace.svelte";
-  import { when, plural } from "../../lib/format";
+  import { when, plural, initials } from "../../lib/format";
   import type { ConversationListItem } from "../../lib/types";
 
   const ws = $derived(workspace.current);
@@ -43,7 +44,22 @@
     await workspace.deleteConversation(c.id);
     chat.drop(c.id);
   })();
+
+  let menuEl: HTMLDivElement | undefined = $state();
+  function onDocClick(e: MouseEvent): void {
+    if (ui.userMenuOpen && menuEl && !menuEl.contains(e.target as Node)) ui.userMenuOpen = false;
+  }
+  function onKey(e: KeyboardEvent): void {
+    if (e.key === "Escape" && ui.userMenuOpen) ui.userMenuOpen = false;
+  }
+
+  const signOut = guard(async () => {
+    ui.closeAll();
+    await session.logout();
+  });
 </script>
+
+<svelte:document onclick={onDocClick} onkeydown={onKey} />
 
 <aside class="rail">
   <button class="ws-card" onclick={() => ui.open({ kind: "workspaces" })}>
@@ -78,11 +94,9 @@
     </section>
 
     <section class="chats">
-      <div class="chats-head">
-        <h6>Chats</h6>
-        <button class="new" onclick={newChat}>+ New chat</button>
-      </div>
+      <h6>Chats</h6>
       <div class="list rag-scroll">
+        <button class="add" onclick={newChat}>+ New chat</button>
         {#each workspace.conversations as c (c.id)}
           {@const active = chat.streaming.includes(c.id)}
           {@const current = c.id === chat.activeId}
@@ -117,6 +131,26 @@
     Recently deleted
     <span class="trash-n">{workspace.deletedConversations.length + workspace.deletedWorkspaces.length || ""}</span>
   </button>
+
+  <div class="user" bind:this={menuEl}>
+    {#if ui.userMenuOpen}
+      <div class="menu" role="menu">
+        <button role="menuitem" onclick={() => ui.open({ kind: "libraries" })}>Libraries</button>
+        <button role="menuitem" onclick={() => ui.open({ kind: "groups" })}>Groups</button>
+        <button role="menuitem" onclick={() => ui.open({ kind: "settings" })}>Settings</button>
+        {#if session.isAdmin}
+          <a role="menuitem" href="/admin" rel="external">Admin console</a>
+        {/if}
+        <div class="sep"></div>
+        <button role="menuitem" class="signout" onclick={signOut}>Sign out</button>
+      </div>
+    {/if}
+    <button class="user-btn" onclick={() => (ui.userMenuOpen = !ui.userMenuOpen)} aria-expanded={ui.userMenuOpen} aria-haspopup="menu">
+      <span class="avatar">{session.me ? initials(session.me.user.display_name, session.me.user.email) : ""}</span>
+      <span class="uname ellipsis">{session.displayName}</span>
+      <span class="caret up">▾</span>
+    </button>
+  </div>
 </aside>
 
 <style>
@@ -138,13 +172,6 @@
   .libs { flex: 0 1 auto; max-height: 40%; }
   .chats { flex: 1 1 auto; }
   h6 { margin: 0 0 6px; padding: 0 18px; font-size: 10px; letter-spacing: .14em; color: var(--color-neutral-700); }
-  .chats-head { display: flex; align-items: baseline; padding-right: 14px; }
-  .chats-head h6 { flex: 1; }
-  .new {
-    border: 0; background: transparent; cursor: pointer; font-family: var(--font-heading); font-size: 12px;
-    color: var(--color-accent-700); padding: 1px 6px; border-radius: var(--radius-md); margin-top: -3px;
-  }
-  .new:hover { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
   .list { overflow-y: auto; min-height: 0; padding: 0 10px 0 8px; }
 
   .row { display: flex; align-items: center; border-radius: var(--radius-md); position: relative; }
@@ -177,7 +204,7 @@
   .row-acts { display: flex; gap: 2px; padding-right: 6px; }
 
   .add {
-    display: block; width: 100%; text-align: left; margin-top: 2px; padding: 5px 6px 5px 22px; border: 0;
+    display: block; width: 100%; text-align: center; margin-top: 2px; padding: 5px 6px; border: 0;
     background: transparent; cursor: pointer; font-family: var(--font-heading); font-size: 13px;
     color: var(--color-accent-700); border-radius: var(--radius-md);
   }
@@ -191,4 +218,30 @@
   }
   .trash:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); color: var(--color-text); }
   .trash-n { margin-left: auto; font-size: 11px; color: var(--color-neutral-600); }
+
+  .user { position: relative; margin: 10px 14px 10px; }
+  .user-btn {
+    display: flex; align-items: center; gap: 9px; width: 100%; background: var(--color-bg); border: 0; cursor: pointer;
+    padding: 9px 12px; border-radius: var(--radius-md); box-shadow: var(--shadow-sm); color: var(--color-text);
+  }
+  .user-btn:hover { box-shadow: var(--shadow-md); }
+  .avatar {
+    width: 26px; height: 26px; flex: none; border-radius: 50%; background: var(--color-accent-2-500); color: var(--color-bg);
+    display: grid; place-items: center; font-family: var(--font-heading); font-size: 12px;
+  }
+  .uname { font-family: var(--font-heading); font-size: 14.5px; }
+  .caret { margin-left: auto; font-size: 10px; color: var(--color-neutral-600); }
+  .caret.up { display: inline-block; transform: rotate(180deg); }
+  .menu {
+    position: absolute; bottom: calc(100% + 6px); right: 0; left: 0; z-index: 40; background: var(--color-bg);
+    border-radius: 3px; box-shadow: var(--shadow-lg); padding: 5px; display: flex; flex-direction: column;
+  }
+  .menu > button, .menu > a {
+    text-align: left; border: 0; background: transparent; cursor: pointer; padding: 7px 10px;
+    font-family: var(--font-heading); font-size: 13.5px; border-radius: var(--radius-md); color: var(--color-text);
+    text-decoration: none;
+  }
+  .menu > button:hover, .menu > a:hover { background: color-mix(in srgb, var(--color-accent) 12%, transparent); }
+  .menu .signout { color: var(--color-accent-700); }
+  .sep { height: 1px; background: var(--color-divider); margin: 4px 8px; }
 </style>

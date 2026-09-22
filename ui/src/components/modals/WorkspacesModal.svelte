@@ -108,7 +108,7 @@
 <style>
   .rows { display: flex; flex-direction: column; margin: 0 -8px; }
   .row {
-    display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: var(--radius-md);
+    display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-radius: var(--radius-md);
     cursor: pointer; background: transparent; border: 0; text-align: left; font: inherit; color: inherit;
     width: 100%;
   }
@@ -118,7 +118,7 @@
   .row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
   .row-name { font-family: var(--font-heading); font-size: 15px; }
   .row-meta { font-size: 11.5px; }
-  .row-state { font-size: 11px; color: var(--color-accent-700); font-family: var(--font-heading); flex: none; }
+  .row-state { font-size: 11px; color: var(--color-accent-700); font-family: var(--font-heading); flex: none; margin-left: 18px; }
   .btn-delete { color: var(--color-accent-2-700); border-color: var(--color-accent-2-300); }
   .btn-delete:hover:not(:disabled) { background: var(--color-accent-2-100); }
 </style>
