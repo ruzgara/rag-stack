@@ -7,7 +7,7 @@
   // is that reasoning text is never stored, so a reopened turn has none.
   import { deriveInvalid, processSummary, type Turn } from "../../lib/turns";
   import { buildCiteMap } from "../../lib/citations";
-  import { clock, locator, plural } from "../../lib/format";
+  import { clock, locator, plural, usd } from "../../lib/format";
   import { session } from "../../state/session.svelte";
   import { ui, guard } from "../../state/ui.svelte";
   import { chat } from "../../state/chat.svelte";
@@ -248,7 +248,7 @@
         <button class="btn btn-ghost act" onclick={guard(() => chat.retry())} disabled={busy}>Retry</button>
       {/if}
       {#if turn.stats?.completion_tokens}
-        <span class="stat">{plural(turn.stats.completion_tokens, "token")}{turn.stats.first_token_s != null ? ` · first token ${turn.stats.first_token_s.toFixed(1)}s` : ""}</span>
+        <span class="stat">{plural(turn.stats.completion_tokens, "token")}{turn.cost != null ? ` · ${usd(turn.cost)}` : ""}{turn.stats.first_token_s != null ? ` · first token ${turn.stats.first_token_s.toFixed(1)}s` : ""}</span>
       {/if}
     </div>
   {/if}

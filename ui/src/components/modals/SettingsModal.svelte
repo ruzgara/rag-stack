@@ -332,6 +332,17 @@
               <span class="sys-label">Ollama</span>
               {#if !session.health.ollama.ok}<span class="err-text sys-detail">{session.health.ollama.error}</span>{/if}
             </div>
+            {#if session.health.openrouter}
+              <div class="sys-row">
+                <span class="dot" class:ok={session.health.openrouter.ok} class:err={!session.health.openrouter.ok}></span>
+                <span class="sys-label">OpenRouter</span>
+                {#if session.health.openrouter.ok}
+                  <span class="sys-detail muted">chat models</span>
+                {:else}
+                  <span class="err-text sys-detail">{session.health.openrouter.error}</span>
+                {/if}
+              </div>
+            {/if}
             <div class="sys-row">
               <span class="dot" class:ok={session.health.qdrant.ok} class:err={!session.health.qdrant.ok}></span>
               <span class="sys-label">Qdrant</span>

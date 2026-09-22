@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 
 import api
+import httpx
 import pytest
 from accounts import Accounts
 from auth import Auth
@@ -121,3 +122,23 @@ def test_health_auth_mode_reflects_proxy(service, monkeypatch):
     resp = api.health()
     body = json.loads(bytes(resp.body))
     assert body["auth"]["mode"] == "proxy"
+
+
+def test_health_has_no_openrouter_check_on_ollama(service):
+    body = json.loads(bytes(api.health().body))
+    assert "openrouter" not in body
+
+
+def test_health_checks_the_openrouter_key(service, monkeypatch):
+    """With CHAT_PROVIDER=openrouter a rejected key shows up as its own
+    failing check -- Ollama is still checked, for embeddings."""
+    def handler(request):
+        assert request.url.path == "/api/v1/key"
+        return httpx.Response(401, json={"error": {"message": "No auth credentials found"}})
+    cfg = ChatConfig.from_env({**CHAT_ENV, "OLLAMA_PORT": "1", "CHAT_PROVIDER": "openrouter",
+                               "OPENROUTER_API_KEY": "sk-bad"})
+    chat = ChatService(api.state.retriever, cfg, client=httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(api.state, "chat", chat, raising=False)
+    body = json.loads(bytes(api.health().body))
+    assert body["openrouter"]["ok"] is False and "401" in body["openrouter"]["error"]
+    assert "ollama" in body

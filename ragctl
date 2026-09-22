@@ -450,7 +450,33 @@ cmd_models_check() {
     local missing=0
     local installed
     installed="$(curl -sf "http://127.0.0.1:${OLLAMA_PORT}/api/tags" | python3 -c 'import json,sys; print("\n".join(m["name"] for m in json.load(sys.stdin).get("models",[])))' 2>/dev/null || true)"
-    for m in CHAT_MODEL_EVERYDAY CHAT_MODEL_HARD EMBED_MODEL VLM_MODEL; do
+    local local_models=(CHAT_MODEL_EVERYDAY CHAT_MODEL_HARD EMBED_MODEL VLM_MODEL)
+    if [[ "${CHAT_PROVIDER:-ollama}" == "openrouter" ]]; then
+        # Chat models come from OpenRouter; embeddings and the VLM stay on Ollama.
+        local_models=(EMBED_MODEL VLM_MODEL)
+        # The key goes to curl on stdin (-H @-), not argv, where ps would show it.
+        local remote
+        if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+            err "CHAT_PROVIDER=openrouter but OPENROUTER_API_KEY is not set in .env"
+            missing=1
+        elif ! remote="$(printf 'Authorization: Bearer %s\n' "$OPENROUTER_API_KEY" | curl -sf -H @- "${OPENROUTER_URL:-https://openrouter.ai/api/v1}/models" | python3 -c 'import json,sys; print("\n".join(m["id"] for m in json.load(sys.stdin).get("data",[])))')"; then
+            err "could not list OpenRouter's models (network, or OPENROUTER_URL)"
+            missing=1
+        else
+            for m in CHAT_MODEL_EVERYDAY CHAT_MODEL_HARD; do
+                local name="${!m:-}"
+                if [[ -z "$name" ]]; then
+                    warn "$m is not set in .env"
+                elif grep -qxF "$name" <<<"$remote"; then
+                    ok "$m -> $name (OpenRouter)"
+                else
+                    err "$m -> $name (NOT an OpenRouter model id; see https://openrouter.ai/models)"
+                    missing=1
+                fi
+            done
+        fi
+    fi
+    for m in "${local_models[@]}"; do
         local name="${!m:-}"
         if [[ -z "$name" ]]; then
             warn "$m is not set in .env"
@@ -691,7 +717,7 @@ Usage: ./ragctl <command> [args]
   logs [svc]             Tail logs (svc: docling, ollama, ingest, query, qdrant)
   logs rotate [--force]  Rotate data/logs now (size-based; LOG_MAX_MB / LOG_KEEP
                          in .env). Runs hourly on its own via a LaunchAgent.
-  models check           Verify .env model names exist in 'ollama list'
+  models check           Verify .env model names exist in 'ollama list' (or on OpenRouter)
   ingest [--force-vlm] [--reprocess]
                          Convert data/inbox to markdown + docling JSON once
                          (--reprocess re-converts data/processed in place)

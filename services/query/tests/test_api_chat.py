@@ -84,6 +84,26 @@ def test_the_done_payload_carries_handles_refs_and_per_source_cited(env, monkeyp
     assert stored["sources"][0]["doc_number"] == 1  # the stored copy agrees with the SSE payload
 
 
+def test_the_turn_cost_is_sent_live_but_never_stored(env, monkeypatch):
+    user = env
+    conv = api.state.db.create_conversation("everyday", user_id=user.id)
+    wire_chat(monkeypatch, {"q": [make_hit("a", ["Sec"])]}, [answer("ok")])
+    real_run_turn = api.state.chat.run_turn
+
+    def priced(*args, **kw):
+        for ev in real_run_turn(*args, **kw):
+            if ev["type"] == "done":
+                ev["result"].cost = 0.0042
+            yield ev
+    monkeypatch.setattr(api.state.chat, "run_turn", priced)
+
+    events = drain(api.send_message(conv["id"], api.NewMessage(content="q"), user))
+
+    assert event(events, "done")["cost"] == 0.0042
+    stored = api.state.db.get_conversation(conv["id"], user_id=user.id)["messages"][-1]
+    assert "cost" not in stored["stats"]
+
+
 # ------------------------------------------------------------------ stopped --
 
 def test_the_stopped_path_stores_numbered_source_dicts(env, monkeypatch):

@@ -42,6 +42,9 @@ export interface Turn {
   searchQueries: string[];
   sources: Source[];
   stats: TurnStats | null;
+  /** US dollars, from `done` when the provider prices calls (OpenRouter).
+   *  Never stored, so a reopened conversation has none. */
+  cost: number | null;
   trace: TraceStep[];
   queuePosition: number | null;
   /** Client clock, for "first token 1.4s" while it streams. */
@@ -68,6 +71,7 @@ export function newTurn(key: string, question: string, askedAt = Date.now() / 10
     searchQueries: [],
     sources: [],
     stats: null,
+    cost: null,
     trace: [],
     queuePosition: null,
     startedAt: Date.now(),
@@ -80,7 +84,7 @@ export function newTurn(key: string, question: string, askedAt = Date.now() / 10
 export function resetForRetry(t: Turn): void {
   Object.assign(t, {
     answer: "", thinking: "", thinkingTokens: 0, answerTokens: 0, status: "streaming", error: null,
-    searchQueries: [], sources: [], stats: null, trace: [], queuePosition: null,
+    searchQueries: [], sources: [], stats: null, cost: null, trace: [], queuePosition: null,
     startedAt: Date.now(), firstTokenAt: null, hasLiveThinking: false,
   } satisfies Partial<Turn>);
 }
@@ -160,6 +164,7 @@ export function applyEvent(t: Turn, ev: TurnEvent): void {
       t.searchQueries = ev.search_queries;
       t.sources = ev.sources; // cumulative and authoritative -- replace, don't merge
       t.stats = ev.stats;
+      t.cost = ev.cost ?? null;
       t.status = "complete";
       const auto = t.trace.find((s) => s.verb === "search" && s.foundBy === "auto");
       if (auto && ev.stats.search_s !== undefined) auto.seconds = ev.stats.search_s;

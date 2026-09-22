@@ -123,7 +123,7 @@ def test_unknown_preset():
 ])
 def test_the_planner_falls_back_to_searching_the_message(reply, expected):
     svc, _, _ = service(ollama=FakeOllama(plan=reply))
-    assert svc.plan_search(svc.cfg.preset(None), [], "and for Level 1?") == expected
+    assert svc.plan_search(svc.cfg.preset(None), [], "and for Level 1?")[:3] == expected
 
 
 def test_the_planner_keeps_at_most_max_queries():

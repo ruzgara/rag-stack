@@ -119,6 +119,15 @@ Edit `.env`:
   (`BAAI/bge-m3` for `bge-m3`), used to size chunks in tokens.
 - Leave everything else at its default unless you know you want to change it.
 
+**Developing on a smaller machine?** Set `CHAT_PROVIDER=openrouter` and
+`OPENROUTER_API_KEY`, and give `CHAT_MODEL_EVERYDAY` / `CHAT_MODEL_HARD`
+OpenRouter model ids (e.g. `anthropic/claude-sonnet-5`) to run the chat models
+on OpenRouter instead of Ollama. Only chat moves; embeddings, the VLM fallback
+and the reranker stay local, so Ollama is still required. The passages
+retrieved for each question are sent to OpenRouter, so use documents you can
+share. Switch back with `CHAT_PROVIDER=ollama`; the change takes effect when
+you save `.env` from the admin console, or after `./ragctl up`.
+
 ```bash
 ./ragctl install
 ```

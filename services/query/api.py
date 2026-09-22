@@ -1170,6 +1170,7 @@ def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], p
                                    "preset": r.preset, "search_queries": r.search_queries, "cited": r.cited,
                                    "refs": {h: list(v) for h, v in r.refs.items()},
                                    "invalid_citations": r.invalid_citations, "stats": r.stats,
+                                   "cost": r.cost,
                                    "sources": [{**asdict(s), "cited": s.handle in r.cited} for s in r.sources]})
                 if first_turn and not has_title:
                     title = state.chat.generate_title(preset, question, r.answer)
@@ -1584,6 +1585,14 @@ def health() -> JSONResponse:
                 checks["qdrant"] = {"ok": True, "collection": cfg.collection, "chunks": resp.json()["result"]["count"]}
         except httpx.HTTPError as exc:
             checks["qdrant"] = {"ok": False, "error": str(exc)}
+    openrouter = state.chat.openrouter
+    if openrouter:
+        # Ollama is still checked above: embeddings never leave the machine.
+        try:
+            openrouter.check()
+            checks["openrouter"] = {"ok": True}
+        except httpx.HTTPError as exc:
+            checks["openrouter"] = {"ok": False, "error": str(exc)}
     try:
         state.db.ping()
         checks["database"] = {"ok": True}

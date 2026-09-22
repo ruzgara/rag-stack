@@ -90,3 +90,12 @@ export function locator(pages: number[], headings: string[]): string {
 export function plural(n: number, one: string, many = `${one}s`): string {
   return `${n.toLocaleString()} ${n === 1 ? one : many}`;
 }
+
+/** "$0.0042", "$0.13" -- a turn's cost. Below a cent it keeps two significant
+ *  digits, since most turns cost a fraction of one. */
+export function usd(cost: number): string {
+  if (cost === 0) return "$0";
+  if (cost < 0.0001) return "<$0.0001";
+  if (cost < 0.01) return `$${Number(cost.toPrecision(2))}`;
+  return `$${cost.toFixed(2)}`;
+}

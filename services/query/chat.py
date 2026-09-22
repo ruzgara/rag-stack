@@ -16,7 +16,8 @@ One turn:
      How many passages that is depends on the question -- one for a narrow
      one, many for a broad one -- rather than a fixed count
      (CHAT_INITIAL_SOURCES only caps it).
-  3. Answer: the chat model streams its answer from Ollama. If the preset has
+  3. Answer: the chat model streams its answer from Ollama (or OpenRouter,
+     CHAT_PROVIDER -- see openrouter.py). If the preset has
      tools on, it may call search_documents for more passages, or
      list_documents to see what the knowledge base holds -- at most
      CHAT_MAX_TOOL_ROUNDS times, within CHAT_MAX_SOURCE_TOKENS. Passages
@@ -44,12 +45,14 @@ import httpx
 from citations import (CitationNumbers, CitationScanner, assign_numbers, handle_for, parse_citations,
                        resolve)
 from library import Library
+from openrouter import DEFAULT_URL as OPENROUTER_URL, OpenRouter, OpenRouterError
 from retrieval import Hit, Retriever, _bool, _float, _int, estimate_tokens, load_env
 
 log = logging.getLogger(__name__)
 
 PROMPTS = Path(__file__).parent / "prompts"
 PRESETS = ("everyday", "hard")
+PROVIDERS = ("ollama", "openrouter")
 
 SEARCH_TOOL = {
     "type": "function",
@@ -119,10 +122,12 @@ class Plan(NamedTuple):
     `search` is set. `failed` means the model never answered -- the one query
     is the user's message verbatim, not a considered decision to leave it
     alone, so a follow-up like "what are some challenges" goes to search with
-    its subject still missing."""
+    its subject still missing. `cost` is what the call cost, when the
+    provider reports it (OpenRouter)."""
     search: bool
     queries: list[str]
     failed: bool
+    cost: float | None = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +154,9 @@ class ChatConfig:
     max_source_tokens: int
     carry_sources: int
     ollama_context_length: int | None
+    provider: str = "ollama"
+    openrouter_url: str = OPENROUTER_URL
+    openrouter_api_key: str = field(default="", repr=False)
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ChatConfig":
@@ -173,6 +181,12 @@ class ChatConfig:
         max_queries = int(env.get("CHAT_MAX_QUERIES") or 2)
         if max_queries < 1:
             raise ValueError(f"CHAT_MAX_QUERIES must be >= 1, got {max_queries}")
+        provider = (env.get("CHAT_PROVIDER") or "ollama").strip().lower()
+        if provider not in PROVIDERS:
+            raise ValueError(f"CHAT_PROVIDER must be one of {', '.join(PROVIDERS)}, got {provider!r}")
+        api_key = (env.get("OPENROUTER_API_KEY") or "").strip()
+        if provider == "openrouter" and not api_key:
+            raise ValueError("CHAT_PROVIDER=openrouter needs OPENROUTER_API_KEY set in .env")
         return cls(
             ollama_url=f"http://127.0.0.1:{env.get('OLLAMA_PORT', '11434')}",
             presets=presets,
@@ -200,6 +214,9 @@ class ChatConfig:
             # a bigger window than Ollama is actually configured to serve
             # would make "context used" read far too low.
             ollama_context_length=int(env["OLLAMA_CONTEXT_LENGTH"]) if env.get("OLLAMA_CONTEXT_LENGTH") else None,
+            provider=provider,
+            openrouter_url=(env.get("OPENROUTER_URL") or OPENROUTER_URL).strip(),
+            openrouter_api_key=api_key,
         )
 
     def preset(self, name: str | None) -> Preset:
@@ -274,6 +291,10 @@ class TurnResult:
     invalid_citations: list[str] = field(default_factory=list)  # raw text that didn't resolve
     refs: dict[str, tuple[int, int]] = field(default_factory=dict)  # handle -> (doc_number, chunk_number)
     stats: dict = field(default_factory=dict)
+    # US dollars, when the provider reports a price (OpenRouter). Kept out of
+    # `stats` because stats are stored with the message; this is only shown
+    # live, on the done event.
+    cost: float | None = None
 
 
 def trim_history(history: list[dict], max_tokens: int) -> list[dict]:
@@ -299,13 +320,24 @@ class ChatService:
         self.library = library or Library(retriever)
         self.client = client or httpx.Client()
         self._model_info: dict[str, dict] = {}
+        # Chat models only: embeddings (retrieval.py) always go to Ollama.
+        self.openrouter = (OpenRouter(self.client, self.cfg.openrouter_api_key, self.cfg.openrouter_url)
+                           if self.cfg.provider == "openrouter" else None)
 
-    # --------------------------------------------------------------- ollama --
+    # ------------------------------------------------------- chat backends --
+    # Everything below speaks Ollama's shapes; with CHAT_PROVIDER=openrouter,
+    # openrouter.py translates to and from them.
 
     def _chat(self, model: str, messages: list[dict], *, think: bool = False, fmt: dict | None = None,
               temperature: float | None = None) -> dict:
+        temperature = self.cfg.temperature if temperature is None else temperature
+        if self.openrouter:
+            try:
+                return self.openrouter.chat(model, messages, think=think, temperature=temperature, fmt=fmt)
+            except OpenRouterError as exc:
+                raise ChatError(str(exc)) from None
         body = {"model": model, "messages": messages, "stream": False, "think": think, "keep_alive": "30m",
-                "options": {"temperature": self.cfg.temperature if temperature is None else temperature}}
+                "options": {"temperature": temperature}}
         if fmt:
             body["format"] = fmt
         resp = self.client.post(f"{self.cfg.ollama_url}/api/chat", json=body, timeout=httpx.Timeout(300, connect=10))
@@ -314,6 +346,13 @@ class ChatService:
         return resp.json()
 
     def _chat_stream(self, model: str, messages: list[dict], *, think: bool, tools: list | None) -> Iterator[dict]:
+        if self.openrouter:
+            try:
+                yield from self.openrouter.chat_stream(model, messages, think=think,
+                                                       temperature=self.cfg.temperature, tools=tools)
+            except OpenRouterError as exc:
+                raise ChatError(str(exc)) from None
+            return
         body = {"model": model, "messages": messages, "stream": True, "think": think, "keep_alive": "30m",
                 "options": {"temperature": self.cfg.temperature}}
         if tools:
@@ -337,9 +376,15 @@ class ChatService:
         caching it, so the next call tries again."""
         if model not in self._model_info:
             try:
-                resp = self.client.post(f"{self.cfg.ollama_url}/api/show", json={"model": model}, timeout=30)
-                resp.raise_for_status()
-                self._model_info[model] = resp.json()
+                if self.openrouter:
+                    info = self.openrouter.show(model)
+                    if info is None:
+                        return None
+                    self._model_info[model] = info
+                else:
+                    resp = self.client.post(f"{self.cfg.ollama_url}/api/show", json={"model": model}, timeout=30)
+                    resp.raise_for_status()
+                    self._model_info[model] = resp.json()
             except httpx.HTTPError:
                 return None
         return self._model_info[model]
@@ -363,7 +408,9 @@ class ChatService:
             return None
         for key, value in (info.get("model_info") or {}).items():
             if key.endswith(".context_length"):
-                if self.cfg.ollama_context_length is not None:
+                # OLLAMA_CONTEXT_LENGTH is Ollama's own truncation; it
+                # doesn't limit a model served by OpenRouter.
+                if self.cfg.ollama_context_length is not None and not self.openrouter:
                     return min(value, self.cfg.ollama_context_length)
                 return value
         return None
@@ -384,9 +431,10 @@ class ChatService:
                   "properties": {"search": {"type": "boolean"},
                                  "queries": {"type": "array", "items": {"type": "string"}}},
                   "required": ["search", "queries"]}
-        failed, queries = False, []
+        failed, queries, cost = False, [], None
         try:
             resp = self._chat(preset.model, [{"role": "user", "content": prompt}], temperature=0, fmt=schema)
+            cost = resp.get("cost")
             out = json.loads(resp["message"]["content"])
             search = out.get("search") is not False
             raw = out.get("queries")
@@ -400,7 +448,7 @@ class ChatService:
                     queries.append(q)
         except (ChatError, httpx.HTTPError, json.JSONDecodeError, KeyError, AttributeError, TypeError):
             search, queries, failed = True, [], True
-        return Plan(search, queries[:self.cfg.max_queries] or [question], failed)
+        return Plan(search, queries[:self.cfg.max_queries] or [question], failed, cost)
 
     def _search(self, query: str, limit: int, seen: set[str], sources: list[Source], found_by: str,
                 budget: list[int], max_tokens: int | None = None, doc_shas: set[str] | None = None,
@@ -474,6 +522,9 @@ class ChatService:
         numbers = numbers.copy() if numbers is not None else CitationNumbers()
         t_start = time.monotonic()
         history = trim_history(history, self.cfg.history_max_tokens)
+        # Summed over every model call in the turn; stays None on Ollama,
+        # which has no price to report.
+        cost: float | None = None
 
         # 0. Carry forward what this conversation has already cited: put
         # these sources in first, so _search's len(sources) + 1 numbering
@@ -492,7 +543,7 @@ class ChatService:
         queries, do_search = [question], True
         if self.cfg.plan:
             t0 = time.monotonic()
-            do_search, queries, failed = self.plan_search(preset, history, question)
+            do_search, queries, failed, cost = self.plan_search(preset, history, question)
             result.stats["plan_s"] = round(time.monotonic() - t0, 2)
             # Only recorded when it went wrong, so a good turn stays unmarked.
             if failed:
@@ -585,7 +636,7 @@ class ChatService:
         scanner = CitationScanner(numbers, lambda h: next((s.doc_sha for s in result.sources if s.handle == h), None))
         while True:
             offer_tools = tools_on and rounds < self.cfg.max_tool_rounds and budget[0] > 0
-            content, tool_calls = "", []
+            content, tool_calls, reasoning_details = "", [], None
             for chunk in self._chat_stream(preset.model, messages, think=preset.think,
                                            tools=available_tools if offer_tools else None):
                 msg = chunk.get("message") or {}
@@ -601,18 +652,26 @@ class ChatService:
                         yield {"type": "citation", "handle": handle, "doc": doc_n, "chunk": chunk_n}
                     yield {"type": "token", "text": msg["content"]}
                 tool_calls.extend(msg.get("tool_calls") or [])
+                # Provider-specific reasoning state (OpenRouter), handed back
+                # with this round's tool calls -- see openrouter.py.
+                reasoning_details = msg.get("reasoning_details") or reasoning_details
                 if chunk.get("done"):
                     round_prompt_tokens = chunk.get("prompt_eval_count", 0)
                     round_eval_tokens = chunk.get("eval_count", 0)
                     prompt_tokens += round_prompt_tokens
                     eval_tokens += round_eval_tokens
+                    if chunk.get("cost") is not None:
+                        cost = (cost or 0) + chunk["cost"]
             if content:
                 parts.append(content)
             if not (tool_calls and offer_tools):
                 break
 
             rounds += 1
-            messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+            assistant = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+            if reasoning_details:
+                assistant["reasoning_details"] = reasoning_details
+            messages.append(assistant)
             for call in tool_calls:
                 fn = call.get("function") or {}
                 args = fn.get("arguments") or {}
@@ -656,7 +715,11 @@ class ChatService:
                     yield {"type": "sources", "sources": [asdict(s) for s in new]}
                     reply = ("\n\n".join(s.for_prompt() for s in new) if new
                              else "No further relevant passages found for this query.")
-                messages.append({"role": "tool", "tool_name": name or "", "content": reply})
+                tool_reply = {"role": "tool", "tool_name": name or "", "content": reply}
+                if call.get("id"):
+                    # OpenAI-style APIs link each reply to its call by id.
+                    tool_reply["tool_call_id"] = call["id"]
+                messages.append(tool_reply)
 
         # 4. Resolve citations: handles the answer cites, against this
         # turn's sources plus the conversation's numbering (so a handle
@@ -688,6 +751,9 @@ class ChatService:
             context_limit=context_limit,
             context_used_pct=round(100 * context_used / context_limit, 1) if context_limit else None,
         )
+        # The planner and every answer round; not the conversation title,
+        # which is generated after the turn.
+        result.cost = round(cost, 6) if cost is not None else None
         yield {"type": "done", "result": result}
 
     def generate_title(self, preset_name: str | None, question: str, answer: str) -> str | None:

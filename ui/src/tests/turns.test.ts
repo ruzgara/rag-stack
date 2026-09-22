@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { toTurns, deriveInvalid, applyEvent, newTurn, traceFromStored, processSummary, conversationDocuments, citedDocuments, passageMarks, documentMarks } from "../lib/turns";
 import type { DoneSource, Message } from "../lib/types";
+import { usd } from "../lib/format";
 
 // A deterministic, HANDLE_RE-shaped handle per small integer -- distinct
 // values for distinct `number`s, so tests can still key off a plain int like
@@ -181,6 +182,17 @@ describe("applyEvent", () => {
     applyEvent(t, { type: "token", text: "!" });
     expect(t).toMatchObject({ thinking: "hmm", thinkingTokens: 2, answer: "Hi!", answerTokens: 2, hasLiveThinking: true });
     expect(t.firstTokenAt).not.toBeNull();
+  });
+
+  it("takes the turn's cost from done, and has none without it (Ollama)", () => {
+    const done = { type: "done" as const, message_id: "m", answer: "a", model: "x", preset: "everyday",
+                   search_queries: [], cited: [], refs: {}, invalid_citations: [], stats: {}, sources: [] };
+    const priced = newTurn("k", "q?");
+    applyEvent(priced, { ...done, cost: 0.0042 });
+    expect(priced.cost).toBe(0.0042);
+    const free = newTurn("k", "q?");
+    applyEvent(free, { ...done, cost: null });
+    expect(free.cost).toBeNull();
   });
 
   it("splits reasoning that resumes after a search into its own run", () => {
@@ -379,5 +391,15 @@ describe("citation-ordered marks", () => {
     const turns = [turnWith("a1", [late, early, uncited])];
     expect(documentMarks(turns, "shaA", 5).map((m) => m.chunkIndex)).toEqual([9, 3, 5]);
     expect(documentMarks(turns, "shaA", 3).map((m) => m.chunkIndex)).toEqual([9, 3]);
+  });
+});
+
+describe("usd", () => {
+  it("keeps two significant digits below a cent, cents above", () => {
+    expect(usd(0)).toBe("$0");
+    expect(usd(0.00000042)).toBe("<$0.0001");
+    expect(usd(0.004213)).toBe("$0.0042");
+    expect(usd(0.0567)).toBe("$0.06");
+    expect(usd(1.5)).toBe("$1.50");
   });
 });

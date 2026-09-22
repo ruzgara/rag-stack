@@ -296,6 +296,9 @@ export type TurnEvent =
       refs: Record<string, [number, number]>;
       invalid_citations: string[];
       stats: TurnStats;
+      /** US dollars for the turn's model calls; null when the provider has no
+       *  price (Ollama). Live only -- not part of the stored message. */
+      cost?: number | null;
       sources: DoneSource[];
     }
   | { type: "title"; title: string }
@@ -315,6 +318,8 @@ export interface PresetInfo { model: string; tools: boolean; think: boolean }
 export interface HealthResponse {
   ok: boolean;
   ollama: HealthCheck;
+  /** Present only with CHAT_PROVIDER=openrouter: chat models are served from there. */
+  openrouter?: HealthCheck;
   qdrant: HealthCheck & { collection?: string; chunks?: number };
   database: HealthCheck;
   reranker?: { ok: true; model: string; device: string } | { ok: true; loading: true };
