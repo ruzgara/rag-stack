@@ -13,7 +13,13 @@ const SERVER_OWNED = ["/admin", "/docs", "/redoc", "/openapi.json", "/api/", "/v
 function match(path: string): Route {
   if (path === "/" || path === "") return { convId: null, notFound: false };
   const m = /^\/c\/([^/]+)\/?$/.exec(path);
-  if (m) return { convId: decodeURIComponent(m[1]), notFound: false };
+  if (m) {
+    try {
+      return { convId: decodeURIComponent(m[1]), notFound: false };
+    } catch {
+      // A malformed escape (/c/%) is a bad link, not a crash.
+    }
+  }
   return { convId: null, notFound: true };
 }
 

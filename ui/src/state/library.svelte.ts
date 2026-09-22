@@ -50,6 +50,17 @@ class LibraryState {
 
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
 
+  constructor() {
+    session.onSignOut(() => {
+      if (this.pollTimer) clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+      this.libraries = [];
+      this.loaded = false;
+      this.documents = null;
+      this.uploading = false;
+    });
+  }
+
   async load(): Promise<void> {
     const res = await get<{ libraries: Library[] }>("/api/libraries");
     this.libraries = res.libraries;

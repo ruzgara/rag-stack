@@ -57,6 +57,21 @@ class ChatState {
   private turnSeq = 0;
   private openSeq = 0;
 
+  constructor() {
+    session.onSignOut(() => {
+      for (const c of this.controllers.values()) c.abort();
+      this.controllers.clear();
+      this.views.clear();
+      this.activeId = null;
+      this.streaming = [];
+      this.drafts = {};
+      this.newChatPreset = "everyday";
+      this.loadingId = null;
+      this.openSeq++; // an open() still in flight must not act on its result
+      session.busy = false;
+    });
+  }
+
   /** The one way into the source viewer: on `handle`'s passage, with every
    *  passage of the same document this conversation referenced marked beside
    *  it -- so it reads the same from a citation, either panel tab, or the
@@ -211,6 +226,7 @@ class ChatState {
     } catch (e) {
       // Before any stream existed (401/403/404/422): nothing was stored.
       this.finish(view.id);
+      if (this.views.get(view.id) !== view) return; // signed out meanwhile
       if (body) {
         view.turns = view.turns.filter((x) => x.key !== t.key);
         this.drafts[view.id] = body.content;
@@ -221,6 +237,7 @@ class ChatState {
       return;
     }
     this.finish(view.id);
+    if (this.views.get(view.id) !== view) return; // signed out meanwhile
 
     switch (outcome.kind) {
       case "complete":

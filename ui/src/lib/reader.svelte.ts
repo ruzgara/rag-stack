@@ -44,6 +44,10 @@ export class ChunkReader {
   private autoScrolling = false;
   private autoTimer: ReturnType<typeof setTimeout> | undefined;
   private scrollFrame = 0;
+  /** Bumped by every fetch into `chunks`: one that lands after a newer one
+   *  started (a slow document, then a quick switch) is dropped, so an old
+   *  document never shows under the new one's header. */
+  private loadSeq = 0;
 
   /** Point the reader at a chunk of a document and load around it. */
   open(docSha: string, chunk: number, full: boolean): void {
@@ -132,6 +136,7 @@ export class ChunkReader {
     if (!sha || first === undefined || last === undefined || this.error) return void this.load(target);
     const lo = Math.min(first, Math.max(0, target - 1));
     const hi = Math.max(last, target + 1);
+    const seq = ++this.loadSeq;
     this.loading = true;
     let chunks: Chunk[] | null = null;
     try {
@@ -139,6 +144,7 @@ export class ChunkReader {
     } catch {
       /* handled below */
     }
+    if (seq !== this.loadSeq) return;
     this.loading = false;
     if (!chunks) return void this.load(target); // a plain reload around it reports the error
     const before = this.body?.querySelector(`[data-i="${first}"]`)?.getBoundingClientRect().top ?? 0;
@@ -160,20 +166,25 @@ export class ChunkReader {
     const sha = this.docSha;
     if (!sha) return;
     const whole = this.full;
+    const seq = ++this.loadSeq;
     this.loading = true;
     this.error = null;
+    let chunks: Chunk[];
+    let error: string | null = null;
     try {
-      this.chunks = whole
+      chunks = whole
         ? await this.fetchRange(sha, 0, Infinity)
         : await this.fetchRange(sha, Math.max(0, center - 1), 3);
     } catch (e) {
       // The document may have been deleted or re-indexed since the answer;
       // ChunkView falls back to the stored copy of the passage.
-      this.chunks = [];
-      this.error = e instanceof Error ? e.message : String(e);
-    } finally {
-      this.loading = false;
+      chunks = [];
+      error = e instanceof Error ? e.message : String(e);
     }
+    if (seq !== this.loadSeq) return;
+    this.chunks = chunks;
+    this.error = error;
+    this.loading = false;
     await tick();
     this.scrollTo(center, { block: whole ? "start" : "nearest" });
   }

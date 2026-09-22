@@ -152,7 +152,7 @@ def build_runtime(env: dict) -> None:
     state.ingest.autorun = (env.get("INGEST_AUTORUN") or "false").strip().lower() == "true"
     state.api_key = (env.get("QUERY_API_KEY") or "").strip()
     if previous is not None and previous is not retriever:
-        previous.close()
+        previous.retire()  # requests already holding it finish on it
     if retriever.cfg.rerank:
         # Load the reranker onto the GPU now rather than on the first question.
         threading.Thread(target=lambda: retriever.reranker, daemon=True).start()
@@ -205,7 +205,9 @@ def service_key_user(request: Request) -> User | None:
         # never as an admin, even on an empty install: admins are only ever
         # made at the terminal (ragctl user add --admin / ragctl user admin).
         account = state.accounts.create_user(SERVICE_ACCOUNT_EMAIL, display_name="API key")
-    return account
+    # Disabling the account is how an admin turns the key off without
+    # editing .env -- the same refusal a disabled person's session gets.
+    return None if account.disabled else account
 
 
 def current_user(request: Request) -> User:

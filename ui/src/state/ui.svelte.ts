@@ -2,6 +2,7 @@
 // confirm/ask dialogs, and which turn the sources panel is showing.
 
 import type { Mark } from "../lib/turns";
+import { session } from "./session.svelte";
 
 export interface Toast {
   id: number;
@@ -84,6 +85,21 @@ class UiState {
   sourcesWidth = $state(readWidth("sources", SOURCES_WIDTH));
 
   private toastSeq = 0;
+
+  constructor() {
+    // Popups and selections point into the last user's conversations and
+    // documents; toasts and column widths are the browser's, so they stay.
+    session.onSignOut(() => {
+      this.closeAll();
+      this.settleDialog(null);
+      this.selectedTurnKey = null;
+      this.focusedSources = [];
+      this.focusedDoc = null;
+      this.panelTab = "citations";
+      this.railOpen = false;
+      this.sourcesOpen = false;
+    });
+  }
 
   saveWidths(): void {
     try {

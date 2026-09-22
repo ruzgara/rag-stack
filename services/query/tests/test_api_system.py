@@ -136,6 +136,25 @@ def test_a_reload_rebuilds_the_runtime_from_the_environment(admin, monkeypatch):
     assert api.state.retriever is not before  # genuinely rebuilt, not patched in place
 
 
+def test_a_reload_leaves_the_old_retriever_usable_until_it_is_let_go(admin, monkeypatch):
+    """A turn that started before the reload still holds the old ChatService,
+    and it retrieves more than once. Closing the old client at reload would
+    fail that turn halfway; it closes once the last holder lets go."""
+    import gc
+
+    monkeypatch.setattr(api, "load_env", lambda: settings.parse(VALID))
+    api.build_runtime(api.load_env())
+    in_flight = api.state.chat  # what a running turn has hold of
+    client = in_flight.retriever._client
+
+    api.admin_reload(admin)
+
+    assert not client.is_closed
+    del in_flight
+    gc.collect()
+    assert client.is_closed
+
+
 def test_a_reload_picks_up_the_api_key_and_the_upload_quota(admin, monkeypatch):
     monkeypatch.setattr(api, "load_env", lambda: {**settings.parse(VALID),
                                                  "QUERY_API_KEY": "fresh-key", "INGEST_MAX_FILES_PER_WINDOW": "3"})

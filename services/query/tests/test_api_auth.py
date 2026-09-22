@@ -73,6 +73,16 @@ def test_a_wrong_or_missing_key_identifies_nobody(service):
     assert service.users() == []
 
 
+def test_a_disabled_service_account_is_refused(service):
+    """Disabling it has to stop the key, as disabling anyone stops their
+    sessions and tokens -- otherwise the key outlives the admin's decision."""
+    user = api.current_user(FakeRequest({"authorization": "Bearer secret-key"}))
+    service.update_user(user.id, disabled=True)
+    with pytest.raises(HTTPException) as exc:
+        api.current_user(FakeRequest({"authorization": "Bearer secret-key"}))
+    assert exc.value.status_code == 401
+
+
 def test_the_service_key_is_ignored_when_none_is_configured(service, monkeypatch):
     monkeypatch.setattr(api.state, "api_key", "")
     with pytest.raises(HTTPException):

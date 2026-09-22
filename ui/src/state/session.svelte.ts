@@ -2,6 +2,7 @@
 // health (models, index) and quota/load (the queue meter).
 
 import { get, post, ApiError, setUnauthorizedHandler } from "../lib/api";
+import { navigate } from "./route.svelte";
 import type { AuthMode, HealthResponse, Me, PresetInfo, QuotaResponse } from "../lib/types";
 
 class Session {
@@ -21,12 +22,26 @@ class Session {
 
   private healthTimer: ReturnType<typeof setInterval> | null = null;
   private quotaTimer: ReturnType<typeof setTimeout> | null = null;
+  private resets: (() => void)[] = [];
 
   constructor() {
-    setUnauthorizedHandler(() => {
-      this.me = null;
-      this.quota = null;
-    });
+    setUnauthorizedHandler(() => this.signedOut());
+  }
+
+  /** Stores holding a user's data register here to be emptied on sign-out.
+   *  They register rather than being imported, since they import session. */
+  onSignOut(reset: () => void): void {
+    this.resets.push(reset);
+  }
+
+  /** Logout and a 401 both end here. Everything the last user loaded goes,
+   *  and so does their URL: whoever signs in next in this tab must not land
+   *  on /c/<their conversation> with its transcript still cached. */
+  private signedOut(): void {
+    this.me = null;
+    this.quota = null;
+    for (const reset of this.resets) reset();
+    navigate("/", { replace: true });
   }
 
   /** The model a preset runs, from /api/health. */
@@ -73,8 +88,7 @@ class Session {
     try {
       await post("/api/auth/logout");
     } finally {
-      this.me = null;
-      this.quota = null;
+      this.signedOut();
     }
   }
 

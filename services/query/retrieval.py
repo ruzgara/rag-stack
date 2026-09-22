@@ -48,6 +48,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -201,6 +202,15 @@ class Retriever:
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
+
+    def retire(self) -> None:
+        """Close once nothing uses this any more, rather than now. A reload
+        swaps in a new retriever while turns and searches that started on this
+        one are still running -- a turn retrieves more than once -- so closing
+        here would fail them mid-answer. The finalizer holds the client, not
+        self, so it doesn't keep this retriever alive."""
+        if self._owns_client:
+            weakref.finalize(self, self._client.close)
 
     def __enter__(self) -> "Retriever":
         return self

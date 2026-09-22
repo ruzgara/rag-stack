@@ -23,9 +23,15 @@ export function fenceScan(text: string): { offsets: number[]; openAfter: boolean
     const m = FENCE.exec(line);
     if (m) {
       const marker = m[1];
-      // CommonMark: a fence closes on the same character, at least as long.
-      if (open === null) open = marker;
-      else if (marker[0] === open[0] && marker.length >= open.length) open = null;
+      const rest = line.slice(m[0].length);
+      // CommonMark: a fence closes on the same character, at least as long,
+      // with nothing but spaces after it -- "```python" inside a ``` block
+      // is code. A backtick opener's info string can't contain a backtick.
+      if (open === null) {
+        if (marker[0] !== "`" || !rest.includes("`")) open = marker;
+      } else if (marker[0] === open[0] && marker.length >= open.length && /^[ \t]*$/.test(rest)) {
+        open = null;
+      }
     }
     openAfter.push(open !== null);
     if (nl < 0) break;

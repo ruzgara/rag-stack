@@ -82,6 +82,7 @@ function route(url: string, init?: RequestInit): Response {
     auth: { ok: true, mode: "password" } });
   if (p === "/api/auth/me") return signedIn ? json(me) : json({ detail: "not signed in" }, 401);
   if (p === "/api/auth/login") { signedIn = true; return json(me); }
+  if (p === "/api/auth/logout") { signedIn = false; return json({ ok: true }); }
   if (p === "/api/quota") return json({ uploads: { unlimited: true, files_used: 0, mb_used: 0 }, load: { running: 0, queued: 1, max_concurrent: 2, max_per_user: 2 } });
   if (p === "/api/libraries") return json({ libraries });
   if (p === "/api/libraries/L1") return json({ ...libraries[0], documents: [
@@ -378,6 +379,22 @@ describe("app smoke", () => {
       await settle();
       expect(document.querySelector(".modal-backdrop")).not.toBeNull();
     }
+
+    // Signing out forgets the conversation and its URL: whoever signs in
+    // next in this tab lands on a new chat, not the last user's transcript.
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await settle();
+    button(/Ellis Marchetti/).click();
+    await settle();
+    button("Sign out").click();
+    await settle();
+    expect(location.pathname).toBe("/");
+    expect(text()).toContain("Sign in");
+    document.querySelector("form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await settle();
+    expect(text()).toContain("Halcyon diligence");
+    expect(text()).not.toContain("What caps did we agree?");
 
     expect(stopCalled).toBe(false);
     expect(errors).toEqual([]);

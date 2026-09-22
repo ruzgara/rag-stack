@@ -6,6 +6,7 @@
 import { get, post, patch, del } from "../lib/api";
 import type { ConversationListItem, Workspace } from "../lib/types";
 import { library } from "./library.svelte";
+import { session } from "./session.svelte";
 
 const STORE_KEY = "rag.workspace";
 
@@ -43,6 +44,19 @@ class WorkspaceState {
   );
 
   private listSeq = 0;
+
+  constructor() {
+    session.onSignOut(() => {
+      this.workspaces = [];
+      this.currentId = null;
+      this.conversations = [];
+      this.conversationsLoaded = false;
+      this.deletedConversations = [];
+      this.archivedConversations = [];
+      this.deletedWorkspaces = [];
+      this.listSeq++; // a list still loading belongs to the last user
+    });
+  }
 
   async load(): Promise<void> {
     const res = await get<{ workspaces: Workspace[] }>("/api/workspaces");

@@ -47,6 +47,25 @@ def test_command_substitution_in_a_value_is_refused(value):
     assert problems and "source .env" in problems[0]
 
 
+@pytest.mark.parametrize("value", ["foo; touch /tmp/pwn", "foo && touch /tmp/pwn", "foo | tee /tmp/pwn",
+                                   "foo > /tmp/pwn", "foo < /etc/passwd", "two words", "$HOME", '"$(id)"',
+                                   "'unbalanced", "back\\slash"])
+def test_anything_the_shell_would_act_on_is_refused(value):
+    """dotenv reads each of these as a plain string, but `source` runs them."""
+    problems = settings.lint(f"CHAT_MODEL_EVERYDAY={value}")
+    assert problems and "source .env" in problems[0]
+
+
+def test_a_space_before_the_equals_is_refused():
+    """`reboot =1` is bash running `reboot`, not an assignment."""
+    assert "not a valid setting name" in settings.lint("reboot =1")[0]
+
+
+@pytest.mark.parametrize("value", ["", "http://127.0.0.1:11434", "qwen3:30b-a3b", "'a; b'", '"a b"', "x # note"])
+def test_values_bash_and_dotenv_read_alike_are_accepted(value):
+    assert settings.lint(f"CHAT_MODEL_EVERYDAY={value}") == []
+
+
 def test_comments_and_blank_lines_are_fine():
     assert settings.lint("# a comment\n\n   \nKEY=value\n") == []
 

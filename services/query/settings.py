@@ -64,9 +64,13 @@ KEEP_BACKUPS = 20
 # else, and a key with a space in it is a typo that would silently do nothing.
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Command substitution in a value is executed by ragctl's `source`. There is no
-# legitimate rag-stack setting that needs it.
-UNSAFE_VALUE = re.compile(r"`|\$\(")
+# ragctl runs `set -a; source .env`, so every line is also a line of bash. A
+# value is only accepted in a form bash and dotenv read the same way, with
+# nothing bash would execute or expand: a bare word of safe characters, a
+# single-quoted string, or a double-quoted one free of $, ` and \. Anything
+# else (;, &&, |, <, >, spaces, $VAR, `...`, $(...)) is refused rather than
+# picked apart.
+SAFE_VALUE = re.compile(r"""(?:[A-Za-z0-9_./:@%+,=-]*|'[^'\n]*'|"[^"$`\\!\n]*")(?:[ \t]+#.*)?""")
 
 # Keys the running process cannot pick up: the session middleware is built
 # once at import, before startup, and the port belongs to uvicorn's command
@@ -118,14 +122,17 @@ def lint(text: str) -> list[str]:
         if "=" not in line:
             problems.append(f"line {number}: {raw.strip()!r} is not a comment and has no '='")
             continue
-        key = line.split("=", 1)[0].strip()
+        # Not stripped: `KEY =x` is bash running a command called KEY.
+        key, value = line.split("=", 1)
         if not KEY_RE.match(key):
-            problems.append(f"line {number}: {key!r} is not a valid setting name "
-                            "(letters, digits and underscores, not starting with a digit)")
-    for key, value in parse(text).items():
-        if UNSAFE_VALUE.search(value or ""):
-            problems.append(f"{key}: a value can't contain ` or $( -- ragctl runs `source .env`, "
-                            "which would execute it")
+            problems.append(f"line {number}: {key.strip()!r} is not a valid setting name "
+                            "(letters, digits and underscores, not starting with a digit, "
+                            "with no space before the '=')")
+        elif not SAFE_VALUE.fullmatch(value):
+            problems.append(f"{key}: the value has characters the shell would act on "
+                            "(spaces, ; & | < > $ ` \\ or unbalanced quotes) -- ragctl runs "
+                            "`source .env`, which would execute it. Quote it with '...' if it "
+                            "really needs them")
     return problems
 
 

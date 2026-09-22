@@ -16,6 +16,18 @@ describe("fenceScan", () => {
     expect(fenceScan("````\ncode\n```\n").openMarker).toBe("````"); // shorter fence can't close a longer one
     expect(fenceScan("```\ncode\n~~~\n").openMarker).toBe("```"); // different character never closes
   });
+
+  it("does not close on a marker followed by text", () => {
+    // Inside a ``` block, "```python" is a line of code, not a closer.
+    const text = "```\n```python\nx = 1\n\ny = 2\n";
+    expect(fenceScan(text).openMarker).toBe("```");
+    expect(splitStable(text)).toEqual(["", text]); // the blank line is inside the fence
+    expect(fenceScan("```\ncode\n```  \n").openMarker).toBeNull(); // trailing spaces are fine
+  });
+
+  it("does not open on a backtick marker whose info string has a backtick", () => {
+    expect(fenceScan("```a`b\ntext\n").openMarker).toBeNull();
+  });
 });
 
 describe("splitStable", () => {
