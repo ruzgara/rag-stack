@@ -53,6 +53,11 @@
   #toast div { border:1px solid var(--line); border-left-width:3px; border-radius:6px; padding:8px 12px; background:var(--bg); box-shadow:0 4px 18px rgba(0,0,0,.12); white-space:pre-wrap; }
   #toast div.err { border-left-color:var(--err); color:var(--err); } #toast div.ok { border-left-color:var(--ok); }
   #gate { padding:40px 20px; max-width:340px; }
+  input.rowSelect, input.selectAll { width:auto; cursor:pointer; margin:0; }
+  th.sel, td.sel { width:28px; padding-right:0; }
+  tr:has(input.rowSelect:checked) { background:var(--soft); }
+  .bulkbar { background:var(--soft); border:1px solid var(--line); border-radius:6px; padding:6px 10px; margin-bottom:10px; }
+  .bulkbar .small { margin-right:4px; }
 </style>
 </head>
 <body>
@@ -90,30 +95,50 @@
     <h2>Users</h2>
     <p class="hint">The same operations as <code>ragctl user</code>, for members. Admin accounts -- making, demoting, editing, disabling or deleting one -- are only managed at the terminal, with <code>ragctl user</code>. <code>is_admin</code> is the only role: an admin can do anything to any library, everyone else only chats and works within the libraries they own or were given access to.</p>
     <div class="row"><button class="primary" id="newUser">+ New user</button></div>
+    <div class="row bulkbar" id="usersBulk" hidden>
+      <span class="small" id="usersBulkCount"></span>
+      <button class="small danger" id="usersBulkDelete">Delete selected</button>
+      <button class="small" id="usersBulkClear">Clear</button>
+    </div>
     <h3>Accounts</h3>
-    <table><thead><tr><th>Email</th><th>Name</th><th>Groups</th><th>Libraries owned</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
+    <table><thead><tr><th class="sel"><input type="checkbox" class="selectAll" data-table="users" title="Select all"></th><th>Email</th><th>Name</th><th>Groups</th><th>Libraries owned</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
   </section>
 
   <section class="panel" id="tab-groups">
     <h2>Groups</h2>
     <p class="hint">A group of users, for granting library access to a team at once instead of one user at a time.</p>
     <div class="row"><button class="primary" id="newGroup">+ New group</button></div>
+    <div class="row bulkbar" id="groupsBulk" hidden>
+      <span class="small" id="groupsBulkCount"></span>
+      <button class="small danger" id="groupsBulkDelete">Delete selected</button>
+      <button class="small" id="groupsBulkClear">Clear</button>
+    </div>
     <h3>Groups</h3>
-    <table><thead><tr><th>Name</th><th>Type</th><th>Members</th><th></th></tr></thead><tbody id="groupRows"></tbody></table>
+    <table><thead><tr><th class="sel"><input type="checkbox" class="selectAll" data-table="groups" title="Select all"></th><th>Name</th><th>Type</th><th>Members</th><th></th></tr></thead><tbody id="groupRows"></tbody></table>
   </section>
 
   <section class="panel" id="tab-libraries">
     <h2>Libraries</h2>
     <p class="hint">A library is a named set of documents with an owner. The owner (or an admin) has full control; everyone else needs a read or write row in its access list to search or cite it -- a user with no access is never told it exists.</p>
     <div class="row"><button class="primary" id="newLibrary">+ New library</button></div>
-    <table><thead><tr><th>Name</th><th>Description</th><th>Owner</th><th>Documents</th><th>Id</th><th></th></tr></thead><tbody id="libraryRows"></tbody></table>
+    <div class="row bulkbar" id="librariesBulk" hidden>
+      <span class="small" id="librariesBulkCount"></span>
+      <button class="small danger" id="librariesBulkDelete">Delete selected</button>
+      <button class="small" id="librariesBulkClear">Clear</button>
+    </div>
+    <table><thead><tr><th class="sel"><input type="checkbox" class="selectAll" data-table="libraries" title="Select all"></th><th>Name</th><th>Description</th><th>Owner</th><th>Documents</th><th>Id</th><th></th></tr></thead><tbody id="libraryRows"></tbody></table>
   </section>
 
   <section class="panel" id="tab-documents">
     <h2>Documents</h2>
     <p class="hint">Every indexed document, and which libraries it belongs to. A document in no library is reachable only by an admin.</p>
     <div class="row"><input id="docFilter" placeholder="filter by filename…" style="min-width:260px"></div>
-    <table><thead><tr><th>File</th><th>Pages</th><th>Chunks</th><th style="min-width:180px">In libraries</th><th></th></tr></thead><tbody id="docRows"></tbody></table>
+    <div class="row bulkbar" id="documentsBulk" hidden>
+      <span class="small" id="documentsBulkCount"></span>
+      <button class="small" id="documentsBulkLibs">Add / remove library…</button>
+      <button class="small" id="documentsBulkClear">Clear</button>
+    </div>
+    <table><thead><tr><th class="sel"><input type="checkbox" class="selectAll" data-table="documents" title="Select all"></th><th>File</th><th>Pages</th><th>Chunks</th><th style="min-width:180px">In libraries</th><th></th></tr></thead><tbody id="docRows"></tbody></table>
   </section>
 
   <section class="panel" id="tab-config">
@@ -233,6 +258,94 @@ function ask(title, fields, okLabel = "Save") {
 let me = null, cache = {users: [], groups: [], libraries: [], documents: []};
 let accessLibrary = null;   // the library the access dialog (if open) is editing
 
+// ------------------------------------------------------------------- select --
+// Bulk selection for the four tables. A row is selectable if it renders an
+// <input class="rowSelect"> -- admin rows in Users don't, everything else does.
+// Selection lives in a Set keyed by data-key (id or sha) so it survives the
+// full-innerHTML re-renders that happen after every load; syncCheckboxes()
+// re-applies it to whatever rows exist after each render.
+
+const TABLES = {
+  users: {tbody: "#userRows", bar: "#usersBulk", count: "#usersBulkCount"},
+  groups: {tbody: "#groupRows", bar: "#groupsBulk", count: "#groupsBulkCount"},
+  libraries: {tbody: "#libraryRows", bar: "#librariesBulk", count: "#librariesBulkCount"},
+  documents: {tbody: "#docRows", bar: "#documentsBulk", count: "#documentsBulkCount"},
+};
+const selections = {users: new Set(), groups: new Set(), libraries: new Set(), documents: new Set()};
+const lastKey = {users: null, groups: null, libraries: null, documents: null};
+
+function selectableRows(tableKey) {
+  return [...document.querySelectorAll(`${TABLES[tableKey].tbody} tr[data-key]`)].filter(tr => tr.querySelector("input.rowSelect"));
+}
+
+function syncCheckboxes(tableKey) {
+  const set = selections[tableKey];
+  const rows = selectableRows(tableKey);
+  for (const tr of rows) tr.querySelector("input.rowSelect").checked = set.has(tr.dataset.key);
+  const selectAll = document.querySelector(`.selectAll[data-table="${tableKey}"]`);
+  if (!selectAll) return;
+  const selected = rows.filter(tr => set.has(tr.dataset.key)).length;
+  selectAll.checked = rows.length > 0 && selected === rows.length;
+  selectAll.indeterminate = selected > 0 && selected < rows.length;
+  const bar = $(TABLES[tableKey].bar);
+  bar.hidden = set.size === 0;
+  $(TABLES[tableKey].count).textContent = `${set.size} selected`;
+}
+
+function bindSelectable(tableKey) {
+  const tbody = $(TABLES[tableKey].tbody);
+  tbody.addEventListener("click", e => {
+    if (e.target.closest("button, a, select, textarea")) return;
+    const tr = e.target.closest("tr[data-key]");
+    if (!tr || !tr.querySelector("input.rowSelect")) return;
+    if (e.target.matches("input.rowSelect")) e.preventDefault(); // we drive checked state ourselves
+    const rows = selectableRows(tableKey);
+    const key = tr.dataset.key;
+    const set = selections[tableKey];
+    if (e.shiftKey && lastKey[tableKey] !== null) {
+      const from = rows.findIndex(r => r.dataset.key === lastKey[tableKey]);
+      const to = rows.indexOf(tr);
+      if (from !== -1) {
+        const [lo, hi] = [from, to].sort((a, b) => a - b);
+        for (let i = lo; i <= hi; i++) set.add(rows[i].dataset.key);
+      } else {
+        set.has(key) ? set.delete(key) : set.add(key);
+      }
+    } else {
+      // plain click and cmd/ctrl-click both toggle just this row -- nothing
+      // here ever clears the rest of the selection, so there's no difference
+      // between them beyond what a user's muscle memory expects.
+      set.has(key) ? set.delete(key) : set.add(key);
+    }
+    lastKey[tableKey] = key;
+    syncCheckboxes(tableKey);
+  });
+  const selectAll = document.querySelector(`.selectAll[data-table="${tableKey}"]`);
+  selectAll.onchange = () => {
+    const rows = selectableRows(tableKey);
+    const set = selections[tableKey];
+    if (selectAll.checked) rows.forEach(r => set.add(r.dataset.key));
+    else rows.forEach(r => set.delete(r.dataset.key));
+    syncCheckboxes(tableKey);
+  };
+  $(`${TABLES[tableKey].bar} button[id$="Clear"]`).onclick = () => {
+    selections[tableKey].clear();
+    lastKey[tableKey] = null;
+    syncCheckboxes(tableKey);
+  };
+}
+
+/** Reports the outcome of a bulk operation done as N independent requests. */
+function bulkResult(results, verbed, noun, plural = `${noun}s`) {
+  const ok = results.filter(r => r.status === "fulfilled").length;
+  const failed = results.filter(r => r.status === "rejected");
+  const label = n => `${n} ${n === 1 ? noun : plural}`;
+  if (ok) toast(`${verbed} ${label(ok)}.`);
+  if (failed.length) toast(`Failed on ${label(failed.length)}: ${failed.map(f => f.reason.message).join("; ")}`, "err");
+}
+
+for (const key of Object.keys(TABLES)) bindSelectable(key);
+
 function showGate() {
   $("#app").hidden = true; $("#gate").hidden = false;
 }
@@ -298,7 +411,8 @@ function renderUsers() {
     const flags = [u.is_admin ? '<span class="tag admin">admin</span>' : "",
                    u.disabled ? '<span class="tag off">disabled</span>' : ""].join(" ");
     const self = u.id === me.user.id;
-    return `<tr data-id="${u.id}">
+    return `<tr data-id="${u.id}" data-key="${u.id}">
+      <td class="sel">${u.is_admin ? "" : '<input type="checkbox" class="rowSelect">'}</td>
       <td>${esc(u.email)} ${flags}${self ? '<span class="small"> · you</span>' : ""}<div class="small">${esc(u.id)}</div></td>
       <td>${esc(u.display_name || "")}</td>
       <td class="small">${esc((u.groups || []).join(", ")) || "—"}</td>
@@ -310,13 +424,15 @@ function renderUsers() {
         <button class="small" data-act="passwd">Password</button>
         <button class="small danger" data-act="delete">Delete</button>`}
       </td></tr>`;
-  }).join("") || '<tr><td colspan="5" class="small">No users.</td></tr>';
+  }).join("") || '<tr><td colspan="6" class="small">No users.</td></tr>';
+  syncCheckboxes("users");
 }
 
 function renderGroups() {
   $("#groupRows").innerHTML = cache.groups.map(g => {
     const members = (g.members || []).map(id => cache.users.find(u => u.id === id)?.email || id);
-    return `<tr data-id="${g.id}">
+    return `<tr data-id="${g.id}" data-key="${g.id}">
+      <td class="sel"><input type="checkbox" class="rowSelect"></td>
       <td>${esc(g.name)}<div class="small">${esc(g.id)}</div></td>
       <td class="small">${g.type === "open" ? "Open" : "Locked"}</td>
       <td class="small">${esc(members.join(", ")) || "—"}</td>
@@ -324,12 +440,14 @@ function renderGroups() {
         <button class="small" data-act="members">Members</button>
         <button class="small danger" data-act="delete">Delete</button>
       </td></tr>`;
-  }).join("") || '<tr><td colspan="4" class="small">No groups.</td></tr>';
+  }).join("") || '<tr><td colspan="5" class="small">No groups.</td></tr>';
+  syncCheckboxes("groups");
 }
 
 function renderLibraries() {
   $("#libraryRows").innerHTML = cache.libraries.map(l =>
-    `<tr data-id="${l.id}">
+    `<tr data-id="${l.id}" data-key="${l.id}">
+      <td class="sel"><input type="checkbox" class="rowSelect"></td>
       <td>${esc(l.name)}</td><td class="small">${esc(l.description || "")}</td>
       <td class="small">${esc(l.owner_name || "—")}</td>
       <td>${l.document_count}</td><td class="small"><code>${esc(l.id)}</code></td>
@@ -338,10 +456,11 @@ function renderLibraries() {
         <button class="small" data-act="access">Access…</button>
         <button class="small danger" data-act="delete">Delete</button>
       </td>
-    </tr>`).join("") || '<tr><td colspan="6" class="small">No libraries.</td></tr>';
+    </tr>`).join("") || '<tr><td colspan="7" class="small">No libraries.</td></tr>';
   // The upload dialog picks from the same list.
   for (const select of document.querySelectorAll("select.libraryPick"))
     select.innerHTML = cache.libraries.map(l => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join("");
+  syncCheckboxes("libraries");
 }
 
 $("#newUser").onclick = guard(async () => {
@@ -356,6 +475,16 @@ $("#newUser").onclick = guard(async () => {
   await api("/api/admin/users", {method: "POST", body: {
     email: form.email, display_name: form.display_name, password: form.password || null}});
   toast(`Created ${form.email}.`);
+  await loadAccounts();
+});
+
+$("#usersBulkDelete").onclick = guard(async () => {
+  const ids = [...selections.users];
+  if (!ids.length) return;
+  if (!confirmed(`Delete ${ids.length} user(s)? Their chats, workspaces and tokens are deleted; their libraries and documents move to the Admin Workspace.`)) return;
+  const results = await Promise.allSettled(ids.map(id => api(`/api/admin/users/${id}`, {method: "DELETE"})));
+  bulkResult(results, "Deleted", "user");
+  selections.users.clear();
   await loadAccounts();
 });
 
@@ -400,6 +529,16 @@ $("#newGroup").onclick = guard(async () => {
   await loadAccounts();
 });
 
+$("#groupsBulkDelete").onclick = guard(async () => {
+  const ids = [...selections.groups];
+  if (!ids.length) return;
+  if (!confirmed(`Delete ${ids.length} group(s)? Their access rows on any library go with them.`)) return;
+  const results = await Promise.allSettled(ids.map(id => api(`/api/admin/groups/${id}`, {method: "DELETE"})));
+  bulkResult(results, "Deleted", "group");
+  selections.groups.clear();
+  await loadAccounts();
+});
+
 $("#groupRows").onclick = guard(async e => {
   const button = e.target.closest("button[data-act]"); if (!button) return;
   const id = button.closest("tr").dataset.id;
@@ -434,6 +573,16 @@ $("#newLibrary").onclick = guard(async () => {
   // Self-service endpoint -- the caller (an admin here) becomes the owner.
   await api("/api/libraries", {method: "POST", body: {name: form.name, description: form.description || null}});
   toast(`Created library ${form.name}.`);
+  await Promise.all([loadAccounts(), loadDocuments()]);
+});
+
+$("#librariesBulkDelete").onclick = guard(async () => {
+  const ids = [...selections.libraries];
+  if (!ids.length) return;
+  if (!confirmed(`Delete ${ids.length} librar${ids.length === 1 ? "y" : "ies"}? Their access lists and attachments to chats go too. The documents stay indexed.`)) return;
+  const results = await Promise.allSettled(ids.map(id => api(`/api/libraries/${id}`, {method: "DELETE"})));
+  bulkResult(results, "Deleted", "library", "libraries");
+  selections.libraries.clear();
   await Promise.all([loadAccounts(), loadDocuments()]);
 });
 
@@ -538,16 +687,36 @@ async function loadDocuments() {
 
 $("#docFilter").oninput = renderDocuments;
 
+$("#documentsBulkLibs").onclick = guard(async () => {
+  const shas = [...selections.documents];
+  if (!shas.length) return;
+  if (!cache.libraries.length) return toast("Create a library first.", "err");
+  const form = await ask(`Libraries for ${shas.length} document(s)`, [
+    {name: "action", label: "Action", type: "select", options: [
+      {value: "add", label: "Add to library"}, {value: "remove", label: "Remove from library"}]},
+    {name: "library_id", label: "Library", type: "select",
+     options: cache.libraries.map(l => ({value: l.id, label: l.name}))},
+  ], "Apply");
+  if (!form) return;
+  const results = await Promise.allSettled(shas.map(sha =>
+    api(`/api/libraries/${form.library_id}/documents/${sha}`, {method: form.action === "add" ? "PUT" : "DELETE"})));
+  bulkResult(results, form.action === "add" ? "Added" : "Removed", "document");
+  selections.documents.clear();
+  await Promise.all([loadDocuments(), loadAccounts()]);
+});
+
 function renderDocuments() {
   const needle = $("#docFilter").value.trim().toLowerCase();
   const shown = cache.documents.filter(d => !needle || (d.filename || "").toLowerCase().includes(needle));
-  $("#docRows").innerHTML = shown.map(d => `<tr data-sha="${esc(d.sha256)}">
+  $("#docRows").innerHTML = shown.map(d => `<tr data-sha="${esc(d.sha256)}" data-key="${esc(d.sha256)}">
+      <td class="sel"><input type="checkbox" class="rowSelect"></td>
       <td>${esc(d.filename || d.sha256)}<div class="small">${esc(d.sha256.slice(0, 16))}…</div></td>
       <td>${d.pages ?? ""}</td><td>${d.chunks ?? ""}</td>
       <td>${(d.libraries || []).map(id => `<span class="tag">${esc(libName(id))}</span>`).join(" ") || '<span class="none">— no library —</span>'}</td>
       <td class="actions"><button class="small" data-act="libs">Libraries…</button></td>
-    </tr>`).join("") || `<tr><td colspan="5" class="small">${
+    </tr>`).join("") || `<tr><td colspan="6" class="small">${
       cache.documents.length ? "Nothing matches that filter." : "No documents indexed yet."}</td></tr>`;
+  syncCheckboxes("documents");
 }
 
 $("#docRows").onclick = guard(async e => {
