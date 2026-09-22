@@ -1,0 +1,284 @@
+/* Broadsheet -- the design system the UI was drawn in (design/_ds/broadsheet-
+   .../styles.css). Tokens and component classes are copied from there; the
+   print treatments (halftone, CMYK plates) are left out, since nothing here
+   uses them. Retune the look in this block. */
+
+/* Self-hosted rather than Google Fonts: the app promises nothing leaves the
+   machine, and that includes a font request. These are the weight-axis-only
+   files, the same cut Google serves the design: the "opsz" variants add an
+   optical-size axis that browsers apply automatically by font size, which
+   reshapes the letters away from the mockup. */
+@import "@fontsource-variable/source-serif-4/index.css";
+@import "@fontsource-variable/source-serif-4/wght-italic.css";
+
+:root {
+  color-scheme: light;
+  --color-bg: #f3f2f2;
+  --color-surface: #eae9e9;
+  --color-text: #201e1d;
+  --color-accent: #0088b0;
+  --color-accent-2: #d6006c;
+  --color-divider: color-mix(in srgb, #201e1d 16%, transparent);
+
+  --color-neutral-100: #f8f4f4;
+  --color-neutral-200: #eae7e7;
+  --color-neutral-300: #d7d3d3;
+  --color-neutral-400: #bab6b6;
+  --color-neutral-500: #9b9797;
+  --color-neutral-600: #7d7979;
+  --color-neutral-700: #605d5d;
+  --color-neutral-800: #444141;
+  --color-neutral-900: #2d2b2b;
+
+  --color-accent-100: #e9f8ff;
+  --color-accent-200: #cbeeff;
+  --color-accent-300: #99e0ff;
+  --color-accent-400: #62c5ee;
+  --color-accent-500: #38a6cf;
+  --color-accent-600: #1186ac;
+  --color-accent-700: #006786;
+  --color-accent-800: #004961;
+  --color-accent-900: #0a303e;
+
+  --color-accent-2-100: #fff1f4;
+  --color-accent-2-200: #ffdee6;
+  --color-accent-2-300: #ffc0d0;
+  --color-accent-2-400: #ff90b1;
+  --color-accent-2-500: #ff458e;
+  --color-accent-2-600: #d82071;
+  --color-accent-2-700: #aa0b56;
+  --color-accent-2-800: #790e3d;
+  --color-accent-2-900: #4b1528;
+
+  --font-heading: "Source Serif 4 Variable", "Source Serif 4", Georgia, serif;
+  --font-heading-weight: 600;
+  --font-body: "Source Serif 4 Variable", "Source Serif 4", Georgia, serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --space-1: 5px;
+  --space-2: 10px;
+  --space-3: 15px;
+  --space-4: 20px;
+  --space-6: 30px;
+  --space-8: 40px;
+
+  --radius-sm: 1px;
+  --radius-md: 2px;
+  --radius-lg: 4px;
+
+  --shadow-sm: 0 1px 2px color-mix(in srgb, #2d2b2b 14%, transparent);
+  --shadow-md: 0 3px 10px color-mix(in srgb, #2d2b2b 16%, transparent);
+  --shadow-lg: 0 12px 32px color-mix(in srgb, #2d2b2b 22%, transparent);
+
+  /* Library kinds, as the design colours them. */
+  --kind-mine: var(--color-accent-2-500);
+  --kind-shared: var(--color-accent);
+  --kind-group: var(--color-neutral-500);
+}
+
+/* Dark: not in the mockup. The ramps are mirrored (100 <-> 900) so every
+   "neutral-700 for muted text" or "accent-100 for a highlight" in the
+   components keeps its meaning on a dark ground; elevation becomes a
+   hairline edge plus ambient darkness, as the system's own comment says. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --color-bg: #1c1b1a;
+    --color-surface: #252322;
+    --color-text: #ebe8e6;
+    --color-accent: #38a6cf;
+    --color-accent-2: #ff458e;
+    --color-divider: color-mix(in srgb, #ebe8e6 16%, transparent);
+
+    --color-neutral-100: #2d2b2b;
+    --color-neutral-200: #444141;
+    --color-neutral-300: #605d5d;
+    --color-neutral-400: #7d7979;
+    --color-neutral-500: #9b9797;
+    --color-neutral-600: #a9a5a5;
+    --color-neutral-700: #c2bebe;
+    --color-neutral-800: #d7d3d3;
+    --color-neutral-900: #eae7e7;
+
+    --color-accent-100: #0f2a35;
+    --color-accent-200: #0a303e;
+    --color-accent-300: #004961;
+    --color-accent-400: #006786;
+    --color-accent-500: #1186ac;
+    --color-accent-600: #38a6cf;
+    --color-accent-700: #62c5ee;
+    --color-accent-800: #99e0ff;
+    --color-accent-900: #cbeeff;
+
+    --color-accent-2-100: #3a1422;
+    --color-accent-2-200: #4b1528;
+    --color-accent-2-300: #790e3d;
+    --color-accent-2-400: #aa0b56;
+    --color-accent-2-500: #ff458e;
+    --color-accent-2-600: #ff5e9c;
+    --color-accent-2-700: #ff90b1;
+    --color-accent-2-800: #ffc0d0;
+    --color-accent-2-900: #ffdee6;
+
+    --shadow-sm: 0 0 0 1px color-mix(in srgb, #ebe8e6 8%, transparent), 0 1px 2px rgb(0 0 0 / 40%);
+    --shadow-md: 0 0 0 1px color-mix(in srgb, #ebe8e6 10%, transparent), 0 3px 10px rgb(0 0 0 / 45%);
+    --shadow-lg: 0 0 0 1px color-mix(in srgb, #ebe8e6 10%, transparent), 0 12px 32px rgb(0 0 0 / 55%);
+  }
+
+  select.input {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23c2bebe' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
+}
+
+/* ------------------------------------------------------------------ base -- */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+  font-weight: 400;
+}
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  line-height: 1.12; letter-spacing: -0.015em; margin: 0 0 var(--space-2);
+}
+h1 { font-size: 42px; }
+h2 { font-size: 32px; }
+h3 { font-size: 25px; }
+h4 { font-size: 20px; }
+h5 { font-size: 16px; }
+h6 { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }
+p { margin: 0 0 var(--space-3); }
+a { color: var(--color-accent-700); text-underline-offset: 3px; }
+code, pre, kbd, samp { font-family: var(--font-mono); font-size: 0.88em; }
+button { font: inherit; color: inherit; }
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+::selection { background: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+
+/* ------------------------------------------------------------ components -- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  cursor: pointer; text-decoration: none; white-space: nowrap;
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 14px; line-height: 1.2; color: var(--color-text);
+  background: transparent; border: 1px solid transparent;
+  padding: var(--space-2) calc(var(--space-3) * 1.2);
+  border-radius: var(--radius-md);
+}
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-primary { background: var(--color-accent); color: var(--color-bg); }
+.btn-primary:hover:not(:disabled) { background: var(--color-accent-600); }
+.btn-primary:active:not(:disabled) { background: var(--color-accent-700); }
+.btn-secondary { border-color: var(--color-divider); }
+.btn-secondary:hover:not(:disabled) { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+.btn-ghost { color: var(--color-accent-700); padding-inline: var(--space-1); }
+.btn-ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
+.btn-danger { color: var(--color-accent-2-700); border-color: var(--color-accent-2-300); }
+.btn-danger:hover:not(:disabled) { background: var(--color-accent-2-100); }
+.btn-ghost.btn-danger { border-color: transparent; }
+.btn-sm { font-size: 12.5px; padding: 5px 10px; }
+
+.field > label, .label {
+  display: block; font-size: 12px; margin-bottom: 5px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.input {
+  width: 100%; min-height: 36px; padding: 6px 10px; font: inherit;
+  font-size: 14px; color: var(--color-text); caret-color: var(--color-accent);
+  background: var(--color-surface);
+  border: 1px solid var(--color-divider); border-radius: var(--radius-md);
+}
+.input::placeholder { color: color-mix(in srgb, var(--color-text) 65%, transparent); opacity: 1; }
+.input:hover { border-color: color-mix(in srgb, var(--color-text) 45%, transparent); }
+/* Ring drawn inside the border box: fields often sit flush against a
+   scrolling container (the popup body), which clips anything painted
+   outside them, so an outline or outer shadow lost whichever sides
+   touched the edge. */
+.input:focus-visible { outline: none; border-color: var(--color-accent); box-shadow: inset 0 0 0 1px var(--color-accent); }
+/* A select keeps focus after a mouse pick; only ring it for keyboard use
+   (data-modality is set in main.ts). */
+:root[data-modality="pointer"] select.input:focus-visible { border-color: var(--color-divider); box-shadow: none; }
+textarea.input { min-height: 90px; resize: vertical; }
+/* Chrome's native appearance:auto arrow sits flush against the border,
+   so we draw our own inset from the edge instead. Two ink colours (here
+   and in the dark-mode block below) since a data-URI fill can't follow
+   --color-neutral-700 across the theme switch. */
+select.input {
+  appearance: none;
+  padding-right: 30px;
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23605d5d' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+.seg {
+  display: inline-flex; overflow: hidden;
+  border: 1px solid var(--color-divider); border-radius: var(--radius-md);
+}
+.seg > button {
+  border: 0; background: transparent; cursor: pointer;
+  padding: 4px 10px; font-family: var(--font-heading); font-size: 12.5px;
+}
+.seg > button + button { border-left: 1px solid var(--color-divider); }
+.seg > button[aria-pressed="true"] { background: var(--color-accent); color: var(--color-bg); }
+.seg > button:not([aria-pressed="true"]):hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+
+.tag {
+  display: inline-flex; align-items: center; font-size: 11px; white-space: nowrap;
+  letter-spacing: 0.02em; padding: 3px 10px; border: 0; font-family: inherit;
+  border-radius: calc(var(--radius-md) * 0.75);
+}
+.tag-accent { background: var(--color-accent-100); color: var(--color-accent-800); }
+.tag-accent-2 { background: var(--color-accent-2-100); color: var(--color-accent-2-800); }
+.tag-neutral { background: var(--color-neutral-100); color: var(--color-neutral-800); }
+button.tag { cursor: pointer; }
+
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th {
+  text-align: left; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 400;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  padding: var(--space-2); border-bottom: 1px solid var(--color-divider);
+  position: sticky; top: 0; background: var(--color-bg); z-index: 1;
+}
+.table td {
+  padding: var(--space-2);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-text) 8%, transparent);
+  vertical-align: top;
+}
+.table tbody tr:hover { background: color-mix(in srgb, var(--color-text) 4%, transparent); }
+
+/* The small uppercase label above a heading ("Workspace", "Library"...). */
+.kicker {
+  font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--color-accent-700); margin-bottom: 4px;
+}
+.muted { color: var(--color-neutral-600); }
+.dot { width: 5px; height: 5px; flex: none; border-radius: 50%; display: inline-block; }
+.nowrap { white-space: nowrap; }
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.empty-note { font-size: 13px; color: var(--color-neutral-600); padding: 6px 0; }
+.err-text { color: var(--color-accent-2-700); }
+
+@keyframes rag-pulse { 0%,100% { opacity: 1; transform: scale(1) } 50% { opacity: .4; transform: scale(.7) } }
+.pulse {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--color-accent); flex: none;
+  animation: rag-pulse 1.2s ease-in-out infinite;
+}
+
+.rag-scroll { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--color-text) 25%, transparent) transparent; }
+.rag-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.rag-scroll::-webkit-scrollbar-track { background: transparent; }
+.rag-scroll::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--color-text) 22%, transparent); border-radius: 4px; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse, .cursor-block { animation: none !important; }
+}

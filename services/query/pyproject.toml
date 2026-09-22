@@ -1,0 +1,34 @@
+[project]
+name = "ragstack-query"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "httpx>=0.28,<1",
+    "python-dotenv>=1.0,<2",
+    # Cross-encoder reranker. The macOS arm64 torch wheel includes the MPS
+    # (Apple GPU) backend. Same majors as services/docling.
+    "torch>=2.14,<3",
+    "transformers>=5.17,<6",
+    "sentencepiece>=0.2,<1",
+    # HTTP API (api.py); python-multipart handles file uploads.
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.32,<1",
+    "python-multipart>=0.0.20,<1",
+    # Password hashing (argon2id) and signed session cookies. pwdlib is the
+    # maintained successor to passlib; itsdangerous comes with Starlette's
+    # SessionMiddleware. Neither hashing nor signing is written here.
+    "pwdlib[argon2]>=0.3,<1",
+    "itsdangerous>=2.2,<3",
+]
+
+[tool.uv]
+package = false
+
+# Unit tests: `uv run pytest` in this directory, or ./run-tests.sh at the
+# repo root for every service. No services, network or data/ needed.
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

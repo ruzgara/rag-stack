@@ -1,0 +1,1 @@
+Sources: none — the document search found no relevant passages for this question. Tell the user briefly that the documents don't cover it. If you answer from general knowledge, tell the user you are doing so. Don't suggest searches to the user.

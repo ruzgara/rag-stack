@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ragstack.logrotate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO_ROOT__/ragctl</string>
+        <string>logs</string>
+        <string>rotate</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>__LOG_ROTATE_INTERVAL__</integer>
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/data/logs/logrotate.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/data/logs/logrotate.log</string>
+</dict>
+</plist>

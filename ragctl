@@ -1,10 +1,10 @@
 #!/bin/bash
 # ragctl — single entry point for the rag-stack deployment.
 #
-# Manages: Ollama.app tuning (native), docling-serve (native), Qdrant +
-# Open WebUI (Docker), and the batch ingestion pipeline. Everything it
-# installs lives inside this repo, in Docker volumes prefixed
-# "ragstack_", or in LaunchAgents labelled "com.ragstack.*".
+# Manages: Ollama.app tuning (native), docling-serve (native), Qdrant
+# (Docker), and the batch ingestion pipeline. Everything it installs
+# lives inside this repo, in Docker volumes prefixed "ragstack_", or in
+# LaunchAgents labelled "com.ragstack.*".
 #
 # Run `./ragctl help` for the command list.
 
@@ -38,36 +38,27 @@ load_env() {
     set +a
     OLLAMA_PORT="${OLLAMA_PORT:-11434}"
     DOCLING_PORT="${DOCLING_PORT:-5001}"
-    WEBUI_PORT="${WEBUI_PORT:-3000}"
     QDRANT_PORT="${QDRANT_PORT:-6333}"
-    BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
-    MIN_FREE_GB="${MIN_FREE_GB:-41}"
+    QUERY_PORT="${QUERY_PORT:-8088}"
+    LOG_MAX_MB="${LOG_MAX_MB:-20}"
+    LOG_KEEP="${LOG_KEEP:-5}"
+    LOG_ROTATE_INTERVAL="${LOG_ROTATE_INTERVAL:-3600}"
 }
 
 compose() {
     docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/compose.yaml" "$@"
 }
 
-# ------------------------------------------------------------- preflight --
-check_free_disk_gb() {
-    df -g "$REPO_ROOT" | awk 'NR==2 {print $4}'
-}
+# The Docker services ragctl starts. Listed explicitly so that anything else
+# in compose.yaml (e.g. the retired open-webui service) is never pulled or started.
+COMPOSE_SERVICES=(qdrant)
 
+# ------------------------------------------------------------- preflight --
 cmd_preflight() {
     local fail=0
 
     [[ "$(uname -s)" == "Darwin" ]] || { err "This stack targets macOS."; fail=1; }
     [[ "$(uname -m)" == "arm64" ]] || warn "Not running on arm64 — MLX/Metal acceleration assumptions won't hold."
-
-    local free_gb
-    free_gb="$(check_free_disk_gb)"
-    if (( free_gb < MIN_FREE_GB )); then
-        err "Only ${free_gb}GB free on disk; need at least ${MIN_FREE_GB}GB (see README for the breakdown)."
-        err "Free up $((MIN_FREE_GB - free_gb))GB more, then re-run. ragctl will not delete anything for you."
-        fail=1
-    else
-        ok "Disk space: ${free_gb}GB free (need ${MIN_FREE_GB}GB)"
-    fi
 
     if ! command -v brew >/dev/null; then
         err "Homebrew is required: https://brew.sh"
@@ -84,12 +75,6 @@ cmd_preflight() {
         err "Docker is not running. Start Docker Desktop (or install it: https://www.docker.com/products/docker-desktop/), then re-run."
         fail=1
     else
-        local mem_bytes
-        mem_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
-        local mem_gb=$(( mem_bytes / 1073741824 ))
-        if (( mem_gb > 0 && mem_gb < 6 )); then
-            warn "Docker Desktop has only ${mem_gb}GB of RAM allocated. Recommend >=8GB in Docker Desktop -> Settings -> Resources."
-        fi
         ok "Docker is running"
     fi
 
@@ -100,7 +85,7 @@ cmd_preflight() {
         ok "Ollama is reachable"
     fi
 
-    for p in "$WEBUI_PORT" "$DOCLING_PORT" "$QDRANT_PORT"; do
+    for p in "$DOCLING_PORT" "$QDRANT_PORT" "$QUERY_PORT"; do
         if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
             warn "Port $p is already in use — check it's not a leftover ragstack process (ragctl status)."
         fi
@@ -134,12 +119,14 @@ render_template() {
         -e "s#__UV_BIN__#$(resolve_uv_bin)#g" \
         -e "s#__OLLAMA_PORT__#${OLLAMA_PORT}#g" \
         -e "s#__DOCLING_PORT__#${DOCLING_PORT}#g" \
+        -e "s#__QUERY_PORT__#${QUERY_PORT}#g" \
         -e "s#__OLLAMA_CONTEXT_LENGTH__#${OLLAMA_CONTEXT_LENGTH:-32768}#g" \
         -e "s#__OLLAMA_NUM_PARALLEL__#${OLLAMA_NUM_PARALLEL:-4}#g" \
         -e "s#__OLLAMA_MAX_LOADED_MODELS__#${OLLAMA_MAX_LOADED_MODELS:-4}#g" \
         -e "s#__OLLAMA_MAX_QUEUE__#${OLLAMA_MAX_QUEUE:-1024}#g" \
         -e "s#__DOCLING_NUM_THREADS__#${DOCLING_NUM_THREADS:-4}#g" \
         -e "s#__DOCLING_LOC_NUM_WORKERS__#${DOCLING_LOC_NUM_WORKERS:-2}#g" \
+        -e "s#__LOG_ROTATE_INTERVAL__#${LOG_ROTATE_INTERVAL:-3600}#g" \
         "$src" > "$dst"
 }
 
@@ -148,11 +135,14 @@ render_all() {
     render_template "$REPO_ROOT/launchd/ollama-env.sh.tmpl" "$LAUNCHD_RENDERED/ollama-env.sh"
     render_template "$REPO_ROOT/launchd/docling-serve.sh.tmpl" "$LAUNCHD_RENDERED/docling-serve.sh"
     render_template "$REPO_ROOT/launchd/ingest-watch.sh.tmpl" "$LAUNCHD_RENDERED/ingest-watch.sh"
+    render_template "$REPO_ROOT/launchd/query-api.sh.tmpl" "$LAUNCHD_RENDERED/query-api.sh"
     chmod +x "$LAUNCHD_RENDERED"/*.sh
 
     render_template "$REPO_ROOT/launchd/com.ragstack.ollama-env.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.ollama-env.plist"
     render_template "$REPO_ROOT/launchd/com.ragstack.docling.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.docling.plist"
     render_template "$REPO_ROOT/launchd/com.ragstack.ingest.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.ingest.plist"
+    render_template "$REPO_ROOT/launchd/com.ragstack.query.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.query.plist"
+    render_template "$REPO_ROOT/launchd/com.ragstack.logrotate.plist.tmpl" "$LAUNCHD_RENDERED/com.ragstack.logrotate.plist"
 }
 
 launchd_label_loaded() {
@@ -207,15 +197,6 @@ cmd_install() {
         [[ -n "${!m:-}" ]] || die "$m is empty in .env. Set it (and run 'ollama pull <name>') before installing."
     done
 
-    if [[ -z "${WEBUI_SECRET_KEY:-}" ]]; then
-        local secret
-        secret="$(openssl rand -hex 32)"
-        sed -i.bak "s#^WEBUI_SECRET_KEY=.*#WEBUI_SECRET_KEY=${secret}#" "$ENV_FILE"
-        rm -f "$ENV_FILE.bak"
-        load_env
-        ok "Generated WEBUI_SECRET_KEY"
-    fi
-
     mkdir -p "$DATA_DIR"/{inbox,work,processed,failed,logs,docling-artifacts,hf-cache}
 
     echo "== System dependencies (brew bundle) =="
@@ -224,6 +205,8 @@ cmd_install() {
     echo "== Python environments (uv sync) =="
     (cd "$REPO_ROOT/services/docling" && uv sync --python 3.12)
     (cd "$REPO_ROOT/services/ingest" && uv sync --python 3.12)
+    (cd "$REPO_ROOT/services/embed" && uv sync --python 3.12)
+    (cd "$REPO_ROOT/services/query" && uv sync --python 3.12)
 
     echo "== LaunchAgents =="
     render_all
@@ -235,71 +218,66 @@ cmd_install() {
     else
         unload_agent "com.ragstack.ingest"
     fi
+    load_agent "com.ragstack.logrotate"
     ok "LaunchAgents installed and loaded"
 
     echo "== Prefetching docling models (best-effort) =="
     (cd "$REPO_ROOT/services/docling" && HF_HOME="$DATA_DIR/hf-cache" uv run --python 3.12 docling-tools models download -o "$DATA_DIR/docling-artifacts") \
         || warn "Model prefetch skipped/failed — docling-serve will download models into data/docling-artifacts on first use instead."
 
+    echo "== Prefetching the reranker model (best-effort) =="
+    (cd "$REPO_ROOT/services/query" && uv run --python 3.12 rerank.py --download) \
+        || warn "Reranker prefetch failed — it will download into data/hf-cache on the first 'ragctl search' instead."
+
     echo "== Docker services =="
-    compose pull
-    compose up -d
-    wait_for_open_webui || true
+    compose pull "${COMPOSE_SERVICES[@]}"
+    compose up -d "${COMPOSE_SERVICES[@]}"
+
+    echo "== Query service =="
+    load_agent "com.ragstack.query"
+    ok "Query service loaded (http://127.0.0.1:${QUERY_PORT})"
+
+    # ui/dist is committed to git, so a normal clone already has it and
+    # install never needs Node. This only fires for a clone where it was
+    # somehow stripped, or a checkout of a commit that predates the UI.
+    if [[ ! -f "$REPO_ROOT/ui/dist/index.html" ]]; then
+        warn "ui/dist is missing — the web UI will show a placeholder. It is normally committed; rebuild with './ragctl ui build' (needs Node)."
+    fi
 
     echo
     ok "Install complete."
     cat <<EOF
 
 Next steps:
-  1. Open http://${BIND_ADDR}:${WEBUI_PORT} and create the admin account.
-  2. In Open WebUI: Admin Panel -> Settings -> Users, then your user ->
-     Settings -> Account -> API keys, create a key, and set OWUI_API_KEY
-     in .env to it.
-  3. Run: ./ragctl webui-setup
-  4. Run: ./ragctl health
+  1. Run: ./ragctl health
+  2. Drop files in data/inbox and run: ./ragctl ingest && ./ragctl embed
+  3. Open http://127.0.0.1:${QUERY_PORT} (admin: /admin, API docs: /docs)
 EOF
 }
 
 # ------------------------------------------------------------- up/down --
-wait_for_open_webui() {
-    # Open WebUI takes a while to actually accept requests after (re)starting
-    # -- DB migrations, loading the reranker model, etc -- well after `docker
-    # compose up -d` itself returns. Poll /health so callers don't report a
-    # false "unreachable" against a container that's simply still booting.
-    local deadline=$((SECONDS + 90))
-    printf '  waiting for Open WebUI to finish starting'
-    while (( SECONDS < deadline )); do
-        if curl -sf "http://127.0.0.1:${WEBUI_PORT}/health" >/dev/null 2>&1; then
-            echo
-            return 0
-        fi
-        printf '.'
-        sleep 2
-    done
-    echo
-    warn "Open WebUI still not responding after 90s — check 'ragctl logs webui'."
-    return 1
-}
-
 cmd_up() {
     load_env
     render_all
     load_agent "com.ragstack.ollama-env"
     load_agent "com.ragstack.docling"
+    load_agent "com.ragstack.logrotate"
     if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
         load_agent "com.ragstack.ingest"
     fi
-    compose up -d
-    wait_for_open_webui || true
-    ok "Stack is up."
+    compose up -d "${COMPOSE_SERVICES[@]}"
+    load_agent "com.ragstack.query"
+    ok "Stack is up. Open http://127.0.0.1:${QUERY_PORT} (admin: /admin, API docs: /docs)"
 }
 
 cmd_down() {
     load_env
     compose down
+    unload_agent "com.ragstack.query"
     unload_agent "com.ragstack.docling"
     unload_agent "com.ragstack.ingest"
-    ok "Docker services stopped and docling-serve unloaded. Ollama.app is left running (it's a shared, native app)."
+    unload_agent "com.ragstack.logrotate"
+    ok "Docker services stopped; docling-serve and the query service unloaded. Ollama.app is left running (it's a shared, native app)."
 }
 
 cmd_restart() {
@@ -310,25 +288,43 @@ cmd_restart() {
 cmd_reload() {
     # Re-render configs from .env and restart the native services + containers
     # so changed settings actually take effect.
+    #
+    # --skip-query leaves com.ragstack.query alone. The admin UI reloads the
+    # stack by running this from *inside* the query service, and reloading
+    # that agent would boot out the process running this script -- between
+    # the bootout and the bootstrap, leaving nothing to start it again. The
+    # UI restarts the query service itself afterwards instead.
+    local skip_query=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --skip-query) skip_query=true; shift ;;
+            *) die "reload: unknown option $1" ;;
+        esac
+    done
     load_env
     render_all
     load_agent "com.ragstack.ollama-env"
     load_agent "com.ragstack.docling"
+    load_agent "com.ragstack.logrotate"
     if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
         load_agent "com.ragstack.ingest"
     else
         unload_agent "com.ragstack.ingest"
     fi
-    compose up -d --force-recreate
-    wait_for_open_webui || true
-    ok "Reloaded. Note: most Open WebUI RAG settings are PersistentConfig and only apply on a FIRST start of a fresh volume — change them in Admin -> Settings -> Documents if they don't take effect."
+    compose up -d --force-recreate "${COMPOSE_SERVICES[@]}"
+    if [[ "$skip_query" == "true" ]]; then
+        ok "Reloaded (query service left running; restart it to pick up QUERY_PORT and session settings)."
+    else
+        load_agent "com.ragstack.query"
+        ok "Reloaded."
+    fi
 }
 
 # -------------------------------------------------------------- status --
 cmd_status() {
     load_env
     echo "== Native services =="
-    for label in com.ragstack.ollama-env com.ragstack.docling com.ragstack.ingest; do
+    for label in com.ragstack.ollama-env com.ragstack.docling com.ragstack.ingest com.ragstack.query com.ragstack.logrotate; do
         if launchd_label_loaded "$label"; then ok "$label loaded"; else info "$label not loaded"; fi
     done
     if pgrep -x "Ollama" >/dev/null 2>&1; then ok "Ollama.app running"; else warn "Ollama.app not running"; fi
@@ -340,22 +336,110 @@ cmd_status() {
     for pair in "Ollama:http://127.0.0.1:${OLLAMA_PORT}/api/version" \
                 "docling-serve:http://127.0.0.1:${DOCLING_PORT}/health" \
                 "Qdrant:http://127.0.0.1:${QDRANT_PORT}/readyz" \
-                "Open WebUI:http://127.0.0.1:${WEBUI_PORT}/health"; do
+                "query API:http://127.0.0.1:${QUERY_PORT}/api/health"; do
         name="${pair%%:*}"; url="${pair#*:}"
         if curl -sf "$url" >/dev/null 2>&1; then ok "$name reachable ($url)"; else warn "$name NOT reachable ($url)"; fi
     done
+}
+
+# Rotate one log by copy-and-truncate: the running services were started by
+# launchd, which holds an open fd on the file, so renaming it out of the way
+# would leave them writing to an unlinked inode until the next restart.
+# Truncating in place keeps that fd valid (everything here appends).
+# Returns 0 if it rotated the file, 1 if it left it alone.
+rotate_log() {
+    local file="$1" max_bytes="$2" keep="$3" force="$4"
+    [[ -f "$file" ]] || return 1
+
+    local size
+    size="$(stat -f%z "$file" 2>/dev/null || echo 0)"
+    (( size > 0 )) || return 1
+    if [[ "$force" != "true" ]] && (( size < max_bytes )); then
+        return 1
+    fi
+
+    if (( keep > 0 )); then
+        # Shift generations up: .1.gz -> .2.gz, ... and drop the oldest.
+        rm -f "$file.$keep.gz"
+        local i
+        for (( i = keep - 1; i >= 1; i-- )); do
+            if [[ -f "$file.$i.gz" ]]; then
+                mv -f "$file.$i.gz" "$file.$((i + 1)).gz"
+            fi
+        done
+        cp "$file" "$file.1"
+        : > "$file"
+        gzip -f "$file.1"
+    else
+        : > "$file"
+    fi
+
+    return 0
+}
+
+# Drop archived generations beyond `keep` -- what a lowered LOG_KEEP leaves
+# behind. Applied to every log, not just the ones that rotated, so an idle
+# service's old archives go away too.
+prune_generations() {
+    local file="$1" keep="$2" old n
+    for old in "$file".*.gz; do
+        [[ -f "$old" ]] || continue   # no match: the glob came back literal
+        n="${old#"$file".}"; n="${n%.gz}"
+        if [[ "$n" =~ ^[0-9]+$ ]] && (( n > keep )); then
+            rm -f "$old"
+        fi
+    done
+}
+
+# Size-based rotation for everything in data/logs. Run hourly by the
+# com.ragstack.logrotate LaunchAgent; also runnable by hand.
+cmd_logs_rotate() {
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            *) die "logs rotate: unknown option $1" ;;
+        esac
+    done
+    mkdir -p "$LOG_DIR"
+
+    local max_bytes=$(( LOG_MAX_MB * 1024 * 1024 ))
+    local rotated=0 f
+    shopt -s nullglob
+    for f in "$LOG_DIR"/*.log; do
+        if rotate_log "$f" "$max_bytes" "$LOG_KEEP" "$force"; then
+            info "$(date '+%Y-%m-%d %H:%M:%S') rotated $(basename "$f")"
+            rotated=$(( rotated + 1 ))
+        fi
+        prune_generations "$f" "$LOG_KEEP"
+    done
+    shopt -u nullglob
+
+    if (( rotated == 0 )); then
+        info "nothing to rotate (all logs under ${LOG_MAX_MB}MB)"
+    else
+        ok "Rotated $rotated log(s), keeping $LOG_KEEP compressed generation(s) each."
+    fi
 }
 
 cmd_logs() {
     load_env
     local svc="${1:-}"
     case "$svc" in
+        rotate) shift; cmd_logs_rotate "$@" ;;
         docling) tail -n 100 -f "$LOG_DIR/docling-serve.log" ;;
         ollama) tail -n 100 -f "$LOG_DIR/ollama-env.log" ;;
-        ingest) tail -n 100 -f "$LOG_DIR/ingest-watch.log" ;;
-        qdrant|open-webui|webui) compose logs -f "${svc/webui/open-webui}" ;;
+        ingest)
+            if [[ "${INGEST_AUTORUN:-false}" == "true" ]]; then
+                tail -n 100 -f "$LOG_DIR/ingest-watch.log"
+            else
+                tail -n 100 -f "$LOG_DIR/ingest-api.log"
+            fi
+            ;;
+        query) tail -n 100 -f "$LOG_DIR/query-api.log" ;;
+        qdrant) compose logs -f "$svc" ;;
         "") compose logs -f ;;
-        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, qdrant, webui" ;;
+        *) die "Unknown service '$svc'. Try: docling, ollama, ingest, query, qdrant (or 'rotate')" ;;
     esac
 }
 
@@ -385,76 +469,84 @@ cmd_models_check() {
     return "$missing"
 }
 
-# ---------------------------------------------------------- webui-setup --
-owui_api() {
-    local method="$1" path="$2" body="${3:-}"
-    load_env
-    [[ -n "${OWUI_API_KEY:-}" ]] || die "OWUI_API_KEY is not set in .env. See README: create an API key in Open WebUI first."
-    if [[ -n "$body" ]]; then
-        curl -sf -X "$method" "http://127.0.0.1:${WEBUI_PORT}${path}" \
-            -H "Authorization: Bearer ${OWUI_API_KEY}" -H "Content-Type: application/json" \
-            -d "$body"
-    else
-        curl -sf -X "$method" "http://127.0.0.1:${WEBUI_PORT}${path}" \
-            -H "Authorization: Bearer ${OWUI_API_KEY}"
-    fi
-}
-
-cmd_webui_setup() {
-    load_env
-    command -v python3 >/dev/null || die "python3 is required for webui-setup"
-
-    echo "== Knowledge base =="
-    local kb_id
-    kb_id="$(owui_api GET "/api/v1/knowledge/" | python3 -c "
-import json, sys, os
-body = json.load(sys.stdin)
-kbs = body['items'] if isinstance(body, dict) else body
-name = os.environ['KB_NAME']
-for kb in kbs:
-    if kb.get('name') == name:
-        print(kb['id']); sys.exit(0)
-print('')
-")"
-    if [[ -z "$kb_id" ]]; then
-        kb_id="$(owui_api POST "/api/v1/knowledge/create" "{\"name\":\"${KB_NAME}\",\"description\":\"Created by ragctl webui-setup\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
-        ok "Created knowledge base '${KB_NAME}' ($kb_id)"
-    else
-        ok "Knowledge base '${KB_NAME}' already exists ($kb_id)"
-    fi
-
-    echo "== Model presets =="
-    for pair in "Everyday:${CHAT_MODEL_EVERYDAY:-}" "Hard questions:${CHAT_MODEL_HARD:-}"; do
-        local label="${pair%%:*}" base_model="${pair#*:}"
-        [[ -n "$base_model" ]] || { warn "Skipping preset '$label': model not set in .env"; continue; }
-        local model_id
-        model_id="ragstack-$(echo "$label" | tr '[:upper:] ' '[:lower:]-')"
-        local body
-        body="$(RAGSTACK_MODEL_ID="$model_id" RAGSTACK_LABEL="$label" RAGSTACK_BASE_MODEL="$base_model" \
-            RAGSTACK_KB_ID="$kb_id" RAGSTACK_KB_NAME="$KB_NAME" python3 -c '
-import json, os
-e = os.environ
-print(json.dumps({
-    "id": e["RAGSTACK_MODEL_ID"],
-    "name": e["RAGSTACK_LABEL"],
-    "base_model_id": e["RAGSTACK_BASE_MODEL"],
-    "meta": {"knowledge": [{"id": e["RAGSTACK_KB_ID"], "name": e["RAGSTACK_KB_NAME"]}]},
-    "params": {},
-}))
-')"
-        owui_api POST "/api/v1/models/create" "$body" >/dev/null 2>&1 \
-            && ok "Preset '$label' -> $base_model (KB attached)" || warn "Preset '$label' may already exist (skipped)"
-    done
-
-    if [[ "${ENABLE_SIGNUP:-true}" == "true" ]]; then
-        warn "ENABLE_SIGNUP is still 'true' in .env. Once your admin account exists, set it to 'false' and run 'ragctl reload' to stop public self-registration."
-    fi
-}
-
 # ----------------------------------------------------------------- ingest --
 cmd_ingest() {
     load_env
     (cd "$REPO_ROOT/services/ingest" && uv run --python 3.12 ingest.py "$@")
+}
+
+# ------------------------------------------------------------------ embed --
+cmd_embed() {
+    load_env
+    (cd "$REPO_ROOT/services/embed" && uv run --python 3.12 embed.py "$@")
+}
+
+# ------------------------------------------------------------------- user --
+cmd_user() {
+    load_env
+    (cd "$REPO_ROOT/services/query" && uv run --python 3.12 usercli.py "$@")
+}
+
+# ----------------------------------------------------------------- search --
+cmd_search() {
+    load_env
+    [[ -n "${1:-}" ]] || die "Usage: ragctl search \"question\" [--fused] [--json] [-v]"
+    (cd "$REPO_ROOT/services/query" && uv run --python 3.12 retrieval.py "$@")
+}
+
+# --------------------------------------------------------------------- ui --
+# The web UI (ui/, Svelte + Vite + TS). ui/dist is committed to git, so
+# installing and running the stack never needs Node or pnpm -- only
+# changing the UI does. Unlike resolve_uv_bin, nothing here ever runs under
+# launchd, so there is no bare-PATH problem to work around: this always runs
+# in a contributor's own interactive shell, where nvm/fnm/volta has already
+# put the right pnpm on PATH. A hardcoded fallback path list would risk
+# picking the wrong one.
+UI_DIR="$REPO_ROOT/ui"
+
+resolve_pnpm_bin() {
+    command -v pnpm 2>/dev/null \
+        || die "pnpm not found. ui/dist is committed, so you only need Node/pnpm to *change* the UI. Install pnpm (https://pnpm.io/installation, or 'brew install pnpm') and re-run."
+}
+
+cmd_ui() {
+    local action="${1:-build}"; shift || true
+    [[ -d "$UI_DIR" ]] || die "ui/ not found at $UI_DIR"
+    local pnpm; pnpm="$(resolve_pnpm_bin)"
+
+    case "$action" in
+        install)
+            echo "== UI dependencies =="
+            (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            ok "Installed ui/node_modules"
+            ;;
+        dev)
+            load_env
+            echo "== UI dev server =="
+            info "Proxies /api, /v1 and /admin to http://127.0.0.1:${QUERY_PORT} -- keep './ragctl up' running alongside this."
+            info "Sign in again at http://localhost:5173 -- it is a different cookie host from 127.0.0.1, so a 127.0.0.1 session doesn't carry over."
+            [[ -d "$UI_DIR/node_modules" ]] || (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            (cd "$UI_DIR" && "$pnpm" run dev -- "$@")
+            ;;
+        build)
+            echo "== UI build =="
+            [[ -d "$UI_DIR/node_modules" ]] || (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            (cd "$UI_DIR" && "$pnpm" run build)
+            ok "Built ui/dist."
+            warn "ui/dist is committed -- 'git add ui/dist' and commit, or the running service keeps serving the old build."
+            ;;
+        check)
+            [[ -d "$UI_DIR/node_modules" ]] || (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            (cd "$UI_DIR" && "$pnpm" run check)
+            ;;
+        test)
+            [[ -d "$UI_DIR/node_modules" ]] || (cd "$UI_DIR" && "$pnpm" install --frozen-lockfile)
+            (cd "$UI_DIR" && "$pnpm" run test -- --run "$@")
+            ;;
+        *)
+            die "Usage: ragctl ui <install|dev|build|check|test>"
+            ;;
+    esac
 }
 
 # ----------------------------------------------------------------- health --
@@ -478,20 +570,17 @@ cmd_health() {
     echo "== Qdrant =="
     curl -sf "http://127.0.0.1:${QDRANT_PORT}/readyz" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
 
-    echo "== Open WebUI =="
-    curl -sf "http://127.0.0.1:${WEBUI_PORT}/health" >/dev/null && ok "reachable" || { err "unreachable"; fail=1; }
-
-    echo "== Container -> host connectivity =="
-    # -q prints just the container ID (one token) when running, nothing
-    # otherwise — more robust than grepping the formatted table, which is
-    # sensitive to column widths/locale and was seen to flicker false.
-    if [[ -n "$(compose ps -q open-webui 2>/dev/null)" ]]; then
-        compose exec -T open-webui curl -sf "http://host.docker.internal:${OLLAMA_PORT}/api/version" >/dev/null 2>&1 \
-            && ok "open-webui -> host Ollama" || { err "open-webui cannot reach host Ollama"; fail=1; }
-        compose exec -T open-webui curl -sf "http://host.docker.internal:${DOCLING_PORT}/health" >/dev/null 2>&1 \
-            && ok "open-webui -> host docling-serve" || { err "open-webui cannot reach host docling-serve"; fail=1; }
+    echo "== Query service =="
+    local qh
+    if qh="$(curl -s --max-time 10 "http://127.0.0.1:${QUERY_PORT}/api/health")" && [[ -n "$qh" ]]; then
+        # Its own checks: Ollama, the Qdrant collection, the database, the reranker device.
+        if python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print(("  ok  " if v["ok"] else "  FAIL ") + k + ": " + ", ".join(f"{a}={b}" for a, b in v.items() if a != "ok")) for k, v in d.items() if isinstance(v, dict)]; sys.exit(0 if d["ok"] else 1)' "$qh"; then
+            ok "healthy"
+        else
+            err "reports problems (above)"; fail=1
+        fi
     else
-        warn "open-webui container not running, skipping container->host checks"
+        err "unreachable on port ${QUERY_PORT} (ragctl logs query)"; fail=1
     fi
 
     if (( fail )); then err "Health check found problems."; else ok "All checks passed."; fi
@@ -502,42 +591,59 @@ cmd_health() {
 cmd_clean() {
     load_env
     if [[ "${1:-}" != "--yes" ]]; then
-        die "This deletes ALL knowledge base files, chat history, Qdrant vectors, and data/{inbox,work,processed,failed,manifest.jsonl}. Your Open WebUI account, OWUI_API_KEY, knowledge base, and chat presets are kept. Re-run as: ragctl clean --yes"
+        die "This deletes data/{inbox,work,processed,failed,markdown,docling,manifest.jsonl}, the Qdrant collection, all chat history and all accounts (users, groups, libraries, access). Re-run as: ragctl clean --yes"
     fi
-    [[ -n "${OWUI_API_KEY:-}" ]] || die "OWUI_API_KEY is not set in .env. See README: create an API key in Open WebUI first."
-
-    echo "== Open WebUI: deleting all files (DB rows + vectors + on-disk storage) =="
-    # Goes through Open WebUI's own delete logic rather than touching its
-    # DB/volume directly, so the account, API key and knowledge-base/preset
-    # config it also lives in are left completely alone.
-    if owui_api DELETE "/api/v1/files/all" >/dev/null 2>&1; then
-        ok "Files cleared"
-    else
-        warn "Could not clear files via API (maybe none existed) — continuing"
-    fi
-
-    echo "== Open WebUI: deleting chat history =="
-    if owui_api DELETE "/api/v1/chats/" >/dev/null 2>&1; then
-        ok "Chat history cleared"
-    else
-        warn "Could not clear chat history via API (maybe none existed) — continuing"
-    fi
-
-    echo "== Qdrant: dropping collections (belt-and-suspenders; Open WebUI recreates them lazily on next write) =="
-    for c in open-webui_files open-webui_knowledge; do
-        if curl -sf "http://127.0.0.1:${QDRANT_PORT}/collections/$c" >/dev/null 2>&1; then
-            curl -sf -X DELETE "http://127.0.0.1:${QDRANT_PORT}/collections/$c" >/dev/null 2>&1 \
-                && ok "Cleared Qdrant collection $c" || warn "Failed to clear Qdrant collection $c"
-        fi
-    done
 
     echo "== Local ingest data =="
-    rm -rf "$DATA_DIR/inbox" "$DATA_DIR/work" "$DATA_DIR/processed" "$DATA_DIR/failed" "$DATA_DIR/manifest.jsonl"
+    rm -rf "$DATA_DIR/inbox" "$DATA_DIR/work" "$DATA_DIR/processed" "$DATA_DIR/failed" \
+        "$DATA_DIR/markdown" "$DATA_DIR/docling" "$DATA_DIR/manifest.jsonl"
     mkdir -p "$DATA_DIR"/{inbox,work,processed,failed}
-    ok "Cleared data/inbox, work, processed, failed and manifest.jsonl"
+    ok "Cleared data/inbox, work, processed, failed, markdown, docling and manifest.jsonl"
+
+    echo "== Qdrant =="
+    local collection="${QDRANT_COLLECTION:-ragstack_chunks}"
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "http://127.0.0.1:${QDRANT_PORT}/collections/${collection}" || true)"
+    case "$code" in
+        200) ok "Deleted collection ${collection}" ;;
+        404) info "Collection ${collection} did not exist" ;;
+        *) warn "Could not reach Qdrant to delete collection ${collection} (HTTP ${code:-none}). Start it with 'ragctl up' and re-run clean, or 'ragctl embed --recreate' will rebuild it." ;;
+    esac
+
+    echo "== Chat history =="
+    if [[ -f "$DATA_DIR/chat.db" ]]; then
+        # Delete the file, not just its rows: there are no migrations
+        # (see services/query/db.py), so only a fresh file picks up the
+        # current schema -- a row-cleared one keeps its old tables and the
+        # service fails to start once the schema has moved on. Everything
+        # goes, including accounts; the next login needs `ragctl user add
+        # ... --admin` again.
+        #
+        # The query service opens the file per request, so a running one
+        # would recreate it empty, without tables. It's stopped first and
+        # started again after, and its startup builds the schema.
+        local query_was_running=false
+        if launchd_label_loaded "com.ragstack.query"; then
+            query_was_running=true
+            launchctl bootout "gui/$(id -u)/com.ragstack.query" >/dev/null 2>&1 || true
+            for _ in $(seq 1 30); do
+                launchd_label_loaded "com.ragstack.query" || break
+                sleep 0.1
+            done
+        fi
+        rm -f "$DATA_DIR/chat.db" "$DATA_DIR/chat.db-wal" "$DATA_DIR/chat.db-shm"
+        ok "Deleted data/chat.db: all conversations, uploads, users, groups, libraries and access"
+        if $query_was_running; then
+            render_all
+            load_agent "com.ragstack.query"
+            ok "Restarted the query service; it recreated data/chat.db with the current schema"
+        fi
+    else
+        info "No chat history yet"
+    fi
 
     echo
-    ok "Clean complete — equivalent to right after a fresh 'ragctl webui-setup': your admin account, API key, knowledge base and chat presets are all still there and ready to use."
+    ok "Clean complete."
     warn "Model caches (data/hf-cache, data/docling-artifacts) were left in place on purpose — they're not your data, and re-downloading them is wasteful. Delete them by hand if you really want to."
 }
 
@@ -551,8 +657,11 @@ cmd_uninstall() {
     unload_agent "com.ragstack.ollama-env"
     unload_agent "com.ragstack.docling"
     unload_agent "com.ragstack.ingest"
+    unload_agent "com.ragstack.query"
+    unload_agent "com.ragstack.logrotate"
     rm -rf "$RUNTIME_DIR"
-    for svc in docling ingest; do rm -rf "$REPO_ROOT/services/$svc/.venv"; done
+    for svc in docling ingest embed query; do rm -rf "$REPO_ROOT/services/$svc/.venv"; done
+    rm -rf "$REPO_ROOT/ui/node_modules" "$REPO_ROOT/ui/.vite" # ui/dist itself is committed -- left in place
 
     if (( purge )); then
         rm -rf "$DATA_DIR"
@@ -571,20 +680,35 @@ ragctl — control the rag-stack deployment
 Usage: ./ragctl <command> [args]
 
   install              Preflight checks, install deps, start everything
-  up                    Start native services + Docker containers
+  up                    Start native services (incl. the query API) + Docker containers
   down                  Stop Docker containers + docling-serve (Ollama.app left running)
   restart               down then up
-  reload                Re-render configs from .env and restart everything
+  reload [--skip-query] Re-render configs from .env and restart everything
+                         (--skip-query leaves the query API running; it is how
+                          the admin UI reloads the stack from inside it)
   status                Show what's running and reachable
-  logs [svc]             Tail logs (svc: docling, ollama, ingest, qdrant, webui)
+  logs [svc]             Tail logs (svc: docling, ollama, ingest, query, qdrant)
+  logs rotate [--force]  Rotate data/logs now (size-based; LOG_MAX_MB / LOG_KEEP
+                         in .env). Runs hourly on its own via a LaunchAgent.
   models check           Verify .env model names exist in 'ollama list'
-  webui-setup             Create the knowledge base + chat presets (after admin signup)
-  ingest [--force-vlm]    Run the batch inbox -> knowledge base pipeline once
+  ingest [--force-vlm] [--reprocess]
+                         Convert data/inbox to markdown + docling JSON once
+                         (--reprocess re-converts data/processed in place)
+  embed [--recreate] [--show-chunks [--doc SHA] [--full]]
+                         Chunk, embed and index converted docs into Qdrant
+                         (--show-chunks prints the chunking without embedding)
+  user <add|list|passwd|disable|admin|delete|group|member|library>
+                         Accounts, groups and libraries (ownership + sharing).
+                         Create the first admin with: ragctl user add you@example.com --admin
+  search "question" [--fused] [--json] [-v]
+                         Hybrid search + GPU reranking over the index
+                         (settings: RAG_* and RERANKER_* in .env)
+  ui <install|dev|build|check|test>
+                         The web UI (ui/, Svelte + Vite). dist/ is committed,
+                         so installing and running the stack never needs
+                         Node — only changing the UI does.
   health                 End-to-end connectivity check
-  clean --yes             Wipe all knowledge base files + chat history +
-                           Qdrant vectors + data/{inbox,work,processed,
-                           failed}; keeps your Open WebUI account, API
-                           key, KB and presets
+  clean --yes             Wipe ingest data, outputs, the Qdrant collection and chat history
   uninstall [--purge-data]  Tear down containers, agents and local envs
 EOF
 }
@@ -601,8 +725,11 @@ main() {
         logs) cmd_logs "$@" ;;
         models)
             case "${1:-}" in check) cmd_models_check ;; *) die "Usage: ragctl models check" ;; esac ;;
-        webui-setup) cmd_webui_setup "$@" ;;
         ingest) cmd_ingest "$@" ;;
+        embed) cmd_embed "$@" ;;
+        user) cmd_user "$@" ;;
+        search) cmd_search "$@" ;;
+        ui) cmd_ui "$@" ;;
         health) cmd_health "$@" ;;
         clean) cmd_clean "$@" ;;
         uninstall) cmd_uninstall "$@" ;;

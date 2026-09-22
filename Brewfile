@@ -4,4 +4,4 @@
 # the installer checks for separately and links to if missing.
 
 brew "uv"          # manages Python for docling-serve and the ingest tool
-brew "ocrmypdf"     # pulls in tesseract, ghostscript, qpdf, pngquant, jbig2enc
+brew "tesseract"    # page orientation detection for scans (OCR itself is ocrmac)

@@ -1,0 +1,25 @@
+[project]
+name = "ragstack-embed"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "httpx>=0.28,<1",
+    "python-dotenv>=1.0,<2",
+    # HybridChunker + the HuggingFace tokenizer used to size chunks. Kept on
+    # the same major as services/docling so the DoclingDocument JSON that
+    # docling-serve writes always loads here. transformers is only used for
+    # its tokenizer; torch is not needed.
+    "docling-core[chunking]>=2.97,<3",
+]
+
+[tool.uv]
+package = false
+
+# Unit tests: `uv run pytest` in this directory, or ./run-tests.sh at the
+# repo root for every service. No services, network or data/ needed.
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
