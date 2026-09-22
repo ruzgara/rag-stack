@@ -8,24 +8,33 @@ more powerful Mac later, not migrated.
 
 ## Status
 
-**v2 is mid-migration.** Open WebUI has been removed — it previously
-provided chunking, embedding, Qdrant writes, hybrid search, reranking,
-retrieval and the chat UI itself. The **indexing half** has been rebuilt:
-documents are OCR'd and parsed, chunked along Docling's document structure,
-embedded with Ollama and written to Qdrant with both dense and BM25 vectors,
-**retrieval** over them works (hybrid search plus GPU reranking), and a
-**query service** answers questions from them with citations over an HTTP
-API, storing chat history — natively and OpenAI-compatibly. It has
-**accounts**: users with passwords, groups, and libraries owned and shared
-rather than granted, manageable from `ragctl user` or the admin console at
-`/admin`. Several
-sessions can use it at once, with turns queueing for the GPU. There is now
-a **chat UI** (`ui/`, Svelte + Vite, served at `/`, drawn from the
-Broadsheet mockup in `design/`): workspaces holding libraries and chats,
-streaming markdown answers with their searches and reasoning shown, citations
-beside the sources they cite and a chunk-by-chunk source viewer, stop and
-retry, library management and sharing, uploads, groups, API tokens, and a
-Recently deleted tray.
+**v2 is complete** (merged in PR #1). Open WebUI has been removed — it
+previously provided chunking, embedding, Qdrant writes, hybrid search,
+reranking, retrieval and the chat UI itself — and every part of it has been
+rebuilt here:
+
+- **Indexing**: documents are OCR'd and parsed, chunked along Docling's
+  document structure, embedded with Ollama and written to Qdrant with both
+  dense and BM25 vectors.
+- **Retrieval**: hybrid search plus GPU reranking, with a planner that splits
+  a message into up to `CHAT_MAX_QUERIES` searches.
+- **A query service** answers questions with citations over an HTTP API,
+  natively and OpenAI-compatibly, and stores chat history. Citations read
+  `[doc:chunk]` and keep their numbers for the whole chat, so a later answer
+  can cite a passage from an earlier turn.
+- **Accounts**: users with passwords, personal API tokens, groups, and
+  libraries that are owned and shared rather than granted. Manage them with
+  `ragctl user` or the admin console at `/admin`, which also selects rows in
+  bulk and edits `.env`.
+- **Several sessions at once**, with turns queueing fairly for the GPU.
+- **A chat UI** (`ui/`, Svelte + Vite, served at `/`, built from a local
+  Broadsheet design mock that isn't committed). It has workspaces holding
+  libraries and chats, and streams markdown answers with their searches and
+  reasoning shown and citations numbered as they arrive. A Citations/Sources
+  side panel sits beside the answer. You can read a single cited chunk, or the
+  whole document with every cited passage highlighted. It also has stop and
+  retry, a context-window meter, library management and sharing, uploads,
+  groups, API tokens, and a Recently deleted tray.
 
 **You provide the models.** What's wired up and pinned to specific
 versions: OCR, document parsing, the Ollama-backed VLM OCR fallback, and
@@ -56,7 +65,7 @@ the embedding/indexing pipeline.
           sign in (session cookie) → library ownership/access check → admission queue
           question → [plan] → hybrid search → rerank (Apple GPU)
           → chat model via Ollama (+ optional search tool rounds)
-          → streamed answer with [n] citations
+          → streamed answer with [doc:chunk] citations
           accounts, libraries and history all in data/chat.db
 ```
 
@@ -143,8 +152,9 @@ admin console is at `/admin`, the API docs at `/docs`.
 
 ## Using it
 
-**Batch ingestion** is the only path in. Drop files into `data/inbox/`
-and run:
+**Ingestion.** Upload files from the chat UI (or `POST /api/upload`), which
+runs ingest and embed for you in the background. Or drop files into
+`data/inbox/` and run:
 
 ```bash
 ./ragctl ingest
@@ -277,8 +287,8 @@ run. The vector size is read from the model, never configured; switching
 so vectors from two models never mix in one index.
 
 **Searching** (`./ragctl search "your question"`) runs the retrieval
-module in `services/query/retrieval.py` — the same code the future query
-service will import (`Retriever(...).search(question)` returns ranked hits
+module in `services/query/retrieval.py` — the same code the query
+service uses (`Retriever(...).search(question)` returns ranked hits
 with filename, pages, headings and text). It embeds the question with
 `EMBED_MODEL`, has Qdrant run the dense and BM25 retrievers in one query,
 and fuses their rankings. Every setting lives in `.env`:
@@ -368,14 +378,25 @@ accounts are real, but passwords over a LAN want TLS in front first.
    used. A narrow question gets one or two passages, a broad one many, and an
    off-topic one none. `CHAT_INITIAL_SOURCES` only caps the count. Several
    queries share that one allowance rather than each getting it, so a
-   two-part question doesn't crowd out the tool rounds. Numbered [1]..[n].
-3. **Answer** — streamed from the preset's chat model, citing passages as
-   [n]. If the preset has tools on, the model may call a `search_documents`
-   tool for more passages (up to `CHAT_MAX_TOOL_ROUNDS`, within
-   `CHAT_MAX_SOURCE_TOKENS`). Passages it already has are never returned
-   again, and numbering continues, so earlier citations stay valid.
-4. **Citations** are resolved to their passages; numbers that don't exist
-   are reported as `invalid_citations`.
+   two-part question doesn't crowd out the tool rounds.
+3. **Answer** — streamed from the preset's chat model. If the preset has
+   tools on, the model may call a `search_documents` tool for more passages
+   (up to `CHAT_MAX_TOOL_ROUNDS`, within `CHAT_MAX_SOURCE_TOKENS`). Passages
+   it already has are never returned again. Passages cited earlier in the
+   chat (up to `CHAT_CARRY_SOURCES`, default 40) are offered to the model
+   again by label, so it can cite them without searching again.
+4. **Citations** come in two layers (`services/query/citations.py`). The
+   model sees each passage under an opaque handle derived from its content
+   (`[Sk29fp]`) and cites that. The reader sees `[doc:chunk]` instead:
+   documents are numbered in the order the chat first cites them, and chunks
+   within each document. A number is assigned as its bracket closes in the
+   stream, and it stays the same across turns, so `[2:4]` means the same
+   passage everywhere in the chat. A passage that was retrieved but never
+   cited gets no number. Handles are sparse, so a garbled one resolves to
+   nothing instead of to some other passage, and it's reported under
+   `invalid_citations`. Ranges and lists work: `[1:3,4]`, `[1:3-5]`,
+   `[2;4]`. If you delete or retry the only answer that cites a document,
+   that document's number is freed for reuse.
 
 The instructions the model gets are in `services/query/prompts/` —
 `planner.md` for step 1, `system.md` always and `tools.md` when tools are on,
@@ -396,14 +417,18 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | Endpoint | |
 |---|---|
 | `POST /api/workspaces` · `GET /api/workspaces` | create (`{name, description?}`), list your own workspaces |
-| `GET` · `PATCH` · `DELETE /api/workspaces/{id}` | open, rename / change `description` / change `library_ids` (every chat in the workspace, old ones included, searches these), delete (also deletes the chats in it) |
+| `GET` · `PATCH` · `DELETE /api/workspaces/{id}` | open, rename / change `description` / change `library_ids` (every chat in the workspace, old ones included, searches these), delete (marks it and its chats deleted; nothing is removed) |
+| `POST /api/workspaces/{id}/restore` | undo a workspace delete, its chats with it |
 | `GET /api/workspaces/{id}/conversations` | chats in this workspace |
-| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?, workspace_id?}`; `library_ids` only outside a workspace, 422 otherwise), list |
-| `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete |
-| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `plan`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error`, `stopped` |
+| `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?, workspace_id?}`; `library_ids` only outside a workspace, 422 otherwise), list (`?archived=true` / `?deleted=true` for the archive and the Recently deleted tray) |
+| `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete (moves it to Recently deleted) |
+| `POST /api/conversations/{id}/restore` · `/archive` · `/unarchive` | bring a deleted chat back; move a chat out of the normal list and back (an archived chat still opens) |
+| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `queued` (position in line), `user`, `plan` (the planned queries), `searching`, `listing`, `sources`, `thinking`, `citation` (a handle's `[doc:chunk]`, sent as its bracket closes), `token`, `done` (message id, cited handles, `refs` mapping each to its `[doc, chunk]`, all sources, timings), `title` (after the first answer), `error`, `stopped` |
+| `POST /api/conversations/{id}/retry` | regenerate the last answer: it's deleted and the turn reruns, streaming the same events minus `user` |
 | `POST /api/conversations/{id}/stop` | stops the conversation's turn -- the one streaming and any queued behind it → `{stopped: n}` (0 if it had already finished). The turn's own stream ends with `stopped` (`{message_id, answer, cited}`; `{}` if it never left the queue), and the partial answer is kept with status `stopped`. Closing the stream alone doesn't stop a turn |
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
 | `GET /api/documents` | processed documents you can read (admins: all), your files waiting in the inbox (admins: everyone's), upload-ingest status |
+| `GET /api/documents/{sha}/chunks` | a document's chunks in order, with its total chunk count -- what the source and document viewers read; same read scope as `/api/documents` |
 | `POST /api/upload` | multipart `files` + `library_id` (required) → saved into `data/inbox`, then ingest + embed run in the background (or the inbox watcher does it, with `INGEST_AUTORUN=true`) |
 | `GET /api/uploads` · `DELETE /api/uploads/{id}` | your uploads (each `waiting`, `processed` or `failed`); delete one, which purges the document from every library, the index and the disk -- unless another user uploaded the same file too, when only yours goes (`{purged: true/false}`). Deleted uploads still count against the quota |
 | `GET /api/quota` | what's left of your upload allowance, and how busy the machine is |
@@ -419,15 +444,19 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `GET /api/auth/me` | `{user, auth_mode}` — what a UI renders itself from; `user.is_admin` is the only global permission fact, everything else is per library |
 | `POST /api/auth/password` | `{current_password, new_password}`, which signs your other sessions out |
 | `GET` · `POST /api/tokens` · `DELETE /api/tokens/{id}` | your personal API tokens: list them (never the tokens themselves), make one (`{name, expires_in_days?}` → the token, shown only this once; needs a signed-in session, not another token), revoke one |
+| `GET /api/users/search?q=` | find users by name or email, e.g. to share a library with |
+| `GET /api/groups` · `POST /api/groups/{id}/join` · `/leave` | every group (name, type, member count -- never the members); join an open group, leave any |
 | `/api/admin/users` · `/api/admin/groups` | users, groups and memberships (admin-only: `users.is_admin`); what the admin console calls. Creates and manages members only -- any change to an admin account is a 403 (`ragctl user`) |
 | `GET /api/admin/documents` | every indexed document on the machine, unfiltered, for assigning into libraries (admin-only) |
+| `/api/admin/system/env` (`GET`, `PUT`, `/check`, `/example`, `/backups`) | read, validate, back up and replace `.env` from the admin console. Values the shell would act on when `ragctl` sources the file (`;`, `&&`, `\|`, `$VAR`, unclosed quotes, `KEY =x`…) are refused |
+| `POST /api/admin/system/reload` · `/stack-reload` · `/restart` | apply `.env` changes: rebuild everything that reads it in-process; re-render the LaunchAgents and restart Qdrant, docling and the watcher (poll `GET /stack-reload`); or restart the query service itself for what a reload can't reach (session cookie, port) |
 | `GET /api/health` | Ollama, the Qdrant collection, the database, reranker device, presets, current load |
 
 History is stored in `data/chat.db` (SQLite): the UI sends only the new
 message, and the service loads earlier turns, sending the model the most
 recent ones within `CHAT_HISTORY_MAX_TOKENS`. Each answer stores a copy of
-the passages it was given, so its citations still resolve after documents
-are re-ingested. An answer keeps generating and is stored even if the
+the passages it was given, along with their `[doc:chunk]` numbers, so its
+citations still resolve after documents are re-ingested. An answer keeps generating and is stored even if the
 client disconnects; reopening the conversation shows it. Every row carries a
 `user_id` and every query is scoped by it, so one person's conversations are
 never visible to another.
@@ -443,8 +472,10 @@ client.chat.completions.create(model="everyday", messages=[{"role": "user", "con
 ```
 
 The protocol is stateless (clients send the whole conversation) and has no
-field for citations, so nothing is stored and the cited passages are
-appended to the answer as a "Sources" list. A client's system prompt is
+field for citations, so nothing is stored. Citations are rewritten to
+`[doc:chunk]` (streamed or not, so no internal handle ever reaches the
+client), and the cited passages are appended to the answer as a "Sources"
+list. A client's system prompt is
 added to the service's, not substituted for it; client-supplied `tools`
 are rejected.
 
@@ -499,8 +530,9 @@ Raise `OLLAMA_MAX_LOADED_MODELS`, `OLLAMA_CONTEXT_LENGTH`,
 `OLLAMA_NUM_PARALLEL`, `DOCLING_NUM_THREADS`, `DOCLING_LOC_NUM_WORKERS` in
 `.env` to match the new hardware, and raise Docker Desktop's memory limit
 (Settings → Resources) to something like 16GB. Set `BIND_ADDR=0.0.0.0` if
-other machines on the network should reach Qdrant (and, once it exists,
-the future chat/retrieval service).
+other machines on the network should reach Qdrant. The query service ignores
+`BIND_ADDR` and always binds to 127.0.0.1, because it takes passwords;
+putting it on the LAN needs TLS in front first (see "Next" below).
 
 ## Uninstall
 
@@ -622,7 +654,16 @@ applies to their tokens at once. Changing a password doesn't revoke tokens --
 revoke them explicitly (`DELETE /api/tokens/{id}`, which works with the token
 itself, or `ragctl user token revoke`). A token can't make more tokens, so a
 leaked one can't mint replacements. `QUERY_API_KEY` still works too, as one
-shared service account with its own row rather than a way past anything.
+shared service account with its own row rather than a way past anything, and
+it stops working if that account is disabled.
+
+**The admin console** (`/admin`) manages members, groups, libraries and
+documents. Each table has checkboxes, with select-all and shift-click ranges,
+for bulk actions: delete users, groups or libraries, or add documents to a
+library and remove them. Admin accounts can't be selected, since they're
+managed only at the terminal. If some rows fail, it reports which ones. The
+console also edits `.env`. Each save is validated and backed up first, and
+the console then tells you which reload the change needs.
 
 **SSO later.** Identity arrives through one seam, so `QUERY_AUTH_MODE=proxy`
 switches the service to trusting an authenticating reverse proxy's header
@@ -631,9 +672,10 @@ authorization or storage. That is only sound when the service can be reached
 *only* through that proxy — otherwise anyone on the network can name themselves
 in a header — so the header is ignored entirely in password mode.
 
-**Upgrading an existing install.** `chat.db` migrates itself. Rows written
-before accounts existed are adopted by the first admin you create, so old
-conversations stay where you can see them.
+**Upgrading an existing install.** `chat.db` has no migrations (see
+`db.py`). When the schema changes, run `ragctl clean --yes` or delete
+`data/chat.db`, and it's recreated with the current schema. Rows written
+before accounts existed are adopted by the first admin you create.
 
 ## Libraries
 
@@ -719,9 +761,6 @@ chats inside it are still their own. The deleted user's upload records pass
 to the admins, so their documents still count as held and can't be purged by
 someone else deleting an identical upload.
 
-The `uploads` table gained a `doc_sha` column for this; as with any schema
-change here (see `db.py`), drop `data/chat.db` in a dev install to recreate it.
-
 ## Several sessions at once
 
 The backend assumes more than one session at a time:
@@ -759,8 +798,8 @@ The backend assumes more than one session at a time:
 - **Uploads don't collide.** The inbox name is claimed with a hard link, which
   fails rather than overwriting, so two sessions uploading `report.pdf` at the
   same moment get `report.pdf` and `report (1).pdf`.
-- **SQLite is fine for this.** WAL is on, every row already carries a
-  `user_id`, and `chat.db` migrates itself forward (`PRAGMA user_version`).
+- **SQLite is fine for this.** WAL is on, and every row already carries a
+  `user_id`.
   Postgres becomes necessary when a second process writes — in practice, the
   day you run uvicorn with more than one worker.
 
@@ -783,10 +822,14 @@ cd services/ingest && uv run pytest   # or directly, per service
 
 The UI's tests (`ui/src/tests/`) cover the SSE frame parser (chunked at
 several byte sizes, to catch boundary bugs), the streaming-markdown fence
-tracker, citation parsing and linkification, turn building (live events and
-the trace rebuilt from a stored answer), and a smoke test that mounts the
-whole app in jsdom against a fake API -- sign in, open a chat, stream and
-stop a turn, open every popup. No browser needed.
+tracker, the citation grammar (handles, `[doc:chunk]` refs, ranges and lists,
+mirroring `citations.py`) and linkification, turn building (live events and
+the trace rebuilt from a stored answer), the helpers that put documents and
+citations in order, and a smoke test that mounts the whole app in jsdom
+against a fake API -- sign in, open a chat, stream and stop a turn, open
+every popup, step through both source viewers in citation order, track the
+focused turn while scrolling, highlight passages, and sign out without
+leaving the last user's data behind. No browser needed.
 `./ragctl ui check` runs `svelte-check`.
 
 Most need no running services, network, `.env` or `data/`, and take a few
@@ -796,7 +839,9 @@ Times-Italic…), so style measurement runs on real renders. Covered: heading
 levels and cleanup, page triage, the ingest pipeline around docling, sibling
 chunk merging, embed retries, section expansion and thresholds in
 retrieval, the chat pipeline (planning, source budget, tool rounds,
-citations), chat history storage, the OpenAI adapter's helpers, the
+citation handles, numbering as they stream and carrying them across turns),
+the streaming endpoint, chat history storage and the reuse of freed citation
+numbers, `.env` validation and reloads, the OpenAI adapter's helpers, the
 knowledge-base listing tool, the admission queue and ingest quotas, and
 accounts — library ownership and sharing, the highest role winning across a
 user's own access and its groups', session lifecycle, login throttling, and
