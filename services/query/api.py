@@ -1091,7 +1091,7 @@ def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], p
     `stop` is checked between the pipeline's events: once it's set, the
     pipeline is closed (which drops the Ollama request, so the model stops
     generating too) and what streamed so far is stored as "stopped". While
-    tokens stream that's immediate; a rewrite or search already underway
+    tokens stream that's immediate; planning or a search already underway
     finishes first, since it has no events to stop between."""
     tokens: list[str] = []
     sources: list[dict] = []
@@ -1181,7 +1181,9 @@ def send_message(conv_id: str, body: NewMessage, user: User = CurrentUser) -> St
     """Streams server-sent events:
       queued    {position}: the machine is busy; this turn is waiting in line
       user      the stored question {id}
-      rewrite   {query, search}: whether to search at all, and the (standalone) search query
+      plan      {queries, search, failed}: whether to search at all, and the (standalone) search
+                queries -- usually one, up to CHAT_MAX_QUERIES. failed: the planner didn't
+                answer, so queries is just the message as-is
       searching {query, found_by}: a search is running (auto or tool)
       listing   {document}: the model asked what the knowledge base holds
       sources   {sources: [...]}: passages added, numbered for citation

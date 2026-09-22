@@ -31,12 +31,16 @@
   const model = $derived(turn.model ?? session.presetInfo(turn.preset ?? preset)?.model ?? null);
   const presetName = $derived(turn.preset ?? preset);
 
-  // null = follow the phase (open while reasoning, as the design does).
+  // null / absent = follow the phase (open while reasoning, as the design does).
   let processOpenSet = $state<boolean | null>(null);
-  let thinkingOpenSet = $state<boolean | null>(null);
+  let thinkOpenSet = $state<Record<number, boolean>>({});
   let openStep = $state<number>(-1);
   const processOpen = $derived(processOpenSet ?? thinkPhase);
-  const thinkingOpen = $derived(thinkingOpenSet ?? thinkPhase);
+  // The run being written right now, if reasoning is what the turn is doing.
+  const liveThink = $derived(
+    thinkPhase && turn.trace[turn.trace.length - 1]?.verb === "thinking" ? turn.trace.length - 1 : -1,
+  );
+  const thinkOpen = (i: number): boolean => thinkOpenSet[i] ?? i === liveThink;
 
   // Ticks the "first token" clock while waiting for it.
   let now = $state(Date.now());
@@ -52,6 +56,7 @@
     if (thinkPhase) return `reasoning${s ? ` · ${s} done` : ""}`;
     if (turn.answer) return `generating${s ? ` · ${s} so far` : ""}`;
     const last = turn.trace[turn.trace.length - 1];
+    if (last?.failed) return "planning failed · searching the message as written";
     if (last?.verb === "search") return `searching · “${last.text}”`;
     if (last?.verb === "list") return `listing ${last.text}`;
     return "starting";
@@ -79,7 +84,7 @@
     return " · " + parts.join(" · ");
   }
 
-  const VERB: Record<string, string> = { rewrote: "rewrote", search: "search", list: "list", note: "decided" };
+  const VERB: Record<string, string> = { planned: "planned", search: "search", list: "list", note: "decided", thinking: "thinking" };
 
   function openSource(n: number): void {
     ui.focusSources([n], turn.key);
@@ -134,7 +139,7 @@
       <button class="process-toggle" onclick={() => (processOpenSet = !processOpen)} aria-expanded={processOpen}>
         {#if streaming}<span class="pulse" aria-hidden="true"></span>{/if}
         <span>{streaming ? liveSummary : processSummary(turn)}</span>
-        {#if turn.trace.length || turn.thinking}
+        {#if turn.trace.length}
           <span class="toggle-label">{processOpen ? "Hide ▲" : "Show ▼"}</span>
         {/if}
       </button>
@@ -143,9 +148,22 @@
         <div class="trace">
           {#each turn.trace as step, i (i)}
             <div class="step">
-              <span class="verb">{VERB[step.verb]}</span>
+              <span class="verb" class:err-text={step.failed}>{step.failed ? "no plan" : VERB[step.verb]}</span>
               <div class="step-body">
-                {#if step.sources.length}
+                {#if step.verb === "thinking"}
+                  {@const open = thinkOpen(i)}
+                  <button class="step-btn" onclick={() => (thinkOpenSet[i] = !open)} aria-expanded={open}>
+                    <span>Reasoning · {plural(step.tokens ?? 0, "token")}{i === liveThink ? " so far" : ""}</span>
+                    <span class="toggle-label">{open ? "Hide ▲" : "Show ▼"}</span>
+                  </button>
+                  {#if open}
+                    <div class="thinking rag-scroll">
+                      {step.text}{#if i === liveThink}<span class="cursor-block small" aria-hidden="true"></span>{/if}
+                    </div>
+                  {/if}
+                {:else if step.failed}
+                  <span>{step.text}<span class="muted"> · the planning step failed, so the message was searched exactly as written</span></span>
+                {:else if step.sources.length}
                   <button class="step-btn" onclick={() => (openStep = openStep === i ? -1 : i)} aria-expanded={openStep === i}>
                     <span>{step.text}<span class="muted">{stepNote(i)}</span></span>
                     <span class="toggle-label">{openStep === i ? "Hide ▲" : "Show ▼"}</span>
@@ -169,23 +187,7 @@
               </div>
             </div>
           {/each}
-          {#if turn.thinking}
-            <div class="step">
-              <span class="verb">thinking</span>
-              <div class="step-body">
-                <button class="step-btn" onclick={() => (thinkingOpenSet = !thinkingOpen)} aria-expanded={thinkingOpen}>
-                  <span>Reasoning · {plural(turn.thinkingTokens, "token")}{thinkPhase ? " so far" : ""}</span>
-                  <span class="toggle-label">{thinkingOpen ? "Hide ▲" : "Show ▼"}</span>
-                </button>
-                {#if thinkingOpen}
-                  <div class="thinking rag-scroll">
-                    {turn.thinking}{#if thinkPhase}<span class="cursor-block small" aria-hidden="true"></span>{/if}
-                  </div>
-                {/if}
-              </div>
-            </div>
-          {/if}
-          {#if !streaming && !turn.hasLiveThinking && turn.trace.length === 0}
+          {#if !streaming && turn.trace.length === 0}
             <div class="step"><span class="verb"></span><span class="muted">No steps recorded for this answer.</span></div>
           {/if}
         </div>
@@ -268,6 +270,7 @@
   .trace { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; font-size: 12.5px; color: var(--color-neutral-700); }
   .step { display: flex; gap: 9px; }
   .verb { color: var(--color-accent-700); width: 62px; flex: none; padding-top: 1px; }
+  .verb.err-text { color: var(--color-accent-2-700); }
   .step-body { min-width: 0; flex: 1; overflow-wrap: anywhere; }
   .step-body > span { color: var(--color-text); }
   .step-btn {

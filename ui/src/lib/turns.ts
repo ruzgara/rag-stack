@@ -12,13 +12,17 @@ export type TurnStatus = "streaming" | AnswerStatus;
 /** One line of the "process" trace under an answer's header: what the turn
  *  did before (and between) writing. */
 export interface TraceStep {
-  verb: "rewrote" | "search" | "list" | "note";
+  verb: "planned" | "search" | "list" | "note" | "thinking";
   text: string;
   /** For searches: the source numbers this query brought in. */
   sources: number[];
   foundBy?: "auto" | "tool";
+  /** Rewrite only: the model never answered, so `text` is the raw message. */
+  failed?: boolean;
   /** Seconds, when the server measured it (only the auto search is). */
   seconds?: number;
+  /** For reasoning: tokens in this run of it. */
+  tokens?: number;
 }
 
 export interface Turn {
@@ -92,11 +96,13 @@ export function applyEvent(t: Turn, ev: TurnEvent): void {
       t.questionId = ev.id;
       t.queuePosition = null;
       break;
-    case "rewrite":
+    case "plan":
       t.queuePosition = null;
-      t.trace.push(ev.search
-        ? { verb: "rewrote", text: ev.query, sources: [] }
-        : { verb: "note", text: "no search needed for this message", sources: [] });
+      t.trace.push(ev.failed
+        ? { verb: "planned", text: planText(ev.queries), sources: [], failed: true }
+        : ev.search
+          ? { verb: "planned", text: planText(ev.queries), sources: [] }
+          : { verb: "note", text: "no search needed for this message", sources: [] });
       break;
     case "searching":
       t.queuePosition = null;
@@ -118,12 +124,23 @@ export function applyEvent(t: Turn, ev: TurnEvent): void {
     case "listing_libraries":
       t.trace.push({ verb: "list", text: "libraries", sources: [] });
       break;
-    case "thinking":
+    case "thinking": {
       t.queuePosition = null;
       t.thinking += ev.text;
       t.thinkingTokens += 1;
       t.hasLiveThinking = true;
+      // Reasoning that resumes after a search (or a listing) is a run of
+      // its own, so the trace reads think, search, think in the order it
+      // happened rather than collapsing into one block at the end.
+      const last = t.trace[t.trace.length - 1];
+      if (last?.verb === "thinking") {
+        last.text += ev.text;
+        last.tokens = (last.tokens ?? 0) + 1;
+      } else {
+        t.trace.push({ verb: "thinking", text: ev.text, sources: [], tokens: 1 });
+      }
       break;
+    }
     case "token":
       t.queuePosition = null;
       if (t.firstTokenAt === null) t.firstTokenAt = Date.now();
@@ -159,21 +176,30 @@ export function applyEvent(t: Turn, ev: TurnEvent): void {
   }
 }
 
+/** One trace line for the planned queries, however many there were. Each one
+ *  also gets its own `search` step, so this reads as the plan, not a repeat. */
+function planText(queries: string[]): string {
+  return queries.join(" · ");
+}
+
 /** The trace as far as the server kept it. What's stored is the search
- *  queries (auto first, then each tool query), each source's query, and a
- *  few stats -- not the order tool calls interleaved in, not what a
+ *  queries (the planner's first, then each tool query), each source's query,
+ *  and a few stats -- not the order tool calls interleaved in, not what a
  *  document listing returned, and not the reasoning text. */
 export function traceFromStored(searchQueries: string[], sources: Source[], stats: TurnStats | null): TraceStep[] {
   const steps: TraceStep[] = [];
   const auto = stats?.auto_search === true;
-  if (stats?.rewrite_s !== undefined) {
-    steps.push(auto
-      ? { verb: "rewrote", text: searchQueries[0] ?? "", sources: [] }
-      : { verb: "note", text: "no search needed for this message", sources: [] });
+  const planned = auto ? Math.max(1, stats?.auto_queries ?? 1) : 0;
+  if (stats?.plan_s !== undefined) {
+    steps.push(stats.plan_failed
+      ? { verb: "planned", text: planText(searchQueries.slice(0, Math.max(1, planned))), sources: [], failed: true }
+      : auto
+        ? { verb: "planned", text: planText(searchQueries.slice(0, planned)), sources: [] }
+        : { verb: "note", text: "no search needed for this message", sources: [] });
   }
   const claimed = new Set<number>();
   searchQueries.forEach((q, i) => {
-    const foundBy = auto && i === 0 ? "auto" : "tool";
+    const foundBy = i < planned ? "auto" : "tool";
     const nums = sources
       .filter((s) => s.query === q && s.found_by === foundBy && !claimed.has(s.number))
       .map((s) => s.number);
@@ -250,6 +276,7 @@ export function processSummary(t: Turn): string {
   const searches = t.trace.filter((s) => s.verb === "search").length;
   const cited = t.sources.filter((s) => s.cited).length;
   const parts: string[] = [];
+  if (t.trace.some((s) => s.failed === true)) parts.push("plan failed");
   parts.push(searches === 0 ? "no search" : `${searches} search${searches === 1 ? "" : "es"}`);
   if (t.sources.length) parts.push(`${cited} source${cited === 1 ? "" : "s"} cited`);
   if (t.stats?.total_s !== undefined) parts.push(`${t.stats.total_s.toFixed(1)}s`);

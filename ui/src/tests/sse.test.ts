@@ -13,7 +13,7 @@ import { SseParser, type SseFrame } from "../lib/sse";
 const FRAMES: [string, string][] = [
   ["queued", '{"position":1}'],
   ["user", '{"id":"m1"}'],
-  ["rewrite", '{"query":"q","search":true}'],
+  ["plan", '{"queries":["q"],"search":true}'],
   ["searching", '{"query":"q","found_by":"auto"}'],
   ["sources", '{"sources":[]}'],
   ["listing", '{"document":""}'],
@@ -64,7 +64,7 @@ describe("SseParser", () => {
   it("produces the expected 14 frames for a whole-frame push", () => {
     expect(expected).toHaveLength(14); // 12 named + note + trailing (keep-alive is not a frame)
     expect(expected.map((f) => f.event)).toEqual([
-      "queued", "user", "rewrite", "searching", "sources", "listing",
+      "queued", "user", "plan", "searching", "sources", "listing",
       "listing_libraries", "thinking", "token", "done", "title", "error",
       "note", "trailing",
     ]);

@@ -80,12 +80,12 @@ def search_cfg():
 
 class FakeOllama:
     """Scripted Ollama: /api/show reports capabilities, non-streamed
-    /api/chat (the rewrite step) returns `rewrite`, and each streamed
+    /api/chat (the planning step) returns `plan`, and each streamed
     /api/chat plays the next script in `streams` as NDJSON."""
 
-    def __init__(self, rewrite: str | None = '{"search": true, "query": ""}', streams: list[list[dict]] | None = None,
+    def __init__(self, plan: str | None = '{"search": true, "queries": []}', streams: list[list[dict]] | None = None,
                  tools: bool = True, context_length: int | None = 8192):
-        self.rewrite = rewrite
+        self.plan = plan
         self.streams = list(streams or [])
         self.tools = tools
         self.context_length = context_length
@@ -99,9 +99,9 @@ class FakeOllama:
                                              "model_info": model_info})
         self.chat_requests.append(body)
         if not body.get("stream"):
-            if self.rewrite is None:
+            if self.plan is None:
                 return httpx.Response(500, text="model crashed")
-            return httpx.Response(200, json={"message": {"role": "assistant", "content": self.rewrite}})
+            return httpx.Response(200, json={"message": {"role": "assistant", "content": self.plan}})
         script = self.streams.pop(0)
         return httpx.Response(200, content="\n".join(json.dumps(c) for c in script).encode())
 

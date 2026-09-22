@@ -37,7 +37,7 @@ const convDetail = {
     { id: "m1", role: "user", content: "What caps did we agree?", created_at: now - 60 },
     { id: "m2", role: "assistant", content: "Arbor is capped at 1× fees [1].", created_at: now - 50, model: "qwen", preset: "hard",
       search_queries: ["indemnity cap"], status: "complete", error: null,
-      stats: { auto_search: true, rewrite_s: 0.2, search_s: 0.8, total_s: 4.2, completion_tokens: 12, first_token_s: 1.1, context_used_pct: 62 },
+      stats: { auto_search: true, plan_s: 0.2, search_s: 0.8, total_s: 4.2, completion_tokens: 12, first_token_s: 1.1, context_used_pct: 62 },
       sources: [source(1, true), source(2, false)] },
   ],
 };
@@ -82,7 +82,7 @@ function route(url: string, init?: RequestInit): Response {
   if (p === "/api/conversations" && m === "GET") return json([]);
   if (p === "/api/conversations/C1" && m === "GET") return json(convDetail);
   if (p === "/api/conversations/C1/messages") return sse([
-    ["user", { id: "m3" }], ["rewrite", { query: "northgate cap", search: true }],
+    ["user", { id: "m3" }], ["plan", { queries: ["northgate cap"], search: true }],
     ["searching", { query: "northgate cap", found_by: "auto" }], ["sources", { sources: [source(1, false)] }],
     ["thinking", { text: "Considering" }], ["token", { text: "Northgate is uncapped " }], ["token", { text: "[1]." }],
     ["stopped", { message_id: "m4", answer: "Northgate is uncapped [1].", cited: [1] }]]);
@@ -158,7 +158,7 @@ describe("app smoke", () => {
     // Expand the process trace
     button(/1 search · 1 source cited/).click();
     await settle();
-    expect(text()).toContain("rewrote");
+    expect(text()).toContain("planned");
     expect(text()).toContain("indemnity cap");
 
     // Citation -> source viewer with its neighbouring chunks

@@ -94,28 +94,44 @@ def test_unknown_preset():
     assert config().preset(" HARD ").name == "hard"
 
 
-# ---------------------------------------------------------------- rewrite --
+# ---------------------------------------------------------------- planner --
 
 @pytest.mark.parametrize("reply, expected", [
-    ('{"search": false, "query": "hello"}', (False, "hello")),
-    ('{"search": true, "query": "RSF factor for Level 1 assets"}', (True, "RSF factor for Level 1 assets")),
-    ('{"search": true, "query": ""}', (True, "and for Level 1?")),   # empty query: the message as-is
-    ('{"query": "x"}', (True, "x")),                                  # missing decision: search
-    ("not json", (True, "and for Level 1?")),
-    (None, (True, "and for Level 1?")),                                # Ollama error
+    ('{"search": false, "queries": ["hello"]}', (False, ["hello"], False)),
+    ('{"search": true, "queries": ["RSF factor for Level 1 assets"]}',
+     (True, ["RSF factor for Level 1 assets"], False)),
+    ('{"search": true, "queries": ["deposits", "withdrawals"]}', (True, ["deposits", "withdrawals"], False)),
+    # Empty queries are the model answering, so they aren't a failure -- but a
+    # reply we can't read at all is, and only then is the turn marked.
+    ('{"search": true, "queries": [""]}', (True, ["and for Level 1?"], False)),
+    ('{"search": true, "queries": []}', (True, ["and for Level 1?"], False)),
+    ('{"queries": ["x"]}', (True, ["x"], False)),                       # missing decision: search
+    ('{"search": true, "queries": "x"}', (True, ["x"], False)),         # schema ignored: bare string
+    # Two searches for one thing would only cost time, so the repeat is dropped.
+    ('{"search": true, "queries": ["Level 1", "level 1", "Level 2"]}', (True, ["Level 1", "Level 2"], False)),
+    ("not json", (True, ["and for Level 1?"], True)),
+    (None, (True, ["and for Level 1?"], True)),                        # Ollama error
 ])
-def test_rewrite_falls_back_to_searching_the_message(reply, expected):
-    svc, _, _ = service(ollama=FakeOllama(rewrite=reply))
-    assert svc.rewrite_query(svc.cfg.preset(None), [], "and for Level 1?") == expected
+def test_the_planner_falls_back_to_searching_the_message(reply, expected):
+    svc, _, _ = service(ollama=FakeOllama(plan=reply))
+    assert svc.plan_search(svc.cfg.preset(None), [], "and for Level 1?") == expected
 
 
-def test_rewrite_sends_the_recent_conversation():
-    svc, _, ollama = service(ollama=FakeOllama(rewrite='{"search": true, "query": "q"}'))
+def test_the_planner_keeps_at_most_max_queries():
+    svc, _, _ = service(ollama=FakeOllama(plan='{"search": true, "queries": ["a", "b", "c", "d"]}'))
+    assert svc.cfg.max_queries == 2
+    assert svc.plan_search(svc.cfg.preset(None), [], "a and b and c and d").queries == ["a", "b"]
+
+
+def test_the_planner_sends_the_recent_conversation_and_its_own_prompt():
+    svc, _, ollama = service(ollama=FakeOllama(plan='{"search": true, "queries": ["q"]}'))
     history = [{"role": "user", "content": f"message {i}"} for i in range(10)]
-    svc.rewrite_query(svc.cfg.preset(None), history, "latest")
+    svc.plan_search(svc.cfg.preset(None), history, "latest")
     prompt = ollama.chat_requests[0]["messages"][0]["content"]
     assert "message 9" in prompt and "message 3" not in prompt  # last 6 only
-    assert ollama.chat_requests[0]["format"]["required"] == ["search", "query"]
+    assert "You prepare searches over a document library" in prompt  # prompts/planner.md
+    assert "{max_queries}" not in prompt and "At most 2." in prompt  # filled in
+    assert ollama.chat_requests[0]["format"]["required"] == ["search", "queries"]
 
 
 # ----------------------------------------------------- source selection --
@@ -161,24 +177,45 @@ def user_turn(ollama: FakeOllama, n: int = 0) -> str:
     return streamed[n]["messages"][-1]["content"]
 
 
+def test_a_failed_plan_is_announced_and_recorded():
+    """The turn still runs on the raw message, but the stream and the stored
+    stats both say the planning didn't happen, so the UI can show it."""
+    ollama = FakeOllama(plan=None, streams=[answer("ok")])
+    svc, retriever, _ = service({"what are some challenges": []}, ollama)
+    events, result = run(svc, "what are some challenges")
+    plan = next(e for e in events if e["type"] == "plan")
+    assert plan == {"type": "plan", "queries": ["what are some challenges"],
+                    "search": True, "failed": True}
+    assert result.stats["plan_failed"] is True
+    assert retriever.calls[0]["question"] == "what are some challenges"  # searched as-is
+
+
+def test_a_working_plan_leaves_no_failure_mark():
+    ollama = FakeOllama(plan='{"search": true, "queries": ["bond parties"]}', streams=[answer("ok")])
+    svc, _, _ = service({"bond parties": []}, ollama)
+    events, result = run(svc, "who are they?")
+    assert next(e for e in events if e["type"] == "plan")["failed"] is False
+    assert "plan_failed" not in result.stats
+
+
 def test_a_greeting_skips_the_search():
-    ollama = FakeOllama(rewrite='{"search": false, "query": "hello"}', streams=[answer("Hi", "!")])
+    ollama = FakeOllama(plan='{"search": false, "queries": ["hello"]}', streams=[answer("Hi", "!")])
     svc, retriever, _ = service(ollama=ollama)
     events, result = run(svc, "hello")
-    assert [e["type"] for e in events] == ["rewrite", "token", "token", "done"]
+    assert [e["type"] for e in events] == ["plan", "token", "token", "done"]
     assert retriever.calls == []
     assert result.answer == "Hi!" and result.sources == [] and result.stats["auto_search"] is False
     assert "no document search was run" in user_turn(ollama)
 
 
 def test_a_question_is_answered_from_its_sources_with_citations():
-    ollama = FakeOllama(rewrite='{"search": true, "query": "bond parties"}', streams=[answer("Investors [1]", " and [3].")])
+    ollama = FakeOllama(plan='{"search": true, "queries": ["bond parties"]}', streams=[answer("Investors [1]", " and [3].")])
     hits = [make_hit("a", ["BOND ISSUES", "The parties"], text="Investors and issuers."), make_hit("b", ["Timetable"])]
     svc, retriever, _ = service({"bond parties": hits}, ollama)
     events, result = run(svc, "who are the parties?")
 
-    assert [e["type"] for e in events[:3]] == ["rewrite", "searching", "sources"]
-    assert retriever.calls[0]["question"] == "bond parties"  # the rewritten query is searched
+    assert [e["type"] for e in events[:3]] == ["plan", "searching", "sources"]
+    assert retriever.calls[0]["question"] == "bond parties"  # the planned query is searched
     assert result.cited == [1] and result.invalid_citations == [3]
     assert result.search_queries == ["bond parties"]
     turn = user_turn(ollama)
@@ -187,8 +224,66 @@ def test_a_question_is_answered_from_its_sources_with_citations():
     assert result.stats["source_tokens"] > 0
 
 
+def test_a_skipped_search_can_still_be_overruled_by_the_tool():
+    """The planner decides before seeing any passage, so a tools-on preset is
+    told it may search anyway rather than being told the message needs nothing."""
+    ollama = FakeOllama(plan='{"search": false, "queries": ["hello"]}',
+                        streams=[[*tool_call("bond parties")], answer("Found it [1].")])
+    svc, retriever, _ = service({"bond parties": [make_hit("a", ["Parties"])]}, ollama, preset="hard")
+    events, result = run(svc, "hi -- and who are the parties?", preset="hard")
+
+    turn = user_turn(ollama)
+    assert "no document search was run" in turn and "looked like one that doesn't need" in turn
+    assert "That judgement can be wrong" in turn  # the override is offered
+    assert [e["type"] for e in events if e["type"] == "searching"] == ["searching"]
+    assert [c["question"] for c in retriever.calls] == ["bond parties"]
+    assert result.search_queries == ["bond parties"]  # found by the tool, not the planner
+    assert result.stats["auto_search"] is False and result.cited == [1]
+
+
+def test_a_two_part_question_searches_each_part_and_records_both():
+    """Every planned query gets its own search and its own pair of events, so
+    the trace shows what was looked for; the sources are numbered across all
+    of them, so citations stay unambiguous."""
+    ollama = FakeOllama(plan='{"search": true, "queries": ["deposit rules", "withdrawal rules"]}',
+                        streams=[answer("Both [1] and [2].")])
+    svc, retriever, _ = service({"deposit rules": [make_hit("a", ["Deposits"])],
+                                 "withdrawal rules": [make_hit("b", ["Withdrawals"])]}, ollama)
+    events, result = run(svc, "how do deposits and withdrawals differ?")
+
+    assert [e["type"] for e in events[:5]] == ["plan", "searching", "sources", "searching", "sources"]
+    assert [e["query"] for e in events if e["type"] == "searching"] == ["deposit rules", "withdrawal rules"]
+    assert [c["question"] for c in retriever.calls] == ["deposit rules", "withdrawal rules"]
+    assert result.search_queries == ["deposit rules", "withdrawal rules"]
+    assert result.stats["auto_queries"] == 2
+    assert [s.number for s in result.sources] == [1, 2]
+    assert result.cited == [1, 2]
+
+
+def test_planned_queries_share_one_turns_worth_of_sources():
+    """Two queries don't get CHAT_AUTO_SOURCE_TOKENS each -- they halve it, so
+    a two-part question leaves the tool rounds as much room as a one-part one.
+    The flip side is that each query's allowance is smaller, so a passage that
+    would have fitted a single-query turn can be skipped here."""
+    ollama = FakeOllama(plan='{"search": true, "queries": ["one", "two"]}', streams=[answer("ok")])
+    svc, _, _ = service({"one": [sized("a", 150), sized("b", 150)], "two": [sized("c", 150)]}, ollama,
+                        CHAT_AUTO_SOURCE_TOKENS=400)
+    _, result = run(svc, "one and two")
+    # 400 // 2 = 200 each: "b" no longer fits the first query, but the second
+    # query still gets its own 200 rather than an exhausted budget.
+    assert [s.point_id for s in result.sources] == ["a", "c"]
+    assert result.stats["source_tokens"] < 400  # the turn kept room for the tool rounds
+
+
+def test_one_planned_query_keeps_the_whole_auto_allowance():
+    ollama = FakeOllama(plan='{"search": true, "queries": ["one"]}', streams=[answer("ok")])
+    svc, _, _ = service({"one": [sized("a", 150), sized("b", 150)]}, ollama, CHAT_AUTO_SOURCE_TOKENS=400)
+    _, result = run(svc, "one")
+    assert [s.point_id for s in result.sources] == ["a", "b"]  # both fit when nothing shares the budget
+
+
 def test_context_usage_is_reported_against_the_models_window():
-    ollama = FakeOllama(rewrite='{"search": false, "query": "hi"}', streams=[answer("Hi", "!", prompt_tokens=200)],
+    ollama = FakeOllama(plan='{"search": false, "queries": ["hi"]}', streams=[answer("Hi", "!", prompt_tokens=200)],
                         context_length=8192)
     svc, _, _ = service(ollama=ollama)
     _, result = run(svc, "hi")
@@ -198,7 +293,7 @@ def test_context_usage_is_reported_against_the_models_window():
 
 
 def test_context_limit_is_none_when_ollama_cant_report_it():
-    ollama = FakeOllama(rewrite='{"search": false, "query": "hi"}', streams=[answer("Hi")], context_length=None)
+    ollama = FakeOllama(plan='{"search": false, "queries": ["hi"]}', streams=[answer("Hi")], context_length=None)
     svc, _, _ = service(ollama=ollama)
     _, result = run(svc, "hi")
     assert result.stats["context_limit"] is None and result.stats["context_used_pct"] is None
@@ -209,7 +304,7 @@ def test_context_limit_is_capped_by_ollamas_configured_context_length():
     actually configured to serve (OLLAMA_CONTEXT_LENGTH) -- the reported
     limit has to be whichever is smaller, or "context used" reads far too
     low against a window the model never really gets."""
-    ollama = FakeOllama(rewrite='{"search": false, "query": "hi"}', streams=[answer("Hi", "!", prompt_tokens=200)],
+    ollama = FakeOllama(plan='{"search": false, "queries": ["hi"]}', streams=[answer("Hi", "!", prompt_tokens=200)],
                         context_length=131072)
     svc, _, _ = service(ollama=ollama, OLLAMA_CONTEXT_LENGTH=32768)
     _, result = run(svc, "hi")
@@ -217,7 +312,7 @@ def test_context_limit_is_capped_by_ollamas_configured_context_length():
 
 
 def test_context_limit_is_the_models_own_when_it_is_smaller_than_ollamas_configured_length():
-    ollama = FakeOllama(rewrite='{"search": false, "query": "hi"}', streams=[answer("Hi", "!", prompt_tokens=200)],
+    ollama = FakeOllama(plan='{"search": false, "queries": ["hi"]}', streams=[answer("Hi", "!", prompt_tokens=200)],
                         context_length=8192)
     svc, _, _ = service(ollama=ollama, OLLAMA_CONTEXT_LENGTH=32768)
     _, result = run(svc, "hi")
@@ -232,7 +327,7 @@ def test_no_relevant_sources_is_said_plainly():
 
 
 def test_the_model_can_search_for_more_with_the_tool():
-    ollama = FakeOllama(rewrite='{"search": true, "query": "loans"}',
+    ollama = FakeOllama(plan='{"search": true, "queries": ["loans"]}',
                         streams=[tool_call("bond parties"), answer("Loans [1], bonds [2].")])
     svc, retriever, _ = service({"loans": [make_hit("a", ["LOANS"])], "bond parties": [make_hit("b", ["BONDS"])]},
                                 ollama)
@@ -274,9 +369,9 @@ def test_presets_choose_model_and_thinking():
     assert (request["model"], request["think"]) == ("big-model", True)
 
 
-def test_without_the_rewrite_step_the_message_is_searched_as_is():
+def test_without_the_planning_step_the_message_is_searched_as_is():
     ollama = FakeOllama(streams=[answer("ok")])
-    svc, retriever, _ = service({}, ollama, CHAT_REWRITE="false")
+    svc, retriever, _ = service({}, ollama, CHAT_PLAN="false")
     events, _ = run(svc, "and for Level 1?")
     assert events[0]["type"] == "searching" and retriever.calls[0]["question"] == "and for Level 1?"
 

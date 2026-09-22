@@ -54,7 +54,7 @@ the embedding/indexing pipeline.
                     ▲
    query/ (native, :8088): HTTP API (native + OpenAI-compatible)
           sign in (session cookie) → library ownership/access check → admission queue
-          question → [rewrite] → hybrid search → rerank (Apple GPU)
+          question → [plan] → hybrid search → rerank (Apple GPU)
           → chat model via Ollama (+ optional search tool rounds)
           → streamed answer with [n] citations
           accounts, libraries and history all in data/chat.db
@@ -356,17 +356,19 @@ clients authenticate as a person with a personal token
 accounts are real, but passwords over a LAN want TLS in front first.
 
 **Each answer:**
-1. **Rewrite** — one call to the chat model decides whether the message
-   needs a search at all ("hello", "thanks", "make that shorter" or
-   "translate that" are answered without one) and, for a follow-up, turns it
-   into a standalone search query ("and for Level 1?" → "RSF factor for
-   Level 1 assets").
-2. **Automatic search** — hybrid search + reranking; every passage above
-   `RAG_RERANK_MIN_SCORE` (whole sections where several of their chunks
-   match), best first, until `CHAT_AUTO_SOURCE_TOKENS` is used. A narrow
-   question gets one or two passages, a broad one many, and an off-topic
-   one none. `CHAT_INITIAL_SOURCES` only caps the count. Numbered
-   [1]..[n].
+1. **Plan** — one call to the chat model decides whether the message needs a
+   search at all ("hello", "thanks", "make that shorter" or "translate that"
+   are answered without one) and, for a follow-up, turns it into a standalone
+   search query ("and for Level 1?" → "RSF factor for Level 1 assets").
+   Usually one query; a message asking about several distinct things, or
+   asking for a comparison, gets up to `CHAT_MAX_QUERIES`.
+2. **Automatic search** — hybrid search + reranking, once per planned query;
+   every passage above `RAG_RERANK_MIN_SCORE` (whole sections where several
+   of their chunks match), best first, until `CHAT_AUTO_SOURCE_TOKENS` is
+   used. A narrow question gets one or two passages, a broad one many, and an
+   off-topic one none. `CHAT_INITIAL_SOURCES` only caps the count. Several
+   queries share that one allowance rather than each getting it, so a
+   two-part question doesn't crowd out the tool rounds. Numbered [1]..[n].
 3. **Answer** — streamed from the preset's chat model, citing passages as
    [n]. If the preset has tools on, the model may call a `search_documents`
    tool for more passages (up to `CHAT_MAX_TOOL_ROUNDS`, within
@@ -376,8 +378,10 @@ accounts are real, but passwords over a LAN want TLS in front first.
    are reported as `invalid_citations`.
 
 The instructions the model gets are in `services/query/prompts/` —
-`system.md` always, `tools.md` when tools are on. Edit them freely; they're
-read on every question.
+`planner.md` for step 1, `system.md` always and `tools.md` when tools are on,
+plus `no_search.md` when the message needs no documents, `no_sources.md` when
+the search came back empty, and `title.md` for conversation titles. Edit them
+freely; they're read on every question.
 
 **Presets.** `everyday` and `hard` map to `CHAT_MODEL_EVERYDAY` /
 `CHAT_MODEL_HARD`, each with its own `CHAT_TOOLS_*` and `CHAT_THINK_*`. By
@@ -396,7 +400,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `GET /api/workspaces/{id}/conversations` | chats in this workspace |
 | `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?, workspace_id?}`; `library_ids` only outside a workspace, 422 otherwise), list |
 | `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete |
-| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `rewrite`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error`, `stopped` |
+| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `user`, `plan`, `searching`, `sources`, `thinking`, `token`, `done` (message id, cited numbers, all sources, timings), `title` (after the first answer), `error`, `stopped` |
 | `POST /api/conversations/{id}/stop` | stops the conversation's turn -- the one streaming and any queued behind it → `{stopped: n}` (0 if it had already finished). The turn's own stream ends with `stopped` (`{message_id, answer, cited}`; `{}` if it never left the queue), and the partial answer is kept with status `stopped`. Closing the stream alone doesn't stop a turn |
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
 | `GET /api/documents` | processed documents you can read (admins: all), your files waiting in the inbox (admins: everyone's), upload-ingest status |
@@ -791,7 +795,7 @@ heading tests generate PDFs on the fly in the standard fonts (Helvetica-Bold,
 Times-Italic…), so style measurement runs on real renders. Covered: heading
 levels and cleanup, page triage, the ingest pipeline around docling, sibling
 chunk merging, embed retries, section expansion and thresholds in
-retrieval, the chat pipeline (rewrite, source budget, tool rounds,
+retrieval, the chat pipeline (planning, source budget, tool rounds,
 citations), chat history storage, the OpenAI adapter's helpers, the
 knowledge-base listing tool, the admission queue and ingest quotas, and
 accounts — library ownership and sharing, the highest role winning across a

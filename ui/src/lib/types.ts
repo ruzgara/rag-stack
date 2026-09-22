@@ -212,7 +212,11 @@ export interface TurnStats {
   first_token_s?: number | null;
   total_s?: number;
   source_tokens?: number;
-  rewrite_s?: number;
+  plan_s?: number;
+  /** Only present, and only true, when the planner didn't answer. */
+  plan_failed?: boolean;
+  /** How many of search_queries the planner wrote; the rest are the tool's. */
+  auto_queries?: number;
   search_s?: number;
   listed_documents?: number;
   context_used?: number;
@@ -262,7 +266,7 @@ export type Message =
 export type TurnEvent =
   | { type: "queued"; position: number }
   | { type: "user"; id: string }
-  | { type: "rewrite"; query: string; search: boolean }
+  | { type: "plan"; queries: string[]; search: boolean; failed?: boolean }
   | { type: "searching"; query: string; found_by: "auto" | "tool" }
   | { type: "sources"; sources: Source[] }
   | { type: "listing"; document: string }

@@ -2,10 +2,12 @@
 The chat pipeline behind both APIs (native and OpenAI-compatible).
 
 One turn:
-  1. Rewrite: the chat model decides whether the message needs a search at
-     all ("hello", "thanks", "make that shorter" don't) and, with earlier
-     history, turns it into a standalone search query ("and for Level 1?" ->
-     "RSF factor for Level 1 assets").
+  1. Plan (prompts/planner.md): the chat model decides whether the message
+     needs a search at all ("hello", "thanks", "make that shorter" don't)
+     and, with earlier history, writes the standalone search queries ("and
+     for Level 1?" -> "RSF factor for Level 1 assets"). Usually one; up to
+     CHAT_MAX_QUERIES when the message asks about several distinct things,
+     which share the auto-search token budget between them.
   2. Auto-search: retrieve() returns the passages the reranker scores
      relevant (RAG_RERANK_MIN_SCORE), whole sections where several chunks of
      one section match; they're taken best first until
@@ -30,7 +32,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
 import httpx
 
@@ -93,8 +95,30 @@ _CITE_ITEM = r"\d+(?:\s*[-–]\s*\d+)?"
 CITATION_RE = re.compile(rf"\[({_CITE_ITEM}(?:\s*[,;]\s*{_CITE_ITEM})*)\]")
 
 
+def prompt_text(name: str, **fields: object) -> str:
+    """One of the files in prompts/, ready to drop into a message. Read on
+    every use, like the system prompts, so edits take effect without a restart.
+    `fields` fill {placeholders}; plain .format() isn't used, so a prompt can
+    contain braces of its own (a JSON example, say) without escaping them."""
+    text = (PROMPTS / name).read_text(encoding="utf-8").strip()
+    for key, value in fields.items():
+        text = text.replace("{" + key + "}", str(value))
+    return text
+
+
 class ChatError(Exception):
     pass
+
+
+class Plan(NamedTuple):
+    """plan_search's result. `queries` holds at least one query whenever
+    `search` is set. `failed` means the model never answered -- the one query
+    is the user's message verbatim, not a considered decision to leave it
+    alone, so a follow-up like "what are some challenges" goes to search with
+    its subject still missing."""
+    search: bool
+    queries: list[str]
+    failed: bool
 
 
 @dataclass(frozen=True)
@@ -112,7 +136,8 @@ class ChatConfig:
     default_preset: str
     temperature: float
     history_max_tokens: int
-    rewrite: bool
+    plan: bool
+    max_queries: int
     initial_sources: int
     auto_source_tokens: int
     tool_results: int
@@ -140,13 +165,17 @@ class ChatConfig:
         rounds = int(env.get("CHAT_MAX_TOOL_ROUNDS") or 2)
         if rounds < 0:
             raise ValueError(f"CHAT_MAX_TOOL_ROUNDS must be >= 0, got {rounds}")
+        max_queries = int(env.get("CHAT_MAX_QUERIES") or 2)
+        if max_queries < 1:
+            raise ValueError(f"CHAT_MAX_QUERIES must be >= 1, got {max_queries}")
         return cls(
             ollama_url=f"http://127.0.0.1:{env.get('OLLAMA_PORT', '11434')}",
             presets=presets,
             default_preset=default,
             temperature=_float(env, "CHAT_TEMPERATURE", "0.3"),
             history_max_tokens=_int(env, "CHAT_HISTORY_MAX_TOKENS", "8000"),
-            rewrite=_bool(env, "CHAT_REWRITE", "true"),
+            plan=_bool(env, "CHAT_PLAN", "true"),
+            max_queries=max_queries,
             initial_sources=_int(env, "CHAT_INITIAL_SOURCES", "10"),
             auto_source_tokens=_int(env, "CHAT_AUTO_SOURCE_TOKENS", "3500"),
             tool_results=_int(env, "CHAT_TOOL_RESULTS", "6"),
@@ -320,32 +349,37 @@ class ChatService:
 
     # ------------------------------------------------------------ pipeline --
 
-    def rewrite_query(self, preset: Preset, history: list[dict], question: str) -> tuple[bool, str]:
+    def plan_search(self, preset: Preset, history: list[dict], question: str) -> Plan:
         """Whether the message needs a document search, and the standalone
-        search query. Falls back to searching the message as-is."""
+        queries to run. Falls back to searching the message as-is, with
+        failed=True so the caller can say so rather than leaving a bad
+        search looking like a deliberate one."""
         recent = history[-6:]
         transcript = ("\n".join(f"{m['role'].upper()}: {m['content'][:1500]}" for m in recent)
                       or "(none — this is the first message)")
-        prompt = (
-            "You prepare the user's latest message for a document search.\n\n"
-            "1. search: false only if the message can be answered from the conversation alone without new "
-            "information from the documents — greetings, thanks, small talk, or requests to reformat, shorten, "
-            "translate or explain the previous answer. Otherwise true. When unsure, true.\n"
-            "2. query: the latest message rewritten as a standalone search query. Resolve references to earlier "
-            "messages (\"it\", \"that\", \"and for X?\") using the conversation. Keep names, numbers and "
-            "technical terms exactly. Keep the language of the latest message. If it is already standalone, "
-            "return it unchanged.\n\n"
-            f"Conversation:\n{transcript}\n\nLatest message: {question}"
-        )
-        schema = {"type": "object", "properties": {"search": {"type": "boolean"}, "query": {"type": "string"}},
-                  "required": ["search", "query"]}
+        prompt = (f"{prompt_text('planner.md', max_queries=self.cfg.max_queries)}\n\n"
+                  f"Conversation:\n{transcript}\n\nLatest message: {question}")
+        schema = {"type": "object",
+                  "properties": {"search": {"type": "boolean"},
+                                 "queries": {"type": "array", "items": {"type": "string"}}},
+                  "required": ["search", "queries"]}
+        failed, queries = False, []
         try:
             resp = self._chat(preset.model, [{"role": "user", "content": prompt}], temperature=0, fmt=schema)
             out = json.loads(resp["message"]["content"])
-            search, query = out.get("search") is not False, str(out.get("query") or "").strip()
-        except (ChatError, httpx.HTTPError, json.JSONDecodeError, KeyError, AttributeError):
-            search, query = True, ""
-        return search, query or question
+            search = out.get("search") is not False
+            raw = out.get("queries")
+            # A model that ignores the schema and answers with a bare string
+            # is still telling us what to search for.
+            for item in ([raw] if isinstance(raw, str) else raw or []):
+                q = str(item).strip()
+                # The planner is told not to repeat itself; this enforces
+                # it, since the same search twice only costs time.
+                if q and q.casefold() not in {seen.casefold() for seen in queries}:
+                    queries.append(q)
+        except (ChatError, httpx.HTTPError, json.JSONDecodeError, KeyError, AttributeError, TypeError):
+            search, queries, failed = True, [], True
+        return Plan(search, queries[:self.cfg.max_queries] or [question], failed)
 
     def _search(self, query: str, limit: int, seen: set[str], sources: list[Source], found_by: str,
                 budget: list[int], max_tokens: int | None = None, doc_shas: set[str] | None = None) -> list[Source]:
@@ -371,7 +405,7 @@ class ChatService:
     def run_turn(self, question: str, history: list[dict], preset_name: str | None = None,
                  extra_system: str | None = None, doc_shas: set[str] | None = None,
                  library_overview: list[dict] | None = None) -> Iterator[dict]:
-        """Yields events: rewrite, searching, sources, listing, thinking, token, done.
+        """Yields events: plan, searching, sources, listing, thinking, token, done.
         The done event carries the TurnResult. `doc_shas` restricts every
         search and the document listing to a library scope (None: every
         indexed document; empty: none) -- see Retriever.search. `library_overview`
@@ -383,26 +417,39 @@ class ChatService:
         t_start = time.monotonic()
         history = trim_history(history, self.cfg.history_max_tokens)
 
-        # 1. Decide whether the message needs a search at all, and rewrite a
-        #    follow-up into a standalone search query.
-        query, do_search = question, True
-        if self.cfg.rewrite:
+        # 1. Decide whether the message needs a search at all, and write the
+        #    standalone queries for it.
+        queries, do_search = [question], True
+        if self.cfg.plan:
             t0 = time.monotonic()
-            do_search, query = self.rewrite_query(preset, history, question)
-            result.stats["rewrite_s"] = round(time.monotonic() - t0, 2)
-            yield {"type": "rewrite", "query": query, "search": do_search}
+            do_search, queries, failed = self.plan_search(preset, history, question)
+            result.stats["plan_s"] = round(time.monotonic() - t0, 2)
+            # Only recorded when it went wrong, so a good turn stays unmarked.
+            if failed:
+                result.stats["plan_failed"] = True
+            yield {"type": "plan", "queries": queries, "search": do_search, "failed": failed}
 
         # 2. Auto-search.
         seen: set[str] = set()
         budget = [self.cfg.max_source_tokens]
         if do_search:
-            yield {"type": "searching", "query": query, "found_by": "auto"}
             t0 = time.monotonic()
-            new = self._search(query, self.cfg.initial_sources, seen, result.sources, "auto", budget,
-                               self.cfg.auto_source_tokens, doc_shas)
+            # Planned queries share one turn's worth of sources rather than
+            # getting CHAT_AUTO_SOURCE_TOKENS each, so asking about two things
+            # doesn't crowd out the tool rounds that follow. The cost is a
+            # smaller allowance per query: a long passage that would have
+            # fitted a one-query turn can be skipped on a two-query one.
+            each = max(1, self.cfg.auto_source_tokens // len(queries))
+            for q in queries:
+                yield {"type": "searching", "query": q, "found_by": "auto"}
+                new = self._search(q, self.cfg.initial_sources, seen, result.sources, "auto", budget,
+                                   each, doc_shas)
+                result.search_queries.append(q)
+                yield {"type": "sources", "sources": [asdict(s) for s in new]}
             result.stats["search_s"] = round(time.monotonic() - t0, 2)
-            result.search_queries.append(query)
-            yield {"type": "sources", "sources": [asdict(s) for s in new]}
+            # How many of search_queries were the planner's, so a stored turn
+            # can tell them from the tool's.
+            result.stats["auto_queries"] = len(queries)
         result.stats["auto_search"] = do_search
 
         # 3. Answer, with optional tool rounds.
@@ -413,19 +460,17 @@ class ChatService:
         if extra_system:
             system += f"\n\nAdditional instructions:\n{extra_system}"
         if not do_search:
-            context = ("Sources: none — no document search was run, because this message doesn't need the "
-                       "documents. Reply to it directly and briefly; don't add citations, and don't mention "
-                       "sources or documents unless asked.")
+            context = prompt_text("no_search.md")
         elif result.sources:
             context = "Sources:\n\n" + "\n\n".join(s.for_prompt() for s in result.sources)
         else:
-            context = ("Sources: none — the document search found no relevant passages for this question. "
-                       "Tell the user briefly that the documents don't cover it; don't answer from general "
-                       "knowledge unless you say so, and don't suggest searches to the user.")
+            context = prompt_text("no_sources.md")
         user_turn = f"{context}\n\n---\n\nQuestion: {question}"
         if tools_on and not do_search:
-            user_turn += ("\n\n(If answering this does need information from the documents after all, "
-                          "call search_documents.)")
+            # The planner's call not to search is a guess made before seeing
+            # any passages, so the answering model gets to overrule it.
+            user_turn += ("\n\n(That judgement can be wrong. If answering this does need the documents "
+                          "after all, call search_documents instead of answering without them.)")
         elif tools_on:
             # Small models weigh the end of the prompt most; the system
             # prompt's tool guidance alone gets ignored in favour of refusing.
@@ -538,9 +583,7 @@ class ChatService:
 
     def generate_title(self, preset_name: str | None, question: str, answer: str) -> str | None:
         preset = self.cfg.preset(preset_name)
-        prompt = ("Write a short title (at most 6 words, no quotes, no final period) for a conversation that "
-                  f"starts with this exchange. Use the language of the question.\n\nQuestion: {question}\n\n"
-                  f"Answer: {answer[:1500]}")
+        prompt = f'{prompt_text("title.md")}\n\nQuestion: {question}\n\nAnswer: {answer[:1500]}'
         try:
             resp = self._chat(preset.model, [{"role": "user", "content": prompt}], temperature=0,
                               fmt={"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]})
