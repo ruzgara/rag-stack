@@ -283,3 +283,20 @@ describe("processSummary", () => {
     expect(processSummary(t)).toBe("2 searches · 1 source cited · 4.2s");
   });
 });
+
+describe("applyEvent: citation", () => {
+  it("numbers the source it names, so the streaming answer can render it", () => {
+    const t = newTurn("k", "q");
+    // Mid-stream a newly retrieved source has no number yet.
+    applyEvent(t, { type: "sources", sources: [{ ...src(1), doc_number: null, chunk_number: null }] });
+    applyEvent(t, { type: "citation", handle: handleFor(1), doc: 2, chunk: 5 });
+    expect([t.sources[0].doc_number, t.sources[0].chunk_number]).toEqual([2, 5]);
+  });
+
+  it("ignores a handle it has no source for rather than inventing one", () => {
+    const t = newTurn("k", "q");
+    applyEvent(t, { type: "sources", sources: [src(1)] });
+    applyEvent(t, { type: "citation", handle: handleFor(9), doc: 1, chunk: 1 });
+    expect(t.sources).toHaveLength(1);
+  });
+});

@@ -12,6 +12,7 @@ never import `db` back.
   assign_numbers  handles -> their [doc:chunk] numbers
   render_answer   handles -> `[doc:chunk]`, for surfaces that don't know handles
   StreamingRenderer   render_answer, but token by token
+  CitationScanner numbers citations as they stream, for the live UI
 """
 
 from __future__ import annotations
@@ -361,16 +362,59 @@ def _render_item(item: Item, ref_of: Callable[[str], tuple[int, int] | None]) ->
     return ""
 
 
+class _BracketStream:
+    """Splits a stream of tokens into plain text and complete `[...]`
+    brackets, holding back once it sees `[` until the bracket closes -- so a
+    handle split across two tokens is never read half-written. A `[` with no
+    `]` within HOLD_LIMIT characters was never a citation, and is released as
+    the prose it turned out to be."""
+
+    HOLD_LIMIT = 64
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, text: str) -> list[tuple[bool, str]]:
+        """(is_bracket, piece) in order, for everything `text` completes.
+        Whatever is still being held back stays for the next call."""
+        self._buf += text
+        out: list[tuple[bool, str]] = []
+        while True:
+            start = self._buf.find("[")
+            if start == -1:
+                if self._buf:
+                    out.append((False, self._buf))
+                self._buf = ""
+                return out
+            if start:
+                out.append((False, self._buf[:start]))
+            end = self._buf.find("]", start + 1)
+            if end == -1:
+                if len(self._buf) - start > self.HOLD_LIMIT:
+                    out.append((False, self._buf[start:]))
+                    self._buf = ""
+                else:
+                    self._buf = self._buf[start:]
+                return out
+            out.append((True, self._buf[start:end + 1]))
+            self._buf = self._buf[end + 1:]
+
+    def flush(self) -> str:
+        # Whatever's left is an unterminated '[' -- the stream ended
+        # mid-citation, so there's no closing bracket to wait for; it's
+        # plain text now.
+        out, self._buf = self._buf, ""
+        return out
+
+
 class StreamingRenderer:
     """render_answer, fed one token at a time (openai_compat's streamed
-    reply): holds back once it sees `[` until the bracket closes, so a
-    handle split across two tokens is never emitted half-rendered. Owns its
-    own CitationNumbers and allocates in first-citation order as brackets
-    close -- provably the same order a post-hoc resolve()+assign_numbers()
-    pass over the finished text would use, so streamed and non-streamed
-    output can't disagree."""
+    reply). Owns its own CitationNumbers and allocates in first-citation
+    order as brackets close -- provably the same order a post-hoc
+    resolve()+assign_numbers() pass over the finished text would use, so
+    streamed and non-streamed output can't disagree."""
 
-    HOLD_LIMIT = 64  # a '[' with no ']' within this many chars isn't a citation
+    HOLD_LIMIT = _BracketStream.HOLD_LIMIT
 
     def __init__(self, sha_of: Mapping[str, str] | None = None, numbers: CitationNumbers | None = None):
         # `sha_of if sha_of is not None else {}`, not `sha_of or {}` -- a
@@ -380,35 +424,14 @@ class StreamingRenderer:
         # the moment it's empty, which is exactly when that caller needs it.
         self._sha_of = sha_of if sha_of is not None else {}
         self._numbers = numbers if numbers is not None else CitationNumbers()
-        self._buf = ""
+        self._brackets = _BracketStream()
 
     def feed(self, text: str) -> str:
-        self._buf += text
-        out = []
-        while True:
-            start = self._buf.find("[")
-            if start == -1:
-                out.append(self._buf)
-                self._buf = ""
-                return "".join(out)
-            out.append(self._buf[:start])
-            end = self._buf.find("]", start + 1)
-            if end == -1:
-                if len(self._buf) - start > self.HOLD_LIMIT:
-                    out.append(self._buf[start:])
-                    self._buf = ""
-                else:
-                    self._buf = self._buf[start:]
-                return "".join(out)
-            out.append(self._render_bracket(self._buf[start:end + 1]))
-            self._buf = self._buf[end + 1:]
+        return "".join(self._render_bracket(piece) if is_bracket else piece
+                       for is_bracket, piece in self._brackets.feed(text))
 
     def flush(self) -> str:
-        # Whatever's left is an unterminated '[' -- the stream ended
-        # mid-citation, so there's no closing bracket to render; pass it
-        # through as the plain text it now is.
-        out, self._buf = self._buf, ""
-        return out
+        return self._brackets.flush()
 
     def _render_bracket(self, bracket: str) -> str:
         citations = parse_citations(bracket)
@@ -432,3 +455,40 @@ class StreamingRenderer:
         if item.ref is not None:
             return f"[{item.ref[0]}:{item.ref[1]}]"
         return ""
+
+
+class CitationScanner:
+    """Numbers an answer's citations while it streams, so a reader sees
+    `[1:3]` the moment the bracket closes instead of a placeholder that only
+    resolves at the end of the turn.
+
+    Allocating mid-stream is safe because stream order IS first-citation
+    order: every number handed out here is the one the end-of-turn
+    assign_numbers() would have given, and assign() is idempotent, so that
+    final pass only confirms what happened here. `sha_of` is a lookup rather
+    than a dict because the turn's sources grow as tool rounds add to them."""
+
+    def __init__(self, numbers: CitationNumbers, sha_of: Callable[[str], str | None]):
+        self._numbers = numbers
+        self._sha_of = sha_of
+        self._brackets = _BracketStream()
+
+    def feed(self, text: str) -> list[tuple[str, int, int]]:
+        """(handle, doc, chunk) for citations that got a number from this
+        text. A handle already numbered -- cited earlier in this answer, or
+        in an earlier turn -- yields nothing, since the reader's copy of the
+        map already has it."""
+        out = []
+        for is_bracket, piece in self._brackets.feed(text):
+            if not is_bracket:
+                continue
+            for citation in parse_citations(piece):
+                for item in citation.items:
+                    if item.handle is None or self._numbers.ref(item.handle) is not None:
+                        continue
+                    doc_sha = self._sha_of(item.handle)
+                    if doc_sha is None:  # not one of this turn's passages; resolve() will judge it
+                        continue
+                    doc, chunk = self._numbers.assign(item.handle, doc_sha)
+                    out.append((item.handle, doc, chunk))
+        return out

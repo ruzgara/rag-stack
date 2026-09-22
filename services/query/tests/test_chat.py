@@ -582,3 +582,40 @@ def test_citing_documents_out_of_retrieval_order_numbers_by_citation_order():
 
     assert result.refs[b_handle][0] == 1
     assert result.refs[a_handle][0] == 2
+
+
+def test_a_citation_is_numbered_while_it_streams_not_only_at_done():
+    """The reader sees [1:3] as the bracket closes. The `citation` events
+    carry exactly the numbers the finished turn ends up with -- allocating
+    mid-stream is only safe because stream order IS first-citation order."""
+    a_handle, b_handle = handle_for("docA", 0), handle_for("docB", 0)
+    ollama = FakeOllama(plan='{"search": true, "queries": ["q"]}',
+                        # split across tokens, so a handle spans two of them
+                        streams=[answer("First [", f"{b_handle}] then [{a_handle[:3]}", f"{a_handle[3:]}].")])
+    svc, _, _ = service({"q": [make_hit("a", ["A"], doc_sha="docA", chunk_index=0),
+                               make_hit("b", ["B"], doc_sha="docB", chunk_index=0)]}, ollama)
+    events, result = run(svc, "q")
+
+    streamed = [(e["handle"], e["doc"], e["chunk"]) for e in events if e["type"] == "citation"]
+    assert streamed == [(b_handle, 1, 1), (a_handle, 2, 1)]
+    assert result.refs == {b_handle: (1, 1), a_handle: (2, 1)}
+    # The number lands before the token whose text closes that bracket, so
+    # the reader's map is never behind the text it has to render.
+    first_citation = next(i for i, e in enumerate(events) if e["type"] == "citation")
+    closing_token = next(i for i, e in enumerate(events) if e["type"] == "token" and "]" in e["text"])
+    assert first_citation < closing_token
+
+
+def test_a_handle_already_numbered_earlier_streams_no_citation_event():
+    """It is already in the reader's map -- it arrived with the carried
+    source -- so re-citing it needs no event."""
+    handle = handle_for("docA", 0)
+    ollama = FakeOllama(plan='{"search": false, "queries": []}',
+                        streams=[answer(f"As before [{handle}].")])
+    svc, _, _ = service({}, ollama)
+    events, result = run(svc, "q", numbers=CitationNumbers.from_rows(
+        [{"handle": handle, "doc_sha": "docA", "doc_number": 1, "chunk_number": 1}]),
+        earlier=[earlier_row(handle, "docA", 0, 1, 1)])
+
+    assert [e for e in events if e["type"] == "citation"] == []
+    assert result.cited == [handle] and result.refs[handle] == (1, 1)

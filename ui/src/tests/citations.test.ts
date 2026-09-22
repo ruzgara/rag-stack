@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseBracket, parseCitations, buildCiteMap, linkifyCitations } from "../lib/citations";
+import { parseBracket, parseCitations, buildCiteMap, linkifyCitations, trimPartialCitation } from "../lib/citations";
 
 // This table is duplicated verbatim in services/query/tests/test_citations.py
 // (HANDLE_GRAMMAR + REF_GRAMMAR) -- a mirror divergence between the two
@@ -171,12 +171,38 @@ describe("linkifyCitations", () => {
     expect(span?.textContent).not.toContain("Sz29zz");
   });
 
-  it("while pending, every citation is a neutral marker with no data-handle", () => {
+  it("while pending, a handle the server has numbered still renders as its [doc:chunk]", () => {
+    // Numbers arrive on their own `citation` events as each bracket closes,
+    // so mid-stream is the normal case for a resolvable citation, not a
+    // reason to withhold it.
     const root = render("<p>[Sk29fp]</p>");
     linkifyCitations(root, known, true);
+    const span = root.querySelector(".cite");
+    expect(span?.textContent).toBe("[1:3]");
+    expect(span?.classList.contains("pending")).toBe(false);
+  });
+
+  it("while pending, an unnumbered handle is a neutral marker, never the handle", () => {
+    const root = render("<p>[Sm4p2q]</p>");
+    linkifyCitations(root, known, true);
     const span = root.querySelector(".cite.pending");
-    expect(span?.textContent).not.toContain("Sk29fp");
+    expect(span?.textContent).not.toContain("Sm4p2q");
     expect(span?.hasAttribute("data-handle")).toBe(false);
+  });
+
+  it("the same unnumbered handle is invalid, not pending, once the answer is done", () => {
+    const root = render("<p>[Sm4p2q]</p>");
+    linkifyCitations(root, known, false);
+    const span = root.querySelector(".cite.invalid");
+    expect(span?.textContent).not.toContain("Sm4p2q");
+  });
+
+  it("holds back a bracket still being typed so its handle never flashes", () => {
+    expect(trimPartialCitation("The floor is 100% [Sk29")).toBe("The floor is 100% ");
+    expect(trimPartialCitation("The floor is 100% [Sk29fp]")).toBe("The floor is 100% [Sk29fp]");
+    // Past the hold limit a '[' was never a citation, so prose keeps it.
+    const prose = `see [${"x".repeat(80)}`;
+    expect(trimPartialCitation(prose)).toBe(prose);
   });
 
   it("never builds markup by string concatenation (no attribute injection)", () => {

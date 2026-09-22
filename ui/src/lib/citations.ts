@@ -144,6 +144,15 @@ export function parseBracket(inner: string): Item[] | null {
   return deduped;
 }
 
+/** Drops a trailing unclosed `[...` from a still-streaming answer, so the
+ *  few tokens between `[` and `]` don't flash the raw handle at the reader
+ *  before the bracket closes and becomes a citation. Mirrors the server's
+ *  _BracketStream hold-back, including its 64-character give-up: past that
+ *  the `[` was never a citation and is left alone as the prose it is. */
+export function trimPartialCitation(text: string): string {
+  return text.replace(/\[[^[\]\n]{0,63}$/, "");
+}
+
 export function parseCitations(text: string): Citation[] {
   const out: Citation[] = [];
   const re = /\[([^[\]\n]{1,200})\]/g;
@@ -191,11 +200,12 @@ function skipped(el: Element, root: ParentNode): boolean {
  *  block and a `[2]` inside an href are untouched. Every node is built with
  *  createElement/textContent -- nothing is ever concatenated into markup.
  *
- *  `pending`: while streaming, nothing has a number yet (that arrives with
- *  `done`), so every recognized citation becomes a neutral, unclickable
- *  placeholder instead -- never the raw handle. `Markdown.finalize()`
- *  re-renders the whole answer at `done`, replacing these wholesale, so no
- *  pending span ever needs to be upgraded in place. */
+ *  `pending`: the answer is still streaming. Numbers arrive on their own
+ *  `citation` events as each bracket closes, so nearly every citation is
+ *  already resolvable here and renders as the real [doc:chunk]; `pending`
+ *  only decides what an UNresolved one looks like -- a neutral placeholder
+ *  while there's still a chance it gets numbered, a struck-through invalid
+ *  marker once the answer is done. Never the raw handle, either way. */
 export function linkifyCitations(root: ParentNode, map: CiteMap, pending: boolean): void {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode: (n) =>
@@ -220,21 +230,14 @@ function replaceIn(node: Text, map: CiteMap, pending: boolean): void {
   let last = 0;
   for (const citation of citations) {
     if (citation.start > last) frag.append(text.slice(last, citation.start));
-    if (pending) {
-      const span = document.createElement("span");
-      span.className = "cite pending";
-      span.textContent = "[…]"; // a neutral marker -- never the handle
-      frag.append(span);
-    } else {
-      for (const item of citation.items) frag.append(renderItem(item, map));
-    }
+    for (const item of citation.items) frag.append(renderItem(item, map, pending));
     last = citation.end;
   }
   if (last < text.length) frag.append(text.slice(last));
   node.replaceWith(frag);
 }
 
-function renderItem(item: Item, map: CiteMap): HTMLSpanElement {
+function renderItem(item: Item, map: CiteMap, pending: boolean): HTMLSpanElement {
   const span = document.createElement("span");
   span.tabIndex = 0;
   span.setAttribute("role", "button");
@@ -255,6 +258,12 @@ function renderItem(item: Item, map: CiteMap): HTMLSpanElement {
     span.dataset.handle = handle;
     span.dataset.ref = `${ref[0]}:${ref[1]}`;
     span.textContent = `[${ref[0]}:${ref[1]}]`; // textContent, never innerHTML
+  } else if (pending) {
+    // Still streaming, so this one may yet be numbered -- a neutral marker
+    // rather than calling it invalid before the answer has finished. No
+    // data-handle, so it isn't clickable either.
+    span.className = "cite pending";
+    span.textContent = "[…]";
   } else {
     // Invalid: no data-handle, so click/hover handlers ignore it by
     // construction rather than by a class check. A malformed ref or orphan

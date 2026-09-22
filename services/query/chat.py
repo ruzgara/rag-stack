@@ -41,7 +41,8 @@ from typing import Iterator, NamedTuple
 
 import httpx
 
-from citations import CitationNumbers, assign_numbers, handle_for, parse_citations, resolve
+from citations import (CitationNumbers, CitationScanner, assign_numbers, handle_for, parse_citations,
+                       resolve)
 from library import Library
 from retrieval import Hit, Retriever, _bool, _float, _int, estimate_tokens, load_env
 
@@ -451,7 +452,8 @@ class ChatService:
                  extra_system: str | None = None, doc_shas: set[str] | None = None,
                  library_overview: list[dict] | None = None, numbers: CitationNumbers | None = None,
                  earlier: list[dict] | None = None) -> Iterator[dict]:
-        """Yields events: plan, searching, sources, listing, thinking, token, done.
+        """Yields events: plan, searching, sources, listing, thinking, citation,
+        token, done.
         The done event carries the TurnResult. `doc_shas` restricts every
         search and the document listing to a library scope (None: every
         indexed document; empty: none) -- see Retriever.search. `library_overview`
@@ -576,6 +578,11 @@ class ChatService:
         round_prompt_tokens = round_eval_tokens = 0
         t_first_token = None
         parts: list[str] = []
+        # Numbers each citation as its bracket closes, so the reader sees
+        # [1:3] while the answer is still being written rather than a
+        # placeholder that only resolves at `done`. Step 4's assign_numbers
+        # then only confirms what this handed out -- see CitationScanner.
+        scanner = CitationScanner(numbers, lambda h: next((s.doc_sha for s in result.sources if s.handle == h), None))
         while True:
             offer_tools = tools_on and rounds < self.cfg.max_tool_rounds and budget[0] > 0
             content, tool_calls = "", []
@@ -588,6 +595,10 @@ class ChatService:
                     if t_first_token is None:
                         t_first_token = time.monotonic()
                     content += msg["content"]
+                    # Before the token, so the number is in the reader's map
+                    # by the time the text citing it arrives.
+                    for handle, doc_n, chunk_n in scanner.feed(msg["content"]):
+                        yield {"type": "citation", "handle": handle, "doc": doc_n, "chunk": chunk_n}
                     yield {"type": "token", "text": msg["content"]}
                 tool_calls.extend(msg.get("tool_calls") or [])
                 if chunk.get("done"):

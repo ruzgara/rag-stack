@@ -167,6 +167,19 @@ export function applyEvent(t: Turn, ev: TurnEvent): void {
     }
     case "title":
       break; // the conversation's, not the turn's -- the caller handles it
+    case "citation": {
+      // Onto the source itself rather than a map of its own: the citation
+      // map is derived from t.sources, so numbering the source is what makes
+      // the answer render [doc:chunk] instead of a placeholder. The source
+      // always arrived first -- passages are streamed before the tokens
+      // citing them -- so a miss here would mean a server-side bug, not a race.
+      const src = t.sources.find((s) => s.handle === ev.handle);
+      if (src) {
+        src.doc_number = ev.doc;
+        src.chunk_number = ev.chunk;
+      }
+      break;
+    }
     case "error":
       t.status = "error";
       t.error = ev.error;

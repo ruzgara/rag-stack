@@ -78,12 +78,20 @@ describe("StreamingMarkdown", () => {
     expect(root.querySelector("pre code")).not.toBeNull();
   });
 
-  it("while pending, a citation renders as a neutral marker -- never the handle", () => {
+  it("while pending, a numbered citation already renders as its [doc:chunk]", () => {
     const root = document.createElement("div");
     new StreamingMarkdown(root).update("Cites [Sk29fp] so far.", MAP, true);
+    const cite = root.querySelector(".cite");
+    expect(cite?.textContent).toBe("[1:3]");
+    expect(root.textContent).not.toContain("Sk29fp");
+  });
+
+  it("while pending, an unnumbered citation is a neutral marker -- never the handle", () => {
+    const root = document.createElement("div");
+    new StreamingMarkdown(root).update("Cites [Sm4p2q] so far.", MAP, true);
     const cite = root.querySelector(".cite.pending");
     expect(cite).not.toBeNull();
-    expect(cite?.textContent).not.toContain("Sk29fp");
+    expect(cite?.textContent).not.toContain("Sm4p2q");
     expect(cite?.hasAttribute("data-handle")).toBe(false);
   });
 

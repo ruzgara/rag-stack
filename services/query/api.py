@@ -1236,6 +1236,9 @@ def send_message(conv_id: str, body: NewMessage, user: User = CurrentUser) -> St
       listing   {document}: the model asked what the knowledge base holds
       sources   {sources: [...]}: passages added, each with its own citation identifier (handle)
       thinking  {text}: reasoning tokens (presets with thinking on)
+      citation  {handle, doc, chunk}: a handle got its reader-facing number,
+                sent as the bracket closes so the client can render [doc:chunk]
+                mid-answer instead of waiting for done
       token     {text}: answer tokens
       done      {message_id, answer, cited, refs, invalid_citations, sources, ...}: cited and
                 invalid_citations are handles; refs maps each cited handle to the

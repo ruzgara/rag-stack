@@ -5,6 +5,7 @@ import pytest
 from citations import (
     ALPHABET,
     CitationNumbers,
+    CitationScanner,
     HANDLE_RE,
     StreamingRenderer,
     assign_numbers,
@@ -318,3 +319,43 @@ def test_assign_numbers_is_idempotent_across_calls():
     first = assign_numbers(["Sh1", "Sh2"], {"Sh1": "sha-a", "Sh2": "sha-b"}, numbers)
     second = assign_numbers(["Sh2", "Sh1"], {"Sh1": "sha-a", "Sh2": "sha-b"}, numbers)
     assert first == second
+
+
+def test_scanner_numbers_in_stream_order_whatever_the_token_boundaries():
+    """Same allocation however the handles are split across tokens: the
+    scanner holds back from `[` until the bracket closes, so a handle never
+    gets read half-written."""
+    sha_of = {"Sk29fp": "sha-a", "Sm4p2q": "sha-b"}.get
+    text = "First [Sm4p2q] then [Sk29fp] and [Sm4p2q] again."
+    for size in (1, 3, 7, len(text)):
+        numbers = CitationNumbers()
+        scanner = CitationScanner(numbers, sha_of)
+        out = []
+        for i in range(0, len(text), size):
+            out.extend(scanner.feed(text[i:i + size]))
+        # Sm4p2q is cited first, so its document is 1; the repeat yields
+        # nothing, being numbered already.
+        assert out == [("Sm4p2q", 1, 1), ("Sk29fp", 2, 1)], f"chunk size {size}"
+
+
+def test_scanner_agrees_with_a_post_hoc_assign_numbers_pass():
+    """The invariant the mid-stream numbering rests on: allocating as
+    brackets close gives what resolving the finished text would."""
+    sha_of = {"Sk29fp": "sha-a", "Sm4p2q": "sha-b"}
+    text = "First [Sm4p2q] then [Sk29fp]."
+
+    streamed = CitationNumbers()
+    scanner = CitationScanner(streamed, sha_of.get)
+    live = {h: (d, c) for h, d, c in scanner.feed(text)}
+
+    after = CitationNumbers()
+    cited, _ = resolve(parse_citations(text), after, sha_of)
+    assert live == assign_numbers(cited, sha_of, after)
+
+
+def test_scanner_leaves_a_handle_it_has_no_document_for_unnumbered():
+    """A handle the model invented isn't one of the turn's passages, so it
+    gets no number here -- resolve() judges it invalid at the end instead."""
+    numbers = CitationNumbers()
+    assert CitationScanner(numbers, {}.get).feed("[Sk29fp]") == []
+    assert numbers.ref("Sk29fp") is None

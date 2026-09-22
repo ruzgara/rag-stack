@@ -5,6 +5,7 @@
   // finalize() parse replaces the incremental render.
   import { onDestroy } from "svelte";
   import { StreamingMarkdown } from "../../lib/render";
+  import { trimPartialCitation } from "../../lib/citations";
   import type { CiteMap } from "../../lib/citations";
   import type { TurnStatus } from "../../lib/turns";
 
@@ -31,10 +32,11 @@
           renderer = new StreamingMarkdown(container);
           finalized = false;
         }
-        // Nothing has a number yet mid-stream (that arrives with `done`),
-        // so every citation renders as a neutral placeholder -- never the
-        // raw handle -- until finalize() below replaces it wholesale.
-        renderer.update(answer, map, true);
+        // Numbers arrive on `citation` events as each bracket closes, so a
+        // finished citation already renders as [doc:chunk] here. Only the
+        // bracket currently being typed is held back (trimPartialCitation),
+        // so the handle inside it is never briefly on screen.
+        renderer.update(trimPartialCitation(answer), map, true);
       } else if (!finalized) {
         renderer ??= new StreamingMarkdown(container);
         finalized = true;
@@ -92,6 +94,10 @@
   }
   .md :global(.cite:hover), .md :global(.cite:focus-visible) { background: var(--color-accent-100); }
   .md :global(.cite.invalid) { color: var(--color-accent-2-700); text-decoration: line-through; cursor: help; }
+  /* Not yet numbered: only reachable for a citation the server never sent a
+     number for, so it stays muted and inert rather than inviting a click. */
+  .md :global(.cite.pending) { color: var(--color-neutral-700); cursor: default; }
+  .md :global(.cite.pending:hover) { background: none; }
 
   /* The block cursor at the end of a streaming answer: after the last
      text-bearing element of the tail, or of the stable part if the tail

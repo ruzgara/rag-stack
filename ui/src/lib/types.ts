@@ -281,6 +281,9 @@ export type TurnEvent =
   | { type: "listing"; document: string }
   | { type: "listing_libraries" }
   | { type: "thinking"; text: string }
+  /** A handle got its [doc:chunk] as its bracket closed, so the answer can
+   *  show a real citation while it's still streaming. */
+  | { type: "citation"; handle: string; doc: number; chunk: number }
   | { type: "token"; text: string }
   | {
       type: "done";
