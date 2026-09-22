@@ -17,3 +17,6 @@ __pycache__/
 # query service serves, so it is committed and installing never needs Node.
 ui/node_modules/
 ui/.vite/
+
+# Local design mock — reference for ui/, not published
+design/
