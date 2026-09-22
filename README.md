@@ -362,8 +362,8 @@ ingest and embed run automatically whenever a file lands in `data/inbox/`.
 signed-in caller (see "Accounts, groups and libraries"). Scripts and API
 clients authenticate as a person with a personal token
 (`Authorization: Bearer rsk_...`), or as a shared service account with
-`QUERY_API_KEY`. It still binds to 127.0.0.1: the
-accounts are real, but passwords over a LAN want TLS in front first.
+`QUERY_API_KEY`. It binds to `BIND_ADDR` (default 127.0.0.1): the
+accounts are real, so passwords over a LAN want TLS in front first.
 
 **Each answer:**
 1. **Plan** — one call to the chat model decides whether the message needs a
@@ -530,9 +530,9 @@ Raise `OLLAMA_MAX_LOADED_MODELS`, `OLLAMA_CONTEXT_LENGTH`,
 `OLLAMA_NUM_PARALLEL`, `DOCLING_NUM_THREADS`, `DOCLING_LOC_NUM_WORKERS` in
 `.env` to match the new hardware, and raise Docker Desktop's memory limit
 (Settings → Resources) to something like 16GB. Set `BIND_ADDR=0.0.0.0` if
-other machines on the network should reach Qdrant. The query service ignores
-`BIND_ADDR` and always binds to 127.0.0.1, because it takes passwords;
-putting it on the LAN needs TLS in front first (see "Next" below).
+other machines on the network should reach the query service and Qdrant.
+The query service takes passwords, so beyond a quick test on a trusted LAN,
+put TLS in front of it first (see "Next" below).
 
 ## Uninstall
 

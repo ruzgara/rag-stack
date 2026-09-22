@@ -4,9 +4,9 @@ The rag-stack query service: HTTP API over retrieval, chat and storage.
 Native API (for the rag-stack UI) under /api, OpenAI-compatible API under /v1
 (see openai_compat.py). Run by the com.ragstack.query LaunchAgent:
 
-  uvicorn api:app --host 127.0.0.1 --port $QUERY_PORT
+  uvicorn api:app --host $BIND_ADDR --port $QUERY_PORT
 
-It binds to 127.0.0.1. Every endpoint except /api/health identifies its
+It binds to BIND_ADDR (default 127.0.0.1). Every endpoint except /api/health identifies its
 caller -- a signed session cookie, a proxy header, a personal API token, or
 QUERY_API_KEY as the service account -- and, where it matters, checks what that caller may do
 (see accounts.py: library ownership and sharing, and users.is_admin for

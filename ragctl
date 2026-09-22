@@ -120,6 +120,7 @@ render_template() {
         -e "s#__OLLAMA_PORT__#${OLLAMA_PORT}#g" \
         -e "s#__DOCLING_PORT__#${DOCLING_PORT}#g" \
         -e "s#__QUERY_PORT__#${QUERY_PORT}#g" \
+        -e "s#__BIND_ADDR__#${BIND_ADDR:-127.0.0.1}#g" \
         -e "s#__OLLAMA_CONTEXT_LENGTH__#${OLLAMA_CONTEXT_LENGTH:-32768}#g" \
         -e "s#__OLLAMA_NUM_PARALLEL__#${OLLAMA_NUM_PARALLEL:-4}#g" \
         -e "s#__OLLAMA_MAX_LOADED_MODELS__#${OLLAMA_MAX_LOADED_MODELS:-4}#g" \
