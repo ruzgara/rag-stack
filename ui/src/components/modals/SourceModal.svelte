@@ -13,9 +13,9 @@
 
   interface Props {
     turnKey: string;
-    number: number;
+    handle: string;
   }
-  const { turnKey, number }: Props = $props();
+  const { turnKey, handle }: Props = $props();
 
   const turn = $derived.by(() => {
     for (const v of chat.views.values()) {
@@ -24,8 +24,17 @@
     }
     return null;
   });
-  const source = $derived<Source | null>(turn?.sources.find((s) => s.number === number) ?? null);
-  const numbers = $derived((turn?.sources ?? []).map((s) => s.number).sort((a, b) => a - b));
+  const source = $derived<Source | null>(turn?.sources.find((s) => s.handle === handle) ?? null);
+  // Cited first (in reader order), then uncited -- there's no meaningful
+  // number to sort the latter by, and mixing them by retrieval order would
+  // put an uncited passage ahead of a cited [1:1].
+  const handles = $derived.by(() => {
+    const sources = turn?.sources ?? [];
+    const cited = sources.filter((s) => s.cited)
+      .sort((a, b) => (a.doc_number ?? 0) - (b.doc_number ?? 0) || (a.chunk_number ?? 0) - (b.chunk_number ?? 0));
+    const uncited = sources.filter((s) => !s.cited);
+    return [...cited, ...uncited].map((s) => s.handle);
+  });
 
   let focus = $state(0); // chunk index the viewer is centred on
   let chunks = $state<Chunk[]>([]);
@@ -96,10 +105,10 @@
   }
 
   function otherSource(delta: number): void {
-    const i = numbers.indexOf(number) + delta;
-    if (i < 0 || i >= numbers.length) return;
-    ui.focusSources([numbers[i]], turnKey);
-    ui.replace({ kind: "source", turnKey, number: numbers[i] });
+    const i = handles.indexOf(handle) + delta;
+    if (i < 0 || i >= handles.length) return;
+    ui.focusSources([handles[i]], turnKey);
+    ui.replace({ kind: "source", turnKey, handle: handles[i] });
   }
 
   function onKey(e: KeyboardEvent): void {
@@ -128,7 +137,7 @@
     <p class="muted">This source is no longer available.</p>
   {:else}
     <div class="src-head">
-      <span class="num">[{number}]</span>
+      {#if source.doc_number !== null}<span class="num">[{source.doc_number}:{source.chunk_number}]</span>{/if}
       <div class="titles">
         <h4 id="source-title">{source.filename}</h4>
         <div class="loc">
@@ -137,10 +146,10 @@
         </div>
         <div class="loc muted">found for “{source.query}”</div>
       </div>
-      {#if numbers.length > 1}
+      {#if handles.length > 1}
         <div class="src-nav">
-          <button class="btn btn-ghost btn-sm" onclick={() => otherSource(-1)} disabled={numbers.indexOf(number) === 0} aria-label="Previous source">‹</button>
-          <button class="btn btn-ghost btn-sm" onclick={() => otherSource(1)} disabled={numbers.indexOf(number) === numbers.length - 1} aria-label="Next source">›</button>
+          <button class="btn btn-ghost btn-sm" onclick={() => otherSource(-1)} disabled={handles.indexOf(handle) === 0} aria-label="Previous source">‹</button>
+          <button class="btn btn-ghost btn-sm" onclick={() => otherSource(1)} disabled={handles.indexOf(handle) === handles.length - 1} aria-label="Next source">›</button>
         </div>
       {/if}
       <button class="x" onclick={() => ui.close()} aria-label="Close">×</button>

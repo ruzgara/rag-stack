@@ -2,6 +2,15 @@ import { describe, expect, it } from "vitest";
 import { toTurns, deriveInvalid, applyEvent, newTurn, traceFromStored, processSummary } from "../lib/turns";
 import type { DoneSource, Message } from "../lib/types";
 
+// A deterministic, HANDLE_RE-shaped handle per small integer -- distinct
+// values for distinct `number`s, so tests can still key off a plain int like
+// the old `number` field did, without hand-picking a real handle each time.
+const ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+function handleFor(n: number): string {
+  const c = (i: number) => ALPHABET[(n + i) % ALPHABET.length];
+  return `S${c(0)}2${c(1)}${c(2)}${c(3)}`;
+}
+
 function src(number: number, query = "q", found_by: "auto" | "tool" = "auto"): DoneSource {
   return {
     number,
@@ -15,6 +24,9 @@ function src(number: number, query = "q", found_by: "auto" | "tool" = "auto"): D
     headings: [],
     text: "text",
     rerank_score: null,
+    handle: handleFor(number),
+    doc_number: number,
+    chunk_number: 1,
     cited: true,
   };
 }
@@ -83,15 +95,27 @@ describe("toTurns", () => {
 });
 
 describe("deriveInvalid", () => {
-  // Mirrors chat.py:resolve_citations' split into known/unknown citation numbers.
-  it.each([
-    ["Answer with [1] and [2].", [1], [2]],
-    ["Uses [1-3] but only source 1 exists.", [1], [2, 3]],
-    ["No citations here.", [1], []],
-    ["Cites [1] twice, [1] again.", [1], []],
-  ])("%s", (answer, knownNumbers, expectedInvalid) => {
-    const sources = knownNumbers.map((n) => src(n));
-    expect(deriveInvalid(answer, sources)).toEqual(expectedInvalid);
+  // Mirrors citations.py's resolve(): the invalid half of it. Entries are
+  // handles, "d:c" ref strings, or malformed raw tokens -- never printed
+  // verbatim by a caller (TurnView.svelte only reports a count).
+  it("a known handle resolves, an unknown one is invalid", () => {
+    const known = src(1); // handle = handleFor(1)
+    const bogus = handleFor(99);
+    expect(deriveInvalid(`Answer with [${known.handle}] and [${bogus}].`, [known])).toEqual([bogus]);
+  });
+
+  it("a ref range only partly covered by known sources reports the rest", () => {
+    const known = { ...src(1), doc_number: 1, chunk_number: 1 };
+    expect(deriveInvalid("Uses [1:1-3] but only chunk 1 exists.", [known])).toEqual(["1:2", "1:3"]);
+  });
+
+  it("no citations here", () => {
+    expect(deriveInvalid("No citations here.", [src(1)])).toEqual([]);
+  });
+
+  it("citing the same known handle twice is not invalid, and not duplicated", () => {
+    const known = src(1);
+    expect(deriveInvalid(`Cites [${known.handle}] twice, [${known.handle}] again.`, [known])).toEqual([]);
   });
 });
 
@@ -109,9 +133,17 @@ describe("applyEvent", () => {
     applyEvent(t, { type: "searching", query: "more", found_by: "tool" });
     applyEvent(t, { type: "sources", sources: [src(2), src(3, "more", "tool")] }); // 2 already known
     expect(t.trace.map((s) => s.verb)).toEqual(["planned", "search", "list", "search"]);
-    expect(t.trace[1].sources).toEqual([1, 2]);
-    expect(t.trace[3].sources).toEqual([2, 3]);
-    expect(t.sources.map((s) => s.number)).toEqual([1, 2, 3]);
+    expect(t.trace[1].sources).toEqual([handleFor(1), handleFor(2)]);
+    expect(t.trace[3].sources).toEqual([handleFor(2), handleFor(3)]);
+    expect(t.sources.map((s) => s.handle)).toEqual([handleFor(1), handleFor(2), handleFor(3)]);
+  });
+
+  it("replaces, not duplicates, a source whose handle is re-emitted (the carry-forward upgrade case)", () => {
+    const t = newTurn("k", "q?");
+    applyEvent(t, { type: "sources", sources: [{ ...src(1), found_by: "auto", rerank_score: null }] });
+    applyEvent(t, { type: "sources", sources: [{ ...src(1), found_by: "tool", rerank_score: 0.9 }] });
+    expect(t.sources).toHaveLength(1);
+    expect(t.sources[0]).toMatchObject({ found_by: "tool", rerank_score: 0.9 });
   });
 
   it("shows several planned queries as one plan line, then a search each", () => {
@@ -164,13 +196,17 @@ describe("applyEvent", () => {
     expect(t.thinkingTokens).toBe(3);
   });
 
-  it("marks cited sources on a stop", () => {
+  it("marks cited sources on a stop, and applies their refs", () => {
     const t = newTurn("k", "q?");
-    applyEvent(t, { type: "sources", sources: [src(1), src(2)] });
-    applyEvent(t, { type: "token", text: "partial [2]" });
-    applyEvent(t, { type: "stopped", message_id: "a1", answer: "partial [2]", cited: [2] });
+    const s1 = { ...src(1), doc_number: null, chunk_number: null };
+    const s2 = { ...src(2), doc_number: null, chunk_number: null };
+    applyEvent(t, { type: "sources", sources: [s1, s2] });
+    applyEvent(t, { type: "token", text: `partial [${s2.handle}]` });
+    applyEvent(t, { type: "stopped", message_id: "a1", answer: `partial [${s2.handle}]`,
+                    cited: [s2.handle], refs: { [s2.handle]: [1, 1] } });
     expect(t.status).toBe("stopped");
     expect(t.sources.map((s) => s.cited)).toEqual([false, true]);
+    expect(t.sources[1]).toMatchObject({ doc_number: 1, chunk_number: 1 });
   });
 
   it("a stop while queued carries nothing and keeps the turn empty", () => {
@@ -187,8 +223,8 @@ describe("traceFromStored", () => {
       { auto_search: true, plan_s: 0.3, search_s: 0.8, listed_documents: 2 });
     expect(steps).toEqual([
       { verb: "planned", text: "auto q", sources: [] },
-      { verb: "search", text: "auto q", sources: [1, 2], foundBy: "auto", seconds: 0.8 },
-      { verb: "search", text: "tool q", sources: [3], foundBy: "tool", seconds: undefined },
+      { verb: "search", text: "auto q", sources: [handleFor(1), handleFor(2)], foundBy: "auto", seconds: 0.8 },
+      { verb: "search", text: "tool q", sources: [handleFor(3)], foundBy: "tool", seconds: undefined },
       { verb: "list", text: "the documents, 2 times", sources: [] },
     ]);
   });
@@ -199,9 +235,9 @@ describe("traceFromStored", () => {
       { auto_search: true, plan_s: 0.3, search_s: 0.8, auto_queries: 2 });
     expect(steps[0]).toEqual({ verb: "planned", text: "a · b", sources: [] });
     expect(steps.slice(1)).toEqual([
-      { verb: "search", text: "a", sources: [1], foundBy: "auto", seconds: 0.8 },
-      { verb: "search", text: "b", sources: [2], foundBy: "auto", seconds: 0.8 },
-      { verb: "search", text: "tool q", sources: [3], foundBy: "tool", seconds: undefined },
+      { verb: "search", text: "a", sources: [handleFor(1)], foundBy: "auto", seconds: 0.8 },
+      { verb: "search", text: "b", sources: [handleFor(2)], foundBy: "auto", seconds: 0.8 },
+      { verb: "search", text: "tool q", sources: [handleFor(3)], foundBy: "tool", seconds: undefined },
     ]);
   });
 
@@ -215,7 +251,7 @@ describe("traceFromStored", () => {
   it("with no auto search, every query is a tool query", () => {
     const steps = traceFromStored(["x"], [src(1, "x", "tool")], { auto_search: false, plan_s: 0.2 });
     expect(steps[0]).toMatchObject({ verb: "note" });
-    expect(steps[1]).toMatchObject({ verb: "search", foundBy: "tool", sources: [1] });
+    expect(steps[1]).toMatchObject({ verb: "search", foundBy: "tool", sources: [handleFor(1)] });
   });
 
   it("rebuilds a failed plan from the stored stats", () => {
@@ -227,7 +263,13 @@ describe("traceFromStored", () => {
   it("gives a repeated query's passages to each occurrence once", () => {
     const sources = [src(1, "x", "tool"), src(2, "x", "tool")];
     const steps = traceFromStored(["x", "x"], sources, { auto_search: false });
-    expect(steps.map((s) => s.sources)).toEqual([[1, 2], []]);
+    expect(steps.map((s) => s.sources)).toEqual([[handleFor(1), handleFor(2)], []]);
+  });
+
+  it("excludes carried-forward (\"earlier\") sources from the trace -- they weren't retrieved this turn", () => {
+    const sources = [{ ...src(1, "x", "auto"), found_by: "earlier" as const }];
+    const steps = traceFromStored(["x"], sources, { auto_search: true, plan_s: 0.1 });
+    expect(steps[1]).toMatchObject({ sources: [] }); // found_by "earlier" never matches "auto"/"tool"
   });
 });
 

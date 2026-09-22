@@ -6,6 +6,7 @@
   // Turn shape, so this can't tell which it was given; the only difference
   // is that reasoning text is never stored, so a reopened turn has none.
   import { deriveInvalid, processSummary, type Turn } from "../../lib/turns";
+  import { buildCiteMap } from "../../lib/citations";
   import { clock, locator, plural } from "../../lib/format";
   import { session } from "../../state/session.svelte";
   import { ui, guard } from "../../state/ui.svelte";
@@ -22,11 +23,11 @@
   const { turn, isLast, preset, busy }: Props = $props();
 
   const streaming = $derived(turn.status === "streaming");
-  const known = $derived(new Set(turn.sources.map((s) => s.number)));
+  const map = $derived(buildCiteMap(turn.sources));
   const invalid = $derived(streaming ? [] : deriveInvalid(turn.answer, turn.sources));
   const thinkPhase = $derived(streaming && !turn.answer && turn.thinking.length > 0);
   const searches = $derived(turn.trace.filter((s) => s.verb === "search").length);
-  const bySource = $derived(new Map(turn.sources.map((s) => [s.number, s])));
+  const bySource = $derived(new Map(turn.sources.map((s) => [s.handle, s])));
 
   const model = $derived(turn.model ?? session.presetInfo(turn.preset ?? preset)?.model ?? null);
   const presetName = $derived(turn.preset ?? preset);
@@ -86,32 +87,35 @@
 
   const VERB: Record<string, string> = { planned: "planned", search: "search", list: "list", note: "decided", thinking: "thinking" };
 
-  function openSource(n: number): void {
-    ui.focusSources([n], turn.key);
-    ui.open({ kind: "source", turnKey: turn.key, number: n });
+  function openSource(handle: string): void {
+    ui.focusSources([handle], turn.key);
+    ui.open({ kind: "source", turnKey: turn.key, handle });
   }
 
-  function citationNums(el: Element | null): number[] | null {
-    if (!(el instanceof HTMLElement) || !el.dataset.nums || el.classList.contains("invalid")) return null;
-    return el.dataset.nums.split(",").map(Number);
+  /** null for an invalid span too, since those carry no data-handle by
+   *  construction (citations.ts) -- the click/hover handlers below ignore
+   *  them without needing a class check of their own. */
+  function citationHandle(el: Element | null): string | null {
+    if (!(el instanceof HTMLElement) || !el.dataset.handle) return null;
+    return el.dataset.handle;
   }
 
   function onAnswerClick(e: MouseEvent): void {
-    const nums = citationNums((e.target as Element).closest(".cite"));
-    if (nums?.length) openSource(nums[0]);
+    const handle = citationHandle((e.target as Element).closest(".cite"));
+    if (handle) openSource(handle);
   }
 
   function onAnswerKey(e: KeyboardEvent): void {
     if (e.key !== "Enter" && e.key !== " ") return;
-    const nums = citationNums((e.target as Element).closest(".cite"));
-    if (!nums?.length) return;
+    const handle = citationHandle((e.target as Element).closest(".cite"));
+    if (!handle) return;
     e.preventDefault();
-    openSource(nums[0]);
+    openSource(handle);
   }
 
   function onAnswerOver(e: Event): void {
-    const nums = citationNums((e.target as Element).closest(".cite"));
-    if (nums) ui.focusSources(nums, turn.key);
+    const handle = citationHandle((e.target as Element).closest(".cite"));
+    if (handle) ui.focusSources([handle], turn.key);
   }
 
   let copied = $state(false);
@@ -173,11 +177,11 @@
                 {/if}
                 {#if openStep === i && step.sources.length}
                   <div class="results">
-                    {#each step.sources as n (n)}
-                      {@const s = bySource.get(n)}
+                    {#each step.sources as handle (handle)}
+                      {@const s = bySource.get(handle)}
                       {#if s}
-                        <button class="result" onclick={() => openSource(n)}>
-                          <span class="n">[{n}]</span>
+                        <button class="result" onclick={() => openSource(handle)}>
+                          {#if s.doc_number !== null}<span class="n">[{s.doc_number}:{s.chunk_number}]</span>{/if}
                           <span class="r-title">{s.filename}<span class="muted">{locator(s.pages, s.headings) ? ` · ${locator(s.pages, s.headings)}` : ""}</span></span>
                         </button>
                       {/if}
@@ -198,7 +202,7 @@
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div class="answer" onclick={onAnswerClick} onkeydown={onAnswerKey} onmouseover={onAnswerOver} onfocusin={onAnswerOver}>
         {#if turn.answer}
-          <Markdown answer={turn.answer} status={turn.status} {known} />
+          <Markdown answer={turn.answer} status={turn.status} {map} />
         {:else if turn.status === "complete"}
           <p class="muted">(empty answer)</p>
         {/if}
@@ -211,7 +215,9 @@
       <p class="note muted">Stopped{turn.answer ? " — this is as far as it got." : " before it wrote anything."}</p>
     {/if}
     {#if invalid.length > 0}
-      <p class="note err-text">Cites source{invalid.length > 1 ? "s" : ""} [{invalid.join(", ")}], which {invalid.length > 1 ? "don't" : "doesn't"} exist in this answer.</p>
+      <!-- Never prints an entry of `invalid` itself: it may be a raw handle,
+           and a raw handle must never reach the reader, garbled or not. -->
+      <p class="note err-text">Cites {plural(invalid.length, "source")} that {invalid.length > 1 ? "don't" : "doesn't"} exist in this answer.</p>
     {/if}
   </div>
 

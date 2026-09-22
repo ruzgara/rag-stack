@@ -5,7 +5,7 @@
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { splitStable, closeOpenFence } from "./markdown";
-import { linkifyCitations } from "./citations";
+import { linkifyCitations, type CiteMap } from "./citations";
 
 marked.setOptions({ gfm: true, breaks: false });
 
@@ -39,7 +39,7 @@ export class StreamingMarkdown {
     root.replaceChildren(this.stable, this.tail);
   }
 
-  update(raw: string, known: Set<number>): void {
+  update(raw: string, map: CiteMap, pending: boolean): void {
     const [stable, volatile] = splitStable(raw);
 
     if (stable.length !== this.stableLen) {
@@ -49,7 +49,7 @@ export class StreamingMarkdown {
       // separate <ol>s each starting at 1.
       this.stableLen = stable.length;
       const frag = mdToFragment(stable);
-      linkifyCitations(frag, known);
+      linkifyCitations(frag, map, pending);
       this.stable.replaceChildren(frag);
     }
 
@@ -61,7 +61,7 @@ export class StreamingMarkdown {
     }
 
     const frag = mdToFragment(closeOpenFence(volatile));
-    linkifyCitations(frag, known);
+    linkifyCitations(frag, map, pending);
     this.tail.replaceChildren(frag);
   }
 
@@ -71,10 +71,10 @@ export class StreamingMarkdown {
    *  link reference. Terminal: this instance is one-per-turn (Markdown.svelte
    *  makes a fresh StreamingMarkdown per Turn), so update() is never called
    *  again after finalize() replaces root's children with a flat fragment. */
-  finalize(answer: string, known: Set<number>): void {
+  finalize(answer: string, map: CiteMap): void {
     this.stableLen = -1;
     const frag = mdToFragment(answer);
-    linkifyCitations(frag, known);
+    linkifyCitations(frag, map, false);
     this.root.replaceChildren(frag);
   }
 }

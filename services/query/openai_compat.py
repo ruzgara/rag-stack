@@ -6,8 +6,19 @@ can use rag-stack: point them at http://127.0.0.1:$QUERY_PORT/v1.
   POST /v1/chat/completions  the same pipeline as the native API, streamed or not
 
 The OpenAI protocol is stateless -- clients send the whole conversation each
-time -- so nothing here is stored. It has no field for citations either, so
-the cited sources are appended to the answer as a "Sources" list.
+time -- so nothing here is stored, and neither is any citation numbering:
+every request starts a fresh CitationNumbers and numbers whatever it cites
+starting from [1:1], even if an identical question was just answered the
+same way. There's no conversation to carry a number forward *to*, so
+cross-turn citation (a later message citing an earlier one's passage by
+number) doesn't exist on this endpoint -- only on the native /api one.
+
+The protocol also has no field for citations, so the cited sources are
+appended to the answer as a "Sources" list, and the handles chat.py's answer
+carries are rendered to reader-facing [doc:chunk] before anything leaves
+this module -- render_answer for the non-streamed reply, StreamingRenderer
+token by token for the streamed one. A raw handle must never reach a client
+here: unlike the native UI, this protocol was never taught what one is.
 """
 
 from __future__ import annotations
@@ -24,6 +35,7 @@ from pydantic import BaseModel
 
 from accounts import User
 from chat import ChatError, TurnResult
+from citations import CitationNumbers, StreamingRenderer, render_answer
 from limits import Busy
 
 router = APIRouter(prefix="/v1")
@@ -67,10 +79,15 @@ def text_of(content: Any) -> str:
 
 
 def sources_footer(result: TurnResult) -> str:
-    cited = [s for s in result.sources if s.number in result.cited]
+    """result.refs is already exactly the [doc:chunk] chat.py assigned each
+    cited handle (a fresh CitationNumbers, since this endpoint never passes
+    one in) -- reused here rather than renumbered, so the footer can't
+    disagree with what render_answer put in the body above it."""
+    by_handle = {s.handle: s for s in result.sources}
+    cited = sorted(((ref, by_handle[handle]) for handle, ref in result.refs.items() if handle in by_handle))
     if not cited:
         return ""
-    return "\n\nSources:\n" + "\n".join(f"[{s.number}] {s.label()}" for s in cited)
+    return "\n\nSources:\n" + "\n".join(f"[{doc}:{chunk}] {s.label()}" for (doc, chunk), s in cited)
 
 
 @router.get("/models")
@@ -135,10 +152,11 @@ def chat_completions(body: ChatCompletionRequest, user: "User" = Depends(_curren
             return error(503, str(exc), "server_busy")
         except (ChatError, httpx.HTTPError, RuntimeError) as exc:
             return error(502, str(exc), "upstream_error")
+        content = render_answer(result.answer, result.refs.get) + sources_footer(result)
         return {
             "id": completion_id, "object": "chat.completion", "created": created, "model": preset,
             "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": result.answer + sources_footer(result)}}],
+                         "message": {"role": "assistant", "content": content}}],
             "usage": usage(result),
         }
 
@@ -149,16 +167,31 @@ def chat_completions(body: ChatCompletionRequest, user: "User" = Depends(_curren
 
     def stream() -> Iterator[str]:
         yield chunk({"role": "assistant", "content": ""})
+        # sha_of is filled as `sources` events arrive and handed to the
+        # renderer by reference (StreamingRenderer keeps the same dict, not
+        # a copy) -- by the time a handle can appear in a token, the
+        # `sources` event that introduced it has already come through.
+        sha_of: dict[str, str] = {}
+        renderer = StreamingRenderer(sha_of)
         try:
             with state.gate.admit(user.id):
                 for ev in turn:
-                    if ev["type"] == "token":
-                        yield chunk({"content": ev["text"]})
+                    if ev["type"] == "sources":
+                        sha_of.update({s["handle"]: s["doc_sha"] for s in ev["sources"]})
+                    elif ev["type"] == "token":
+                        out = renderer.feed(ev["text"])
+                        if out:
+                            yield chunk({"content": out})
                     elif ev["type"] == "done":
                         result = ev["result"]
-                        footer = sources_footer(result)
-                        if footer:
-                            yield chunk({"content": footer})
+                        # Flush before the footer: any '[' the renderer was
+                        # still holding back at the last token has to be
+                        # resolved (or released as plain text) before
+                        # anything else is appended.
+                        tail = renderer.flush()
+                        content = tail + sources_footer(result)
+                        if content:
+                            yield chunk({"content": content})
                         yield chunk({}, "stop", usage=usage(result))
         except Busy as exc:
             yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'server_busy'}})}\n\n"

@@ -9,6 +9,12 @@ accounts existed carry; the first admin created adopts them (accounts.py).
 Each assistant message keeps a copy of the sources it was given (text
 included), so an old answer's citations still resolve after the index is
 rebuilt or re-ingested.
+
+Citation numbers ([1:3], see citations.py) live on those same rows rather
+than in a registry of their own. That is what makes them recyclable: the
+numbering a conversation is using is whatever its surviving messages say it
+is, so deleting or regenerating the only message that cited a document frees
+its number, while a number some other message still cites is never free.
 """
 
 from __future__ import annotations
@@ -20,6 +26,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+from citations import CitationNumbers, handle_for
 
 LOCAL_USER = "local"
 
@@ -86,9 +94,9 @@ CREATE INDEX IF NOT EXISTS messages_conversation ON messages (conversation_id, c
 
 CREATE TABLE IF NOT EXISTS message_sources (
     message_id   TEXT NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
-    number       INTEGER NOT NULL,   -- the [n] the answer cites it by
+    number       INTEGER NOT NULL,   -- this message's own index for it; never displayed
     cited        INTEGER NOT NULL,   -- 1 if the answer actually cited it
-    found_by     TEXT NOT NULL,      -- auto | tool
+    found_by     TEXT NOT NULL,      -- auto | tool | earlier (cited in a previous turn)
     query        TEXT NOT NULL,      -- the search that found it
     point_id     TEXT NOT NULL,
     doc_sha      TEXT NOT NULL,
@@ -98,6 +106,17 @@ CREATE TABLE IF NOT EXISTS message_sources (
     headings     TEXT NOT NULL,      -- JSON list
     text         TEXT NOT NULL,
     rerank_score REAL,
+    -- The [doc:chunk] a reader sees, set only on cited rows: which document
+    -- of this conversation, and which of its passages. Both are assigned
+    -- when the citation happens, so a passage that was retrieved and never
+    -- cited holds no number at all.
+    doc_number   INTEGER,
+    chunk_number INTEGER,
+    -- A silent renumbering bug (a cited row saved with no number, say)
+    -- would otherwise surface only as a citation that mysteriously never
+    -- resolves; this turns it into an immediate failure instead. Dev-only
+    -- DB (see below), so adding a CHECK costs nothing in migration.
+    CHECK (cited = 0 OR (doc_number IS NOT NULL AND chunk_number IS NOT NULL)),
     PRIMARY KEY (message_id, number)
 );
 
@@ -640,6 +659,41 @@ class ChatDB:
             out.pop()
         return out
 
+    def citation_state(self, conv_id: str, user_id: str) -> tuple[CitationNumbers, list[dict]]:
+        """The conversation's citation numbering, and the passages it has
+        already cited (oldest first, one entry per passage).
+
+        Both are read from the messages that exist right now, which is what
+        makes numbers recyclable: an answer that has been deleted or
+        regenerated takes its citations with it, so a document nothing cites
+        any more is simply absent here and its number goes to the next one.
+        A number some other message still cites stays bound to its passage,
+        so no live citation can be re-pointed.
+
+        This refcount is over *stored* messages, which isn't quite the same
+        set history() shows the model: a stopped answer with no content at
+        all is excluded from history() but its (empty) row is still here --
+        it just never cited anything, so it doesn't change the count either
+        way.
+
+        Concurrency: two turns racing in the same conversation could each
+        read this before the other writes and both allocate document 1.
+        limits.py admits by user, not by conversation, so today that window
+        is real but rare (one browser tab, one turn at a time); close it
+        with a conv_id lock only if per-user concurrency ever rises above 1."""
+        with self._conn() as db:
+            rows = [self._source_dict(r) for r in db.execute(
+                """SELECT s.* FROM message_sources s JOIN messages m ON m.id = s.message_id
+                   WHERE m.conversation_id = ? AND m.user_id = ? AND s.cited = 1
+                         AND s.doc_number IS NOT NULL AND s.chunk_number IS NOT NULL
+                   ORDER BY m.created_at, s.doc_number, s.chunk_number""", (conv_id, user_id))]
+        cited: dict[str, dict] = {}
+        for row in rows:
+            # Last copy wins: a passage cited again in a later turn was
+            # re-retrieved then, so that row carries the fresher text.
+            cited[row["handle"]] = row
+        return CitationNumbers.from_rows(rows), list(cited.values())
+
     def add_user_message(self, conv_id: str, content: str, user_id: str) -> dict:
         now = time.time()
         msg = {"id": uuid.uuid4().hex, "role": "user", "content": content, "created_at": now}
@@ -667,11 +721,12 @@ class ChatDB:
             )
             db.executemany(
                 """INSERT INTO message_sources (message_id, number, cited, found_by, query, point_id, doc_sha,
-                                                filename, chunk_index, pages, headings, text, rerank_score)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                                filename, chunk_index, pages, headings, text, rerank_score,
+                                                doc_number, chunk_number)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [(msg_id, s["number"], int(s["number"] in cited), s["found_by"], s["query"], s["point_id"],
                   s["doc_sha"], s["filename"], s["chunk_index"], json.dumps(s["pages"]), json.dumps(s["headings"]),
-                  s["text"], s.get("rerank_score")) for s in sources],
+                  s["text"], s.get("rerank_score"), s.get("doc_number"), s.get("chunk_number")) for s in sources],
             )
             # A chat has one owner, and this is the answer to their own turn
             # -- they watched it stream, so it counts as read, not just as
@@ -809,4 +864,8 @@ class ChatDB:
         return {"number": s["number"], "cited": bool(s["cited"]), "found_by": s["found_by"], "query": s["query"],
                 "point_id": s["point_id"], "doc_sha": s["doc_sha"], "filename": s["filename"],
                 "chunk_index": s["chunk_index"], "pages": json.loads(s["pages"]),
-                "headings": json.loads(s["headings"]), "text": s["text"], "rerank_score": s["rerank_score"]}
+                "headings": json.loads(s["headings"]), "text": s["text"], "rerank_score": s["rerank_score"],
+                # Derived, not stored: one passage has one handle forever, so
+                # keeping a copy could only ever disagree with the truth.
+                "handle": handle_for(s["doc_sha"], s["chunk_index"]),
+                "doc_number": s["doc_number"], "chunk_number": s["chunk_number"]}

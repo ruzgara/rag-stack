@@ -3,6 +3,7 @@ import sqlite3
 
 import pytest
 
+from citations import handle_for
 from db import ADMIN_WORKSPACE_ID, ChatDB, NotFound, WorkspaceLibraries
 
 USER = "user-under-test"
@@ -14,7 +15,7 @@ OTHER = "someone-else"
 # separately below.
 SCOPED = ("create_conversation", "list_conversations", "get_conversation", "update_conversation",
           "delete_conversation", "restore_conversation", "archive_conversation", "unarchive_conversation",
-          "history", "add_user_message", "add_assistant_message", "prepare_retry",
+          "history", "citation_state", "add_user_message", "add_assistant_message", "prepare_retry",
           "record_upload", "upload_usage", "list_uploads", "get_upload", "delete_uploads",
           "document_held_by_others",
           "create_workspace", "list_workspaces", "get_workspace", "update_workspace", "delete_workspace",
@@ -38,10 +39,18 @@ def db(tmp_path):
     return Scoped(ChatDB(tmp_path / "chat.db"))
 
 
-def src(number: int) -> dict:
-    return {"number": number, "found_by": "auto", "query": "q", "point_id": f"p{number}", "doc_sha": "d",
-            "filename": "book.pdf", "chunk_index": number, "pages": [number], "headings": ["Ch", "S"],
-            "text": f"passage {number}", "rerank_score": 0.9}
+def src(number: int, sha: str = "d", chunk_index: int | None = None, doc: int | None = None,
+        chunk: int | None = None, text: str | None = None) -> dict:
+    """`doc`/`chunk` default to `number`/1 -- not None -- so a source cited
+    by the tests' default `cited={1}` satisfies message_sources' CHECK
+    without every unrelated test having to say so. Citation-focused tests
+    override `sha`/`chunk_index` (what the handle is derived from) and
+    `doc`/`chunk` (the [doc:chunk] a caller like chat.py would have
+    assigned) explicitly."""
+    return {"number": number, "found_by": "auto", "query": "q", "point_id": f"p{number}", "doc_sha": sha,
+            "filename": f"{sha}.pdf", "chunk_index": number if chunk_index is None else chunk_index,
+            "pages": [number], "headings": ["Ch", "S"], "text": text if text is not None else f"passage {number}",
+            "rerank_score": 0.9, "doc_number": number if doc is None else doc, "chunk_number": 1 if chunk is None else chunk}
 
 
 def answer(db, conv_id: str, content: str = "answer [1]", status: str = "complete", **kw) -> dict:
@@ -121,6 +130,85 @@ def test_messages_and_sources_round_trip(db):
     assert [(s["number"], s["cited"], s["pages"], s["headings"]) for s in assistant["sources"]] == [
         (1, True, [1], ["Ch", "S"]), (2, False, [2], ["Ch", "S"])]
     assert assistant["sources"][0]["text"] == "passage 1"  # a copy, independent of the index
+
+
+# --------------------------------------------------------------- citations --
+
+def test_citation_state_reads_the_conversations_numbering_oldest_first(db):
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q1")
+    answer(db, conv["id"], "cites A", sources=[src(1, sha="A", chunk_index=0, doc=1, chunk=1)], cited={1})
+    db.add_user_message(conv["id"], "q2")
+    answer(db, conv["id"], "cites B", sources=[src(1, sha="B", chunk_index=0, doc=2, chunk=1)], cited={1})
+
+    numbers, cited = db.citation_state(conv["id"])
+
+    assert numbers.ref(handle_for("A", 0)) == (1, 1)
+    assert numbers.ref(handle_for("B", 0)) == (2, 1)
+    assert {c["doc_sha"] for c in cited} == {"A", "B"}
+
+
+def test_retrying_frees_the_retried_answers_document_number_for_reuse(db):
+    """The recycling contract: a number lives on whichever rows still cite
+    it, not in a registry, so deleting the only message that cited a
+    document frees its number -- and the next new document gets the lowest
+    *free* number, not the next unused one after the highest so far."""
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q1")
+    answer(db, conv["id"], "cites A", sources=[src(1, sha="A", chunk_index=0, doc=1, chunk=1)], cited={1})
+    db.add_user_message(conv["id"], "q2")
+    answer(db, conv["id"], "cites B", sources=[src(1, sha="B", chunk_index=0, doc=2, chunk=1)], cited={1})
+
+    db.prepare_retry(conv["id"])  # deletes the answer that cited B -- the trailing one
+
+    numbers, cited = db.citation_state(conv["id"])
+    assert numbers.ref(handle_for("A", 0)) == (1, 1)  # untouched
+    assert numbers.ref(handle_for("B", 0)) is None  # gone: nothing cites it any more
+    assert {c["doc_sha"] for c in cited} == {"A"}
+    assert numbers.assign(handle_for("C", 0), "C") == (2, 1)  # B's freed number, recycled -- not 3
+
+
+def test_a_document_cited_by_two_answers_keeps_its_number_while_either_survives(db):
+    a = src(1, sha="A", chunk_index=0, doc=1, chunk=1)
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q1")
+    answer(db, conv["id"], "cites A", sources=[a], cited={1})
+    db.add_user_message(conv["id"], "q2")
+    answer(db, conv["id"], "cites A again", sources=[a], cited={1})
+
+    db.prepare_retry(conv["id"])  # deletes the second citation of A, not the first
+
+    numbers, cited = db.citation_state(conv["id"])
+    assert numbers.ref(handle_for("A", 0)) == (1, 1)  # the first message still cites it
+    assert len(cited) == 1
+
+
+def test_citation_state_excludes_uncited_and_unnumbered_rows(db):
+    cited_src = src(1, sha="A", chunk_index=0, doc=1, chunk=1)
+    uncited_src = {**src(2, sha="B", chunk_index=0), "doc_number": None, "chunk_number": None}
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q1")
+    answer(db, conv["id"], "cites A", sources=[cited_src, uncited_src], cited={1})
+
+    numbers, cited = db.citation_state(conv["id"])
+    assert numbers.ref(handle_for("B", 0)) is None
+    assert {c["doc_sha"] for c in cited} == {"A"}
+
+
+def test_citation_state_keeps_the_freshest_text_for_a_repeat_citation(db):
+    """Last copy wins: a passage cited again in a later turn was
+    re-retrieved then, so that row's text is the one citation_state hands
+    back for it."""
+    conv = db.create_conversation("everyday")
+    db.add_user_message(conv["id"], "q1")
+    answer(db, conv["id"], "first", sources=[src(1, sha="A", chunk_index=0, doc=1, chunk=1, text="old text")],
+           cited={1})
+    db.add_user_message(conv["id"], "q2")
+    answer(db, conv["id"], "second", sources=[src(1, sha="A", chunk_index=0, doc=1, chunk=1, text="new text")],
+           cited={1})
+
+    _, cited = db.citation_state(conv["id"])
+    assert len(cited) == 1 and cited[0]["text"] == "new text"
 
 
 def test_listing_is_newest_first_with_counts(db):

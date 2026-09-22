@@ -2,7 +2,8 @@ import httpx
 import pytest
 from conftest import CHAT_ENV, FakeLibrary, FakeOllama, FakeRetriever, answer, calls, make_hit, tool_call
 
-from chat import ChatConfig, ChatError, ChatService, Source, resolve_citations, trim_history
+from chat import ChatConfig, ChatError, ChatService, Source, trim_history
+from citations import CitationNumbers, handle_for
 
 
 def config(**env) -> ChatConfig:
@@ -17,32 +18,32 @@ def service(results=None, ollama: FakeOllama | None = None, library=None,
             retriever, ollama)
 
 
-def run(svc: ChatService, question: str, history=None, preset=None, library_overview=None) -> tuple[list[dict], object]:
-    events = list(svc.run_turn(question, history or [], preset, library_overview=library_overview))
+def run(svc: ChatService, question: str, history=None, preset=None, library_overview=None,
+        numbers: CitationNumbers | None = None, earlier: list[dict] | None = None) -> tuple[list[dict], object]:
+    events = list(svc.run_turn(question, history or [], preset, library_overview=library_overview,
+                               numbers=numbers, earlier=earlier))
     return events, events[-1]["result"]
 
 
-def source(number: int, pages=(3,), headings=("Ch 1", "Risks")) -> Source:
-    return Source(number=number, found_by="auto", query="q", point_id=f"p{number}", doc_sha="d", filename="book.pdf",
-                  chunk_index=number, pages=list(pages), headings=list(headings), text=" body ", rerank_score=0.9)
+def earlier_row(handle: str, sha: str, chunk_index: int, doc: int, chunk: int, text: str = "earlier text",
+                query: str = "earlier query") -> dict:
+    """One of db.citation_state's rows: a passage cited in an earlier turn,
+    already numbered."""
+    return {"handle": handle, "found_by": "earlier", "query": query, "point_id": f"p-{handle}", "doc_sha": sha,
+            "filename": f"{sha}.pdf", "chunk_index": chunk_index, "pages": [1], "headings": [], "text": text,
+            "rerank_score": None, "doc_number": doc, "chunk_number": chunk}
 
 
-# ------------------------------------------------------------- citations --
-
-def test_citations_in_every_form():
-    sources = [source(n) for n in range(1, 9)]
-    cited, invalid = resolve_citations("A [1]. B [2, 3]. C [4-5] and [6–6]. D [7; 8]. E [3]. F [99].", sources)
-    assert cited == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert invalid == [99]
+def source(number: int, pages=(3,), headings=("Ch 1", "Risks"), doc_sha: str = "d") -> Source:
+    return Source(number=number, found_by="auto", query="q", point_id=f"p{number}", doc_sha=doc_sha,
+                  filename="book.pdf", chunk_index=number, pages=list(pages), headings=list(headings),
+                  text=" body ", rerank_score=0.9, handle=handle_for(doc_sha, number))
 
 
-def test_absurd_citation_ranges_are_capped():
-    cited, invalid = resolve_citations("[1-100000]", [source(1)])
-    assert cited == [1] and len(invalid) == 50
-
-
-def test_text_in_brackets_is_not_a_citation():
-    assert resolve_citations("see [a] and [1a] and [ 2 ]", [source(1), source(2)]) == ([], [])
+# The citation grammar itself (handles, [d:c] refs, the corner cases) is
+# tested exhaustively in test_citations.py; the tests below only cover the
+# integration -- that run_turn actually calls parse_citations/resolve/
+# assign_numbers on what it built.
 
 
 # --------------------------------------------------------------- history --
@@ -67,8 +68,16 @@ def test_source_label(pages, label):
     assert source(1, pages=pages).label() == label
 
 
-def test_source_in_the_prompt_shows_number_place_and_section():
-    assert source(2).for_prompt() == "[2] book.pdf, p. 3 — Ch 1 > Risks\nbody"
+def test_source_in_the_prompt_shows_the_handle_place_and_section():
+    s = source(2)
+    assert s.for_prompt() == f"[{s.handle}] book.pdf, p. 3 — Ch 1 > Risks\nbody"
+
+
+def test_source_for_prompt_text_false_is_label_only():
+    """The carry-forward block's form: identifier and location, no passage
+    text -- what a passage cited in an earlier turn is offered by."""
+    s = source(2)
+    assert s.for_prompt(text=False) == f"[{s.handle}] book.pdf, p. 3 — Ch 1 > Risks"
 
 
 # ---------------------------------------------------------------- config --
@@ -209,17 +218,21 @@ def test_a_greeting_skips_the_search():
 
 
 def test_a_question_is_answered_from_its_sources_with_citations():
-    ollama = FakeOllama(plan='{"search": true, "queries": ["bond parties"]}', streams=[answer("Investors [1]", " and [3].")])
-    hits = [make_hit("a", ["BOND ISSUES", "The parties"], text="Investors and issuers."), make_hit("b", ["Timetable"])]
+    hits = [make_hit("a", ["BOND ISSUES", "The parties"], text="Investors and issuers.", chunk_index=0),
+            make_hit("b", ["Timetable"], chunk_index=1)]
+    a_handle, bogus = handle_for("doc1", 0), handle_for("doc1", 99)  # 99: not among this turn's sources
+    ollama = FakeOllama(plan='{"search": true, "queries": ["bond parties"]}',
+                        streams=[answer(f"Investors [{a_handle}]", f" and [{bogus}].")])
     svc, retriever, _ = service({"bond parties": hits}, ollama)
     events, result = run(svc, "who are the parties?")
 
     assert [e["type"] for e in events[:3]] == ["plan", "searching", "sources"]
     assert retriever.calls[0]["question"] == "bond parties"  # the planned query is searched
-    assert result.cited == [1] and result.invalid_citations == [3]
+    assert result.cited == [a_handle] and result.invalid_citations == [bogus]
+    assert result.refs[a_handle] == (1, 1)
     assert result.search_queries == ["bond parties"]
     turn = user_turn(ollama)
-    assert turn.startswith("Sources:\n\n[1] doc1.pdf, p. 1 — BOND ISSUES > The parties\nInvestors and issuers.")
+    assert turn.startswith(f"Sources:\n\n[{a_handle}] doc1.pdf, p. 1 — BOND ISSUES > The parties\nInvestors and issuers.")
     assert "Question: who are the parties?" in turn  # the model sees the user's own words
     assert result.stats["source_tokens"] > 0
 
@@ -227,9 +240,10 @@ def test_a_question_is_answered_from_its_sources_with_citations():
 def test_a_skipped_search_can_still_be_overruled_by_the_tool():
     """The planner decides before seeing any passage, so a tools-on preset is
     told it may search anyway rather than being told the message needs nothing."""
+    a_handle = handle_for("doc1", 0)
     ollama = FakeOllama(plan='{"search": false, "queries": ["hello"]}',
-                        streams=[[*tool_call("bond parties")], answer("Found it [1].")])
-    svc, retriever, _ = service({"bond parties": [make_hit("a", ["Parties"])]}, ollama, preset="hard")
+                        streams=[[*tool_call("bond parties")], answer(f"Found it [{a_handle}].")])
+    svc, retriever, _ = service({"bond parties": [make_hit("a", ["Parties"], chunk_index=0)]}, ollama, preset="hard")
     events, result = run(svc, "hi -- and who are the parties?", preset="hard")
 
     turn = user_turn(ollama)
@@ -238,17 +252,18 @@ def test_a_skipped_search_can_still_be_overruled_by_the_tool():
     assert [e["type"] for e in events if e["type"] == "searching"] == ["searching"]
     assert [c["question"] for c in retriever.calls] == ["bond parties"]
     assert result.search_queries == ["bond parties"]  # found by the tool, not the planner
-    assert result.stats["auto_search"] is False and result.cited == [1]
+    assert result.stats["auto_search"] is False and result.cited == [a_handle]
 
 
 def test_a_two_part_question_searches_each_part_and_records_both():
     """Every planned query gets its own search and its own pair of events, so
-    the trace shows what was looked for; the sources are numbered across all
-    of them, so citations stay unambiguous."""
+    the trace shows what was looked for; the sources are cited unambiguously
+    by their own handles regardless of which query found them."""
+    a_handle, b_handle = handle_for("doc1", 0), handle_for("doc1", 1)
     ollama = FakeOllama(plan='{"search": true, "queries": ["deposit rules", "withdrawal rules"]}',
-                        streams=[answer("Both [1] and [2].")])
-    svc, retriever, _ = service({"deposit rules": [make_hit("a", ["Deposits"])],
-                                 "withdrawal rules": [make_hit("b", ["Withdrawals"])]}, ollama)
+                        streams=[answer(f"Both [{a_handle}] and [{b_handle}].")])
+    svc, retriever, _ = service({"deposit rules": [make_hit("a", ["Deposits"], chunk_index=0)],
+                                 "withdrawal rules": [make_hit("b", ["Withdrawals"], chunk_index=1)]}, ollama)
     events, result = run(svc, "how do deposits and withdrawals differ?")
 
     assert [e["type"] for e in events[:5]] == ["plan", "searching", "sources", "searching", "sources"]
@@ -257,7 +272,7 @@ def test_a_two_part_question_searches_each_part_and_records_both():
     assert result.search_queries == ["deposit rules", "withdrawal rules"]
     assert result.stats["auto_queries"] == 2
     assert [s.number for s in result.sources] == [1, 2]
-    assert result.cited == [1, 2]
+    assert result.cited == [a_handle, b_handle]
 
 
 def test_planned_queries_share_one_turns_worth_of_sources():
@@ -327,20 +342,21 @@ def test_no_relevant_sources_is_said_plainly():
 
 
 def test_the_model_can_search_for_more_with_the_tool():
+    a_handle, b_handle = handle_for("doc1", 0), handle_for("doc1", 1)
     ollama = FakeOllama(plan='{"search": true, "queries": ["loans"]}',
-                        streams=[tool_call("bond parties"), answer("Loans [1], bonds [2].")])
-    svc, retriever, _ = service({"loans": [make_hit("a", ["LOANS"])], "bond parties": [make_hit("b", ["BONDS"])]},
-                                ollama)
+                        streams=[tool_call("bond parties"), answer(f"Loans [{a_handle}], bonds [{b_handle}].")])
+    svc, retriever, _ = service({"loans": [make_hit("a", ["LOANS"], chunk_index=0)],
+                                 "bond parties": [make_hit("b", ["BONDS"], chunk_index=1)]}, ollama)
     events, result = run(svc, "compare loans and bonds")
 
     searches = [e for e in events if e["type"] == "searching"]
     assert [(e["query"], e["found_by"]) for e in searches] == [("loans", "auto"), ("bond parties", "tool")]
     assert [(s.number, s.point_id, s.found_by) for s in result.sources] == [(1, "a", "auto"), (2, "b", "tool")]
     assert retriever.calls[1]["exclude"] == {"a"}  # already-given passages aren't returned again
-    assert result.cited == [1, 2] and result.stats["tool_rounds"] == 1
+    assert result.cited == [a_handle, b_handle] and result.stats["tool_rounds"] == 1
     # The tool result goes back to the model as a tool message.
     second = [r for r in ollama.chat_requests if r.get("stream")][1]["messages"]
-    assert second[-1]["role"] == "tool" and second[-1]["content"].startswith("[2] doc1.pdf")
+    assert second[-1]["role"] == "tool" and second[-1]["content"].startswith(f"[{b_handle}] doc1.pdf")
     assert second[-2]["tool_calls"][0]["function"]["arguments"] == {"query": "bond parties"}
 
 
@@ -490,3 +506,79 @@ def test_list_libraries_with_none_readable_says_so():
     _, _ = run(svc, "what libraries are there?", library_overview=[])
     second = [r for r in ollama.chat_requests if r.get("stream")][1]["messages"]
     assert second[-1]["content"] == "No libraries available."
+
+
+# ------------------------------------------------------- carry-forward / cross-turn citation --
+
+def test_a_carried_source_appears_in_the_prompt_as_a_label_only():
+    handle = handle_for("earlier-doc", 0)
+    row = earlier_row(handle, "earlier-doc", 0, doc=1, chunk=1, text="THE SECRET PASSAGE TEXT")
+    ollama = FakeOllama(plan='{"search": true, "queries": ["something else"]}',
+                        streams=[answer("An answer with no citation.")])
+    svc, _, _ = service({"something else": []}, ollama)
+    events, result = run(svc, "tell me more", earlier=[row])
+
+    assert events[0]["type"] == "sources" and events[0]["sources"][0]["handle"] == handle
+    turn = user_turn(ollama)
+    assert "Cited earlier in this conversation" in turn
+    assert f"[{handle}] earlier-doc.pdf, p. 1" in turn
+    assert "THE SECRET PASSAGE TEXT" not in turn  # label only, no passage text
+    assert result.sources[0].found_by == "earlier"
+
+
+def test_a_handle_cited_earlier_can_be_cited_again_by_handle_or_by_ref():
+    handle = handle_for("earlier-doc", 0)
+    row = earlier_row(handle, "earlier-doc", 0, doc=1, chunk=1)
+    numbers = CitationNumbers.from_rows([row])
+    ollama = FakeOllama(plan='{"search": false, "queries": ["x"]}', streams=[answer(f"Again [{handle}] and [1:1].")])
+    svc, _, _ = service({}, ollama)
+    _, result = run(svc, "and that first point?", earlier=[row], numbers=numbers)
+
+    assert result.cited == [handle]  # both citations of it collapse to one
+    assert result.invalid_citations == []
+    assert result.refs[handle] == (1, 1)  # its number from the earlier turn, unchanged
+
+
+def test_a_carried_source_evicted_from_the_prompt_by_the_cap_still_resolves():
+    old_handle, new_handle = handle_for("old-doc", 0), handle_for("new-doc", 0)
+    old_row = earlier_row(old_handle, "old-doc", 0, doc=1, chunk=1)
+    new_row = earlier_row(new_handle, "new-doc", 0, doc=2, chunk=1)
+    ollama = FakeOllama(plan='{"search": false, "queries": ["x"]}', streams=[answer(f"Back to [{old_handle}].")])
+    svc, _, _ = service({}, ollama, CHAT_CARRY_SOURCES=1)
+    _, result = run(svc, "and the first thing?", earlier=[old_row, new_row])  # old_row: evicted by the cap
+
+    turn = user_turn(ollama)
+    assert old_handle not in turn  # not in the rendered prompt...
+    assert result.cited == [old_handle]  # ...but still resolves, from citation_state's own numbering
+
+
+def test_a_carried_source_re_found_by_search_upgrades_in_place_not_duplicates():
+    """The single easiest thing to get wrong in the carry-forward machinery:
+    a re-retrieved passage must replace its carried copy, never sit beside it."""
+    handle = handle_for("doc1", 0)
+    row = earlier_row(handle, "doc1", 0, doc=1, chunk=1, text="stale text")
+    hit = make_hit("a", ["Fresh"], doc_sha="doc1", chunk_index=0, text="fresh text", score=0.95)
+    ollama = FakeOllama(plan='{"search": true, "queries": ["q"]}', streams=[answer(f"Cites [{handle}].")])
+    svc, _, _ = service({"q": [hit]}, ollama)
+    _, result = run(svc, "q", earlier=[row])
+
+    matches = [s for s in result.sources if s.handle == handle]
+    assert len(matches) == 1
+    assert matches[0].found_by == "auto"  # upgraded: no longer "earlier"
+    assert matches[0].text == "fresh text"
+
+
+def test_citing_documents_out_of_retrieval_order_numbers_by_citation_order():
+    """B is retrieved second but cited first, so its document becomes
+    document 1: allocation follows first-citation order, not retrieval
+    order. Two different documents (doc_sha), so this is about document
+    numbers, not chunk numbers within one document."""
+    a_handle, b_handle = handle_for("docA", 0), handle_for("docB", 0)
+    ollama = FakeOllama(plan='{"search": true, "queries": ["q"]}',
+                        streams=[answer(f"First [{b_handle}] then [{a_handle}].")])
+    svc, _, _ = service({"q": [make_hit("a", ["A"], doc_sha="docA", chunk_index=0),
+                               make_hit("b", ["B"], doc_sha="docB", chunk_index=0)]}, ollama)
+    _, result = run(svc, "q")
+
+    assert result.refs[b_handle][0] == 1
+    assert result.refs[a_handle][0] == 2

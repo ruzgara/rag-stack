@@ -13,6 +13,7 @@ import pytest
 from accounts import Accounts
 from auth import Auth
 from chat import TurnResult
+from citations import handle_for
 from db import ChatDB
 from fastapi import HTTPException
 from limits import Gate, GateConfig
@@ -305,13 +306,16 @@ def test_stopping_a_turn_keeps_what_streamed_and_ends_the_pipeline(chat, monkeyp
     conv = api.state.db.create_conversation("everyday", user_id=user.id)
     closed = []
 
+    handle = handle_for("d", 0)
+
     def long_answer(self, question, history, preset, **kw):
         try:
             yield {"type": "sources", "sources": [{"number": 1, "found_by": "auto", "query": "q", "point_id": "p",
                                                    "doc_sha": "d", "filename": "f.pdf", "chunk_index": 0,
                                                    "pages": [1], "headings": [], "text": "t",
-                                                   "rerank_score": 0.9}]}
-            yield {"type": "token", "text": "It says [1]"}
+                                                   "rerank_score": 0.9, "handle": handle,
+                                                   "doc_number": None, "chunk_number": None}]}
+            yield {"type": "token", "text": f"It says [{handle}]"}
             # The stop button, pressed while the answer streams.
             assert api.stop_generation(conv["id"], user) == {"stopped": 1}
             yield {"type": "token", "text": " and more"}
@@ -327,7 +331,7 @@ def test_stopping_a_turn_keeps_what_streamed_and_ends_the_pipeline(chat, monkeyp
     assert events[-1].startswith("event: stopped"), events
     assert not any("and more" in e or e.startswith("event: done") for e in events)
     answer = api.state.db.get_conversation(conv["id"], user_id=user.id)["messages"][-1]
-    assert (answer["status"], answer["content"]) == ("stopped", "It says [1]")
+    assert (answer["status"], answer["content"]) == ("stopped", f"It says [{handle}]")
     assert [s["cited"] for s in answer["sources"]] == [True]
 
 

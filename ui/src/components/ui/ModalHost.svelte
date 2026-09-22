@@ -18,7 +18,7 @@
   {:else if m.kind === "libraries"}<LibrariesModal />
   {:else if m.kind === "library"}<LibraryModal id={m.id} />
   {:else if m.kind === "sharing"}<SharingModal id={m.id} />
-  {:else if m.kind === "source"}<SourceModal turnKey={m.turnKey} number={m.number} />
+  {:else if m.kind === "source"}<SourceModal turnKey={m.turnKey} handle={m.handle} />
   {:else if m.kind === "upload"}<UploadModal libraryId={m.libraryId} folder={m.folder} />
   {:else if m.kind === "groups"}<GroupsModal />
   {:else if m.kind === "settings"}<SettingsModal />

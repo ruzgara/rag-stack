@@ -11,10 +11,15 @@
   });
   const isLatest = $derived(turn !== null && turn === chat.active?.turns[chat.active.turns.length - 1]);
 
+  // Carried-forward sources ("earlier") this answer did not itself cite
+  // weren't retrieved for this turn -- they're excluded from the panel
+  // entirely, not just uncited-styled, and from the "N retrieved" count.
+  const retrieved = $derived((turn?.sources ?? []).filter((s) => s.found_by !== "earlier" || s.cited));
   // Mid-stream nothing is cited yet (`cited` arrives with `done`), so every
   // source shows as retrieved until then.
-  const cited = $derived((turn?.sources ?? []).filter((s) => s.cited).sort((a, b) => a.number - b.number));
-  const uncited = $derived((turn?.sources ?? []).filter((s) => !s.cited).sort((a, b) => a.number - b.number));
+  const cited = $derived(retrieved.filter((s) => s.cited)
+    .sort((a, b) => (a.doc_number ?? 0) - (b.doc_number ?? 0) || (a.chunk_number ?? 0) - (b.chunk_number ?? 0)));
+  const uncited = $derived(retrieved.filter((s) => !s.cited));
 
   function scoreColor(s: Source): string {
     return (s.rerank_score ?? 0) >= 0.8 ? "var(--color-accent-700)" : "var(--color-neutral-600)";
@@ -22,15 +27,15 @@
 
   function openSource(s: Source): void {
     if (!turn) return;
-    ui.open({ kind: "source", turnKey: turn.key, number: s.number });
+    ui.open({ kind: "source", turnKey: turn.key, handle: s.handle });
   }
 
   // Scroll the first focused card into view (citation hover/click).
   let list: HTMLDivElement | undefined = $state();
   $effect(() => {
-    const n = ui.focusedSources[0];
-    if (n === undefined || !list) return;
-    list.querySelector(`[data-n="${n}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    const handle = ui.focusedSources[0];
+    if (handle === undefined || !list) return;
+    list.querySelector(`[data-handle="${handle}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   });
 
   let menuEl: HTMLDivElement | undefined = $state();
@@ -50,10 +55,10 @@
 <svelte:document onclick={onDocClick} onkeydown={onKey} />
 
 {#snippet card(s: Source)}
-  <button class="src" class:focused={ui.focusedSources.includes(s.number)} class:uncited={!s.cited && turn?.status !== "streaming"}
-          data-n={s.number} onclick={() => openSource(s)}>
+  <button class="src" class:focused={ui.focusedSources.includes(s.handle)} class:uncited={!s.cited && turn?.status !== "streaming"}
+          data-handle={s.handle} onclick={() => openSource(s)}>
     <div class="src-head">
-      <span class="n">[{s.number}]</span>
+      {#if s.doc_number !== null}<span class="n">[{s.doc_number}:{s.chunk_number}]</span>{/if}
       <span class="title">{s.filename}</span>
     </div>
     <div class="src-meta">
@@ -89,26 +94,26 @@
 
   <div class="head">
     <h6>Sources</h6>
-    {#if turn && turn.sources.length}
-      <span class="counts">{turn.status !== "streaming" ? `${cited.length} cited · ` : ""}{turn.sources.length} retrieved</span>
+    {#if turn && retrieved.length}
+      <span class="counts">{turn.status !== "streaming" ? `${cited.length} cited · ` : ""}{retrieved.length} retrieved</span>
     {/if}
   </div>
-  {#if turn && !isLatest && turn.sources.length}
+  {#if turn && !isLatest && retrieved.length}
     <button class="back" onclick={() => (ui.selectedTurnKey = null)}>Showing an earlier answer · back to latest</button>
   {/if}
 
   <div class="list rag-scroll" bind:this={list}>
-    {#if !turn || turn.sources.length === 0}
+    {#if !turn || retrieved.length === 0}
       <p class="empty">
         {#if turn?.status === "streaming"}Passages appear here as the answer searches.
         {:else if turn}This answer didn't draw on any documents.
-        {:else}The passages and answer cites appear here, numbered as it cites them.{/if}
+        {:else}The passages and answer cites appear here, marked [doc:chunk] as it cites them.{/if}
       </p>
     {:else}
-      {#each cited as s (s.number)}{@render card(s)}{/each}
+      {#each cited as s (s.handle)}{@render card(s)}{/each}
       {#if uncited.length}
         {#if cited.length}<div class="sub">Retrieved, not cited</div>{/if}
-        {#each uncited as s (s.number)}{@render card(s)}{/each}
+        {#each uncited as s (s.handle)}{@render card(s)}{/each}
       {/if}
     {/if}
   </div>

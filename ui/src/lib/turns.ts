@@ -5,7 +5,7 @@
 // unit-tested (tests/turns.test.ts).
 
 import type { AnswerStatus, Message, Source, TurnEvent, TurnStats } from "./types";
-import { citationRe, parseCitation } from "./citations";
+import { buildCiteMap, parseCitations } from "./citations";
 
 export type TurnStatus = "streaming" | AnswerStatus;
 
@@ -14,8 +14,8 @@ export type TurnStatus = "streaming" | AnswerStatus;
 export interface TraceStep {
   verb: "planned" | "search" | "list" | "note" | "thinking";
   text: string;
-  /** For searches: the source numbers this query brought in. */
-  sources: number[];
+  /** For searches: the handles of the sources this query brought in. */
+  sources: string[];
   foundBy?: "auto" | "tool";
   /** Rewrite only: the model never answered, so `text` is the raw message. */
   failed?: boolean;
@@ -110,11 +110,17 @@ export function applyEvent(t: Turn, ev: TurnEvent): void {
       t.trace.push({ verb: "search", text: ev.query, sources: [], foundBy: ev.found_by });
       break;
     case "sources": {
-      // A `sources` event follows its own `searching` event.
+      // A `sources` event follows its own `searching` event. Deduped and
+      // REPLACED on handle collision, not appended: a carried-forward
+      // source that a fresh search re-finds is re-emitted with the same
+      // handle (chat.py._search's upgrade-in-place), so the second copy
+      // here must overwrite the first rather than sit beside it.
       const step = [...t.trace].reverse().find((s) => s.verb === "search");
       for (const s of ev.sources) {
-        if (!t.sources.some((x) => x.number === s.number)) t.sources.push(s);
-        if (step && !step.sources.includes(s.number)) step.sources.push(s.number);
+        const i = t.sources.findIndex((x) => x.handle === s.handle);
+        if (i === -1) t.sources.push(s);
+        else t.sources[i] = s;
+        if (step && !step.sources.includes(s.handle)) step.sources.push(s.handle);
       }
       break;
     }
@@ -169,7 +175,12 @@ export function applyEvent(t: Turn, ev: TurnEvent): void {
       if (ev.answer !== undefined) t.answer = ev.answer;
       if (ev.cited) {
         const cited = new Set(ev.cited);
-        t.sources = t.sources.map((s) => ({ ...s, cited: cited.has(s.number) }));
+        const refs = ev.refs ?? {};
+        t.sources = t.sources.map((s) => {
+          const ref = refs[s.handle];
+          return { ...s, cited: cited.has(s.handle), doc_number: ref ? ref[0] : s.doc_number,
+                   chunk_number: ref ? ref[1] : s.chunk_number };
+        });
       }
       t.status = "stopped";
       break;
@@ -197,14 +208,19 @@ export function traceFromStored(searchQueries: string[], sources: Source[], stat
         ? { verb: "planned", text: planText(searchQueries.slice(0, planned)), sources: [] }
         : { verb: "note", text: "no search needed for this message", sources: [] });
   }
-  const claimed = new Set<number>();
+  const claimed = new Set<string>();
   searchQueries.forEach((q, i) => {
     const foundBy = i < planned ? "auto" : "tool";
-    const nums = sources
-      .filter((s) => s.query === q && s.found_by === foundBy && !claimed.has(s.number))
-      .map((s) => s.number);
-    nums.forEach((n) => claimed.add(n));
-    steps.push({ verb: "search", text: q, sources: nums, foundBy,
+    // found_by here is only ever "auto" or "tool" -- a carried-forward
+    // ("earlier") source never matches, so it's excluded from the trace
+    // without this needing to say so. Correct, but only because nothing
+    // upstream can produce query === q with found_by "earlier": it's
+    // carried in at run_turn's start, not from a search step at all.
+    const handles = sources
+      .filter((s) => s.query === q && s.found_by === foundBy && !claimed.has(s.handle))
+      .map((s) => s.handle);
+    handles.forEach((h) => claimed.add(h));
+    steps.push({ verb: "search", text: q, sources: handles, foundBy,
                  seconds: foundBy === "auto" ? stats?.search_s : undefined });
   });
   const listed = stats?.listed_documents ?? 0;
@@ -258,17 +274,27 @@ export function toTurns(messages: Message[]): Turn[] {
 }
 
 /** The server's invalid_citations is sent on `done` but never stored, so a
- *  reopened turn derives it here. Mirrors chat.py:resolve_citations. */
-export function deriveInvalid(answer: string, sources: Source[]): number[] {
-  const known = new Set(sources.map((s) => s.number));
-  const seen: number[] = [];
-  const re = citationRe();
-  for (let m = re.exec(answer); m; m = re.exec(answer)) {
-    for (const n of parseCitation(m[1])) {
-      if (!seen.includes(n)) seen.push(n);
+ *  reopened turn derives it here, from the message's own sources -- mirrors
+ *  citations.py's resolve() (the invalid half of it; cited isn't needed
+ *  here, the stored `sources[].cited` already has it). Entries may be a raw
+ *  handle -- never rendered, see citations.ts's renderItem -- a "d:c" ref
+ *  string, or a malformed token; callers must not print one verbatim. */
+export function deriveInvalid(answer: string, sources: Source[]): string[] {
+  const map = buildCiteMap(sources);
+  const invalid: string[] = [];
+  for (const citation of parseCitations(answer)) {
+    for (const item of citation.items) {
+      if (item.handle !== undefined) {
+        if (!map.handles.has(item.handle) && !invalid.includes(item.handle)) invalid.push(item.handle);
+      } else if (item.ref !== undefined) {
+        const key = `${item.ref[0]}:${item.ref[1]}`;
+        if (!map.refs.has(key) && !invalid.includes(key)) invalid.push(key);
+      } else if (item.raw !== undefined && !invalid.includes(item.raw)) {
+        invalid.push(item.raw);
+      }
     }
   }
-  return seen.filter((n) => !known.has(n));
+  return invalid;
 }
 
 /** "3 searches · 7 sources cited · 4.2s" */

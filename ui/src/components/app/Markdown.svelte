@@ -5,14 +5,15 @@
   // finalize() parse replaces the incremental render.
   import { onDestroy } from "svelte";
   import { StreamingMarkdown } from "../../lib/render";
+  import type { CiteMap } from "../../lib/citations";
   import type { TurnStatus } from "../../lib/turns";
 
   interface Props {
     answer: string;
     status: TurnStatus;
-    known: Set<number>;
+    map: CiteMap;
   }
-  const { answer, status, known }: Props = $props();
+  const { answer, status, map }: Props = $props();
 
   let container: HTMLDivElement | undefined = $state();
   let renderer: StreamingMarkdown | undefined;
@@ -30,11 +31,14 @@
           renderer = new StreamingMarkdown(container);
           finalized = false;
         }
-        renderer.update(answer, known);
+        // Nothing has a number yet mid-stream (that arrives with `done`),
+        // so every citation renders as a neutral placeholder -- never the
+        // raw handle -- until finalize() below replaces it wholesale.
+        renderer.update(answer, map, true);
       } else if (!finalized) {
         renderer ??= new StreamingMarkdown(container);
         finalized = true;
-        renderer.finalize(answer, known);
+        renderer.finalize(answer, map);
       }
     });
   }
@@ -42,7 +46,7 @@
   $effect(() => {
     void answer;
     void status;
-    void known;
+    void map;
     scheduleUpdate();
   });
 

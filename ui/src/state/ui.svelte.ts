@@ -14,7 +14,7 @@ export type Modal =
   | { kind: "libraries" }
   | { kind: "library"; id: string }
   | { kind: "sharing"; id: string }
-  | { kind: "source"; turnKey: string; number: number }
+  | { kind: "source"; turnKey: string; handle: string }
   | { kind: "upload"; libraryId?: string; folder?: boolean }
   | { kind: "groups" }
   | { kind: "settings" }
@@ -63,8 +63,8 @@ class UiState {
   dialog = $state<Dialog | null>(null);
   /** Which turn's sources the right panel shows; null = the last turn. */
   selectedTurnKey = $state<string | null>(null);
-  /** Source numbers to flash in the panel (hovering/clicking a citation). */
-  focusedSources = $state<number[]>([]);
+  /** Source handles to flash in the panel (hovering/clicking a citation). */
+  focusedSources = $state<string[]>([]);
   /** Narrow screens: the rail and the sources panel become drawers. */
   railOpen = $state(false);
   sourcesOpen = $state(false);
@@ -136,9 +136,9 @@ class UiState {
     else d.resolve(typeof result === "object" ? result : null);
   }
 
-  focusSources(nums: number[], turnKey?: string): void {
+  focusSources(handles: string[], turnKey?: string): void {
     if (turnKey) this.selectedTurnKey = turnKey;
-    this.focusedSources = nums;
+    this.focusedSources = handles;
   }
 }
 

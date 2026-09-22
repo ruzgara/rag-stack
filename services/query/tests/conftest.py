@@ -7,6 +7,7 @@ or data/.
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import httpx
@@ -17,10 +18,18 @@ from retrieval import Hit, SearchConfig
 SEARCH_ENV = {"EMBED_MODEL": "bge-m3"}
 CHAT_ENV = {"CHAT_MODEL_EVERYDAY": "small-model", "CHAT_MODEL_HARD": "big-model", "CHAT_THINK_HARD": "true"}
 
+# handle_for(doc_sha, chunk_index) is what gives a passage its citation
+# handle, so two fixture hits that don't say otherwise must not share a
+# chunk_index -- same doc_sha default too -- or they silently share a
+# handle, and a citation test can pass by accident (or fail for a reason
+# that has nothing to do with what it's testing).
+_next_chunk_index = itertools.count()
+
 
 def make_hit(point_id: str, headings: list[str], score: float = 0.9, doc_sha: str = "doc1", text: str | None = None,
-             chunk_index: int = 0, pages: list[int] | None = None) -> Hit:
+             chunk_index: int | None = None, pages: list[int] | None = None) -> Hit:
     text = text if text is not None else f"text of {point_id}"
+    chunk_index = next(_next_chunk_index) if chunk_index is None else chunk_index
     return Hit(rank=0, score=score, fused_rank=1, fused_score=0.5, point_id=point_id, doc_sha=doc_sha,
                filename=f"{doc_sha}.pdf", chunk_index=chunk_index, pages=pages or [1], headings=list(headings),
                text=text, context_text="\n".join([*headings, text]), rerank_score=score)

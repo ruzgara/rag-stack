@@ -24,10 +24,17 @@ const workspaces = [
   { id: "W2", name: "Scratch", description: null, created_at: now, updated_at: now, last_used_at: now - 10,
     library_ids: [], conversation_count: 0 },
 ];
-const source = (n: number, cited: boolean) => ({
-  number: n, found_by: "auto", query: "indemnity cap", point_id: `p${n}`, doc_sha: "sha1", filename: "Arbor MSA.pdf",
-  chunk_index: 4, pages: [24], headings: ["11 Liability", "11.3 Limitation"], text: `Passage ${n} text.`,
-  rerank_score: 0.91, cited,
+// HANDLE_RE-shaped test handles -- see services/query/citations.py: S + 4
+// alphabet chars with a digit forced third.
+const CITED_HANDLE = "Sk29fp";
+const UNCITED_HANDLE = "Sm4p2q";
+const EARLIER_HANDLE = "Sz29zz"; // carried forward, not cited by m2 -- excluded from its panel/count
+const RETRY_HANDLE = "Sa2bcd";
+
+const source = (handle: string, cited: boolean, foundBy: "auto" | "tool" | "earlier" = "auto") => ({
+  found_by: foundBy, query: "indemnity cap", point_id: `p-${handle}`, doc_sha: "sha1", filename: "Arbor MSA.pdf",
+  chunk_index: 4, pages: [24], headings: ["11 Liability", "11.3 Limitation"], text: `Passage ${handle} text.`,
+  rerank_score: 0.91, handle, doc_number: cited ? 1 : null, chunk_number: cited ? 1 : null, cited,
 });
 const convList = [{ id: "C1", title: "Indemnity caps", preset: "hard", workspace_id: "W1", created_at: now - 100,
   updated_at: now - 50, last_read_at: now - 60, last_message_at: now - 50, archived: 0, message_count: 2, library_ids: ["L1"] }];
@@ -35,10 +42,13 @@ const convDetail = {
   ...convList[0],
   messages: [
     { id: "m1", role: "user", content: "What caps did we agree?", created_at: now - 60 },
-    { id: "m2", role: "assistant", content: "Arbor is capped at 1× fees [1].", created_at: now - 50, model: "qwen", preset: "hard",
+    { id: "m2", role: "assistant", content: `Arbor is capped at 1× fees [${CITED_HANDLE}].`, created_at: now - 50, model: "qwen", preset: "hard",
       search_queries: ["indemnity cap"], status: "complete", error: null,
       stats: { auto_search: true, plan_s: 0.2, search_s: 0.8, total_s: 4.2, completion_tokens: 12, first_token_s: 1.1, context_used_pct: 62 },
-      sources: [source(1, true), source(2, false)] },
+      // The third source is carried forward from an earlier turn and this
+      // answer doesn't cite it -- SourcesPanel must exclude it from both the
+      // list and the "N retrieved" count (it wasn't retrieved this turn).
+      sources: [source(CITED_HANDLE, true), source(UNCITED_HANDLE, false), source(EARLIER_HANDLE, false, "earlier")] },
   ],
 };
 
@@ -83,9 +93,10 @@ function route(url: string, init?: RequestInit): Response {
   if (p === "/api/conversations/C1" && m === "GET") return json(convDetail);
   if (p === "/api/conversations/C1/messages") return sse([
     ["user", { id: "m3" }], ["plan", { queries: ["northgate cap"], search: true }],
-    ["searching", { query: "northgate cap", found_by: "auto" }], ["sources", { sources: [source(1, false)] }],
-    ["thinking", { text: "Considering" }], ["token", { text: "Northgate is uncapped " }], ["token", { text: "[1]." }],
-    ["stopped", { message_id: "m4", answer: "Northgate is uncapped [1].", cited: [1] }]]);
+    ["searching", { query: "northgate cap", found_by: "auto" }], ["sources", { sources: [source(RETRY_HANDLE, false)] }],
+    ["thinking", { text: "Considering" }], ["token", { text: "Northgate is uncapped " }], ["token", { text: `[${RETRY_HANDLE}].` }],
+    ["stopped", { message_id: "m4", answer: `Northgate is uncapped [${RETRY_HANDLE}].`, cited: [RETRY_HANDLE],
+                  refs: { [RETRY_HANDLE]: [1, 1] } }]]);
   if (p === "/api/conversations/C1/stop") { stopCalled = true; return json({ stopped: 1 }); }
   if (p === "/api/groups") return json({ groups: [{ id: "g1", name: "Corporate", description: null, type: "open", member_count: 3 }] });
   if (p === "/api/tokens") return json({ tokens: [] });
@@ -151,7 +162,9 @@ describe("app smoke", () => {
     expect(text()).toContain("What caps did we agree?");
     expect(text()).toContain("1 search · 1 source cited · 4.2s");
     expect(text()).toContain("context 62% full");
-    expect(document.querySelector(".md .cite")?.textContent).toBe("[1]");
+    expect(document.querySelector(".md .cite")?.textContent).toBe("[1:1]");
+    // 2 retrieved, not 3: the carried-forward EARLIER_HANDLE source this
+    // answer didn't cite is excluded from the panel and this count.
     expect(text()).toContain("1 cited · 2 retrieved");
     expect(text()).toContain("Ellis Marchetti");
 

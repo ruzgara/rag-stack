@@ -225,10 +225,16 @@ export interface TurnStats {
 }
 
 /** chat.py Source. `cited` is absent on the incremental `sources` SSE event
- *  and present once `done` (or the stored copy) arrives. */
+ *  and present once `done` (or the stored copy) arrives. `handle` is the
+ *  citation identifier the model actually cites by -- opaque, stable
+ *  forever, never shown to the reader (see lib/citations.ts). `doc_number`/
+ *  `chunk_number` are the reader-facing [doc:chunk], set only once this
+ *  passage has actually been cited in the conversation. "earlier": carried
+ *  forward from a previous turn (db.citation_state), not retrieved this one
+ *  -- see turns.ts's traceFromStored comment on why it's excluded there. */
 export interface Source {
   number: number;
-  found_by: "auto" | "tool";
+  found_by: "auto" | "tool" | "earlier";
   query: string;
   point_id: string;
   doc_sha: string;
@@ -238,6 +244,9 @@ export interface Source {
   headings: string[];
   text: string;
   rerank_score: number | null;
+  handle: string;
+  doc_number: number | null;
+  chunk_number: number | null;
   cited?: boolean;
 }
 
@@ -280,15 +289,17 @@ export type TurnEvent =
       model: string;
       preset: string;
       search_queries: string[];
-      cited: number[];
-      invalid_citations: number[];
+      cited: string[];
+      refs: Record<string, [number, number]>;
+      invalid_citations: string[];
       stats: TurnStats;
       sources: DoneSource[];
     }
   | { type: "title"; title: string }
   | { type: "error"; error: string }
   /** Empty ({}) when stopped while still queued -- nothing was stored. */
-  | { type: "stopped"; message_id?: string; answer?: string; cited?: number[] };
+  | { type: "stopped"; message_id?: string; answer?: string; cited?: string[];
+      refs?: Record<string, [number, number]>; invalid_citations?: string[] };
 
 // ----------------------------------------------------------------- health --
 

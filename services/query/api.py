@@ -39,7 +39,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from chat import ChatConfig, ChatError, ChatService, Source, resolve_citations
+from chat import ChatConfig, ChatError, ChatService
+from citations import CitationNumbers, assign_numbers, parse_citations, resolve
 from accounts import Accounts, Denied, Invalid, User
 from auth import SESSION_MAX_AGE, Auth, as_http_error, bearer_token, hash_password, session_secret, verify_password
 import settings
@@ -1080,13 +1081,44 @@ def unarchive_conversation(conv_id: str, user: User = CurrentUser) -> dict:
         raise HTTPException(404, "conversation not found") from None
 
 
+def _cited_numbers(sources: list[dict], cited_handles: list[str]) -> set[int]:
+    """add_assistant_message's `cited` is a set of per-message retrieval-order
+    numbers (message_sources' PRIMARY KEY); TurnResult.cited (and the handles
+    a stopped answer resolves for itself, below) are handles. This is the one
+    place that gap gets closed -- every call site converts through it rather
+    than reinventing the mapping three times."""
+    cited = set(cited_handles)
+    return {s["number"] for s in sources if s.get("handle") in cited}
+
+
+def _merge_source(sources: list[dict], new: dict) -> None:
+    """Accumulates one turn's `sources` SSE events for storage. A carried
+    source that gets upgraded in place (chat.py._search) is re-emitted with
+    the same `number` so the UI can replace its copy -- accumulating it here
+    with extend() would try to INSERT two message_sources rows sharing that
+    number and hit the table's own primary key. Replacing in place keeps
+    exactly one row per number, same as the UI keeps one per handle."""
+    for i, existing in enumerate(sources):
+        if existing["number"] == new["number"]:
+            sources[i] = new
+            return
+    sources.append(new)
+
+
 def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], preset: str, doc_shas,
-                 library_overview, stop: threading.Event, *, first_turn: bool, has_title: bool) -> Iterator[str]:
+                 library_overview, numbers: CitationNumbers, earlier: list[dict], stop: threading.Event, *,
+                 first_turn: bool, has_title: bool) -> Iterator[str]:
     """Runs one turn and streams it as the SSE kinds documented on
     send_message, storing the answer (or the error) as it finishes. Shared
     by send_message and retry_message -- they differ only in what happens
     before this: whether a new user message is stored and a `user` event
     opens the stream.
+
+    `numbers`/`earlier` are the conversation's citation state (db.citation_state),
+    read by the caller alongside `history` -- see send_message/retry_message.
+    A copy is kept here (never `numbers` itself) so the stopped path below
+    can resolve against it independently of whatever run_turn did with its
+    own copy.
 
     `stop` is checked between the pipeline's events: once it's set, the
     pipeline is closed (which drops the Ollama request, so the model stops
@@ -1098,30 +1130,45 @@ def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], p
     queries: list[str] = []
     finished = False
     try:
-        turn = state.chat.run_turn(question, history, preset, doc_shas=doc_shas, library_overview=library_overview)
+        turn = state.chat.run_turn(question, history, preset, doc_shas=doc_shas, library_overview=library_overview,
+                                   numbers=numbers, earlier=earlier)
         for ev in turn:
             kind = ev["type"]
             if stop.is_set() and kind != "done":  # a finished answer is kept, however late the stop
                 turn.close()
                 finished = True
                 partial = "".join(tokens)
-                cited, _ = resolve_citations(partial, [Source(**s) for s in sources])
+                # The turn never reached its own citation step, so it's redone
+                # here -- against a copy of the conversation's numbering, not
+                # run_turn's (which died with the generator) -- and the
+                # NUMBERED source dicts are what get stored, or a stopped
+                # answer's citations would never resolve.
+                local_numbers = numbers.copy()
+                known = {s["handle"]: s for s in sources}
+                cited_handles, invalid = resolve(parse_citations(partial), local_numbers, known)
+                refs = assign_numbers(cited_handles, {h: known[h]["doc_sha"] for h in cited_handles}, local_numbers)
+                for handle, (doc_n, chunk_n) in refs.items():
+                    known[handle]["doc_number"], known[handle]["chunk_number"] = doc_n, chunk_n
                 saved = state.db.add_assistant_message(
                     conv_id, content=partial, model=state.chat.cfg.preset(preset).model, preset=preset,
-                    search_queries=queries, sources=sources, cited=set(cited), status="stopped", user_id=user.id)
-                yield sse("stopped", {"message_id": saved["id"], "answer": partial, "cited": cited})
+                    search_queries=queries, sources=sources, cited=_cited_numbers(sources, cited_handles),
+                    status="stopped", user_id=user.id)
+                yield sse("stopped", {"message_id": saved["id"], "answer": partial, "cited": cited_handles,
+                                      "refs": {h: list(r) for h, r in refs.items()}, "invalid_citations": invalid})
                 return
             if kind == "done":
                 r = ev["result"]
+                stored_sources = [asdict(s) for s in r.sources]
                 saved = state.db.add_assistant_message(
                     conv_id, content=r.answer, model=r.model, preset=r.preset, search_queries=r.search_queries,
-                    sources=[asdict(s) for s in r.sources], cited=set(r.cited), stats=r.stats,
+                    sources=stored_sources, cited=_cited_numbers(stored_sources, r.cited), stats=r.stats,
                     user_id=user.id)
                 finished = True
                 yield sse("done", {"message_id": saved["id"], "answer": r.answer, "model": r.model,
                                    "preset": r.preset, "search_queries": r.search_queries, "cited": r.cited,
+                                   "refs": {h: list(v) for h, v in r.refs.items()},
                                    "invalid_citations": r.invalid_citations, "stats": r.stats,
-                                   "sources": [{**asdict(s), "cited": s.number in r.cited} for s in r.sources]})
+                                   "sources": [{**asdict(s), "cited": s.handle in r.cited} for s in r.sources]})
                 if first_turn and not has_title:
                     title = state.chat.generate_title(preset, question, r.answer)
                     if title:
@@ -1131,7 +1178,8 @@ def _stream_turn(conv_id: str, user: User, question: str, history: list[dict], p
             if kind == "token":
                 tokens.append(ev["text"])
             elif kind == "sources":
-                sources.extend(ev["sources"])
+                for s in ev["sources"]:
+                    _merge_source(sources, s)
             elif kind == "searching":
                 queries.append(ev["query"])
             yield sse(kind, {k: v for k, v in ev.items() if k != "type"})
@@ -1186,15 +1234,18 @@ def send_message(conv_id: str, body: NewMessage, user: User = CurrentUser) -> St
                 answer, so queries is just the message as-is
       searching {query, found_by}: a search is running (auto or tool)
       listing   {document}: the model asked what the knowledge base holds
-      sources   {sources: [...]}: passages added, numbered for citation
+      sources   {sources: [...]}: passages added, each with its own citation identifier (handle)
       thinking  {text}: reasoning tokens (presets with thinking on)
       token     {text}: answer tokens
-      done      {message_id, answer, cited, invalid_citations, sources, ...}
+      done      {message_id, answer, cited, refs, invalid_citations, sources, ...}: cited and
+                invalid_citations are handles; refs maps each cited handle to the
+                [doc_number, chunk_number] a reader sees for it
       title     {title}: after the first answer, a generated conversation title
       error     {error}: the turn failed; partial output is stored with status "error"
-      stopped   {message_id, answer, cited}: stop_generation ended the turn; the partial answer
-                is stored with status "stopped". Just {} if it was stopped while
-                still queued -- then nothing was stored, not even the question.
+      stopped   {message_id, answer, cited, refs, invalid_citations}: stop_generation ended the
+                turn; the partial answer is stored with status "stopped". Just {} if it
+                was stopped while still queued -- then nothing was stored, not even
+                the question.
 
     The turn runs in its own thread and is stored when it finishes, even if
     the client disconnects halfway: reopening the conversation shows it.
@@ -1216,11 +1267,12 @@ def send_message(conv_id: str, body: NewMessage, user: User = CurrentUser) -> St
 
     def stream(stop: threading.Event) -> Iterator[str]:
         history = state.db.history(conv_id, user_id=user.id)
+        numbers, earlier = state.db.citation_state(conv_id, user_id=user.id)
         first_turn = not history
         user_msg = state.db.add_user_message(conv_id, body.content, user_id=user.id)
         yield sse("user", {"id": user_msg["id"]})
-        yield from _stream_turn(conv_id, user, body.content, history, preset, doc_shas, library_overview, stop,
-                                first_turn=first_turn, has_title=bool(conv["title"]))
+        yield from _stream_turn(conv_id, user, body.content, history, preset, doc_shas, library_overview,
+                                numbers, earlier, stop, first_turn=first_turn, has_title=bool(conv["title"]))
 
     return _streamed(user.id, conv_id, stream)
 
@@ -1250,9 +1302,15 @@ def retry_message(conv_id: str, user: User = CurrentUser) -> StreamingResponse:
         state.db.touch_workspace(conv["workspace_id"], user_id=user.id, is_admin=user.is_admin)
 
     def stream(stop: threading.Event) -> Iterator[str]:
+        # prepare_retry above already deleted the old answer (cascading its
+        # message_sources rows), so citation_state read here already sees
+        # its number as free -- that ordering is what makes retry recycle
+        # the number instead of leaving it held by a row that's about to
+        # vanish anyway.
         history = state.db.history(conv_id, user_id=user.id)
-        yield from _stream_turn(conv_id, user, question, history, preset, doc_shas, library_overview, stop,
-                                first_turn=not history, has_title=bool(conv["title"]))
+        numbers, earlier = state.db.citation_state(conv_id, user_id=user.id)
+        yield from _stream_turn(conv_id, user, question, history, preset, doc_shas, library_overview,
+                                numbers, earlier, stop, first_turn=not history, has_title=bool(conv["title"]))
 
     return _streamed(user.id, conv_id, stream)
 

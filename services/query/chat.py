@@ -11,16 +11,21 @@ One turn:
   2. Auto-search: retrieve() returns the passages the reranker scores
      relevant (RAG_RERANK_MIN_SCORE), whole sections where several chunks of
      one section match; they're taken best first until
-     CHAT_AUTO_SOURCE_TOKENS is used, and numbered [1]..[n]. How many that is
-     depends on the question -- one passage for a narrow one, many for a broad
-     one -- rather than a fixed count (CHAT_INITIAL_SOURCES only caps it).
+     CHAT_AUTO_SOURCE_TOKENS is used. Each gets a citation handle (see
+     citations.py) -- opaque, stable forever, and never shown to the reader.
+     How many passages that is depends on the question -- one for a narrow
+     one, many for a broad one -- rather than a fixed count
+     (CHAT_INITIAL_SOURCES only caps it).
   3. Answer: the chat model streams its answer from Ollama. If the preset has
      tools on, it may call search_documents for more passages, or
      list_documents to see what the knowledge base holds -- at most
      CHAT_MAX_TOOL_ROUNDS times, within CHAT_MAX_SOURCE_TOKENS. Passages
-     already given are never returned again, and numbering continues, so
-     earlier citations stay valid.
-  4. Citations: [n] references in the answer are resolved to their sources.
+     already given are never returned again. Passages the conversation cited
+     in an earlier turn are offered too, by identifier and location only
+     (no text), so the model can cite them again without re-searching.
+  4. Citations: the handles in the answer are resolved against this turn's
+     sources and the conversation's numbering (citations.py), which also
+     assigns each cited passage its reader-facing [doc:chunk].
 
 run_turn() yields events as they happen; the caller streams and stores them.
 """
@@ -28,7 +33,7 @@ run_turn() yields events as they happen; the caller streams and stores them.
 from __future__ import annotations
 
 import json
-import re
+import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -36,8 +41,11 @@ from typing import Iterator, NamedTuple
 
 import httpx
 
+from citations import CitationNumbers, assign_numbers, handle_for, parse_citations, resolve
 from library import Library
 from retrieval import Hit, Retriever, _bool, _float, _int, estimate_tokens, load_env
+
+log = logging.getLogger(__name__)
 
 PROMPTS = Path(__file__).parent / "prompts"
 PRESETS = ("everyday", "hard")
@@ -48,7 +56,7 @@ SEARCH_TOOL = {
         "name": "search_documents",
         "description": (
             "Search the document library for more passages. Returns passages not already provided, "
-            "numbered for citation. Repeating an earlier query returns further passages for it."
+            "each with its own citation identifier. Repeating an earlier query returns further passages for it."
         ),
         "parameters": {
             "type": "object",
@@ -89,11 +97,6 @@ LIBRARIES_TOOL = {
         "parameters": {"type": "object", "properties": {}},
     },
 }
-
-# [2], [1, 3], [1; 3], and ranges [1-4] / [1–4]
-_CITE_ITEM = r"\d+(?:\s*[-–]\s*\d+)?"
-CITATION_RE = re.compile(rf"\[({_CITE_ITEM}(?:\s*[,;]\s*{_CITE_ITEM})*)\]")
-
 
 def prompt_text(name: str, **fields: object) -> str:
     """One of the files in prompts/, ready to drop into a message. Read on
@@ -143,6 +146,7 @@ class ChatConfig:
     tool_results: int
     max_tool_rounds: int
     max_source_tokens: int
+    carry_sources: int
     ollama_context_length: int | None
 
     @classmethod
@@ -181,6 +185,13 @@ class ChatConfig:
             tool_results=_int(env, "CHAT_TOOL_RESULTS", "6"),
             max_tool_rounds=rounds,
             max_source_tokens=_int(env, "CHAT_MAX_SOURCE_TOKENS", "6000"),
+            # How many earlier-cited passages the carry-forward block offers
+            # by label (identifier and location, no text) -- a cap on the
+            # PROMPT, not on what a citation can resolve to: citation_state
+            # itself is read uncapped, so a passage evicted from this list
+            # can still be cited (and re-attached) if the model remembers
+            # its handle from an earlier answer.
+            carry_sources=_int(env, "CHAT_CARRY_SOURCES", "40"),
             # Ollama truncates every model to this regardless of what the
             # model itself supports (unset means Ollama's own built-in
             # default, which we don't try to guess). context_length() uses
@@ -199,8 +210,11 @@ class ChatConfig:
 
 @dataclass
 class Source:
+    # This message's own retrieval index -- what fixes its row in
+    # message_sources (db.py's PRIMARY KEY (message_id, number)). Never
+    # shown to the model or the reader; the citation currency is `handle`.
     number: int
-    found_by: str  # auto | tool
+    found_by: str  # auto | tool | earlier (carried forward, not retrieved this turn)
     query: str
     point_id: str
     doc_sha: str
@@ -210,12 +224,26 @@ class Source:
     headings: list[str]
     text: str
     rerank_score: float | None
+    handle: str = ""
+    doc_number: int | None = None
+    chunk_number: int | None = None
 
     @classmethod
     def from_hit(cls, number: int, hit: Hit, found_by: str, query: str) -> "Source":
         return cls(number=number, found_by=found_by, query=query, point_id=hit.point_id, doc_sha=hit.doc_sha,
                    filename=hit.filename, chunk_index=hit.chunk_index, pages=hit.pages, headings=hit.headings,
-                   text=hit.text, rerank_score=hit.rerank_score)
+                   text=hit.text, rerank_score=hit.rerank_score, handle=handle_for(hit.doc_sha, hit.chunk_index))
+
+    @classmethod
+    def from_earlier(cls, number: int, row: dict) -> "Source":
+        """A passage cited in an earlier turn (db.citation_state), carried
+        into this one so the model can cite it again by the same handle
+        without re-searching. Keeps its already-assigned [doc:chunk] --
+        run_turn never reassigns a live number."""
+        return cls(number=number, found_by="earlier", query=row["query"], point_id=row["point_id"],
+                   doc_sha=row["doc_sha"], filename=row["filename"], chunk_index=row["chunk_index"],
+                   pages=row["pages"], headings=row["headings"], text=row["text"], rerank_score=row["rerank_score"],
+                   handle=row["handle"], doc_number=row["doc_number"], chunk_number=row["chunk_number"])
 
     def label(self) -> str:
         pages = ""
@@ -224,9 +252,14 @@ class Source:
             pages = f", p. {first}" if first == last else f", pp. {first}-{last}"
         return f"{self.filename}{pages}"
 
-    def for_prompt(self) -> str:
+    def for_prompt(self, *, text: bool = True) -> str:
+        """The full `[handle] label\\npassage text` form for the Sources:
+        block, or (text=False) just the identifier and location -- what the
+        carry-forward block offers for a passage cited in an earlier turn,
+        so the model can cite it again without paying for its text twice."""
         section = f" — {' > '.join(self.headings)}" if self.headings else ""
-        return f"[{self.number}] {self.label()}{section}\n{self.text.strip()}"
+        head = f"[{self.handle}] {self.label()}{section}"
+        return head if not text else f"{head}\n{self.text.strip()}"
 
 
 @dataclass
@@ -236,23 +269,10 @@ class TurnResult:
     preset: str = ""
     search_queries: list[str] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
-    cited: list[int] = field(default_factory=list)
-    invalid_citations: list[int] = field(default_factory=list)
+    cited: list[str] = field(default_factory=list)  # handles, first-citation order
+    invalid_citations: list[str] = field(default_factory=list)  # raw text that didn't resolve
+    refs: dict[str, tuple[int, int]] = field(default_factory=dict)  # handle -> (doc_number, chunk_number)
     stats: dict = field(default_factory=dict)
-
-
-def resolve_citations(answer: str, sources: list[Source]) -> tuple[list[int], list[int]]:
-    """Numbers the answer cites, split into ones that exist and ones that don't."""
-    known = {s.number for s in sources}
-    seen: list[int] = []
-    for m in CITATION_RE.finditer(answer):
-        for item in re.split(r"\s*[,;]\s*", m.group(1)):
-            bounds = [int(x) for x in re.split(r"\s*[-–]\s*", item)]
-            lo, hi = bounds[0], bounds[-1]
-            for n in range(lo, min(hi, lo + 50) + 1):  # cap absurd ranges
-                if n not in seen:
-                    seen.append(n)
-    return [n for n in seen if n in known], [n for n in seen if n not in known]
 
 
 def trim_history(history: list[dict], max_tokens: int) -> list[dict]:
@@ -382,40 +402,88 @@ class ChatService:
         return Plan(search, queries[:self.cfg.max_queries] or [question], failed)
 
     def _search(self, query: str, limit: int, seen: set[str], sources: list[Source], found_by: str,
-                budget: list[int], max_tokens: int | None = None, doc_shas: set[str] | None = None) -> list[Source]:
+                budget: list[int], max_tokens: int | None = None, doc_shas: set[str] | None = None,
+                by_handle: dict[str, Source] | None = None) -> list[Source]:
         """New sources for a query, best first, numbered after the existing
         ones: every relevant result that fits this search's token allowance
         (max_tokens) and the turn's remaining budget (budget[0], mutated).
         A result too big for what's left is skipped in favour of smaller,
-        less relevant ones. `limit` only caps the count."""
+        less relevant ones. `limit` only caps the count.
+
+        `by_handle` is run_turn's map of this turn's carried-forward sources
+        (see Source.from_earlier). A hit whose handle is already in it
+        upgrades that Source in place -- a fresh retrieval has a real
+        rerank score and the passage's full text, strictly better than the
+        label-only carried copy -- rather than appending a second row for
+        the same passage. Appending one would make citation_state's dedupe
+        and the UI's handle map ambiguous: this is the single easiest thing
+        here to get wrong, and it fails silently if you do."""
         new = []
         allowance = min(budget[0], max_tokens) if max_tokens else budget[0]
         for hit in self.retriever.retrieve(query, limit=limit, exclude=seen, doc_shas=doc_shas):
-            src = Source.from_hit(len(sources) + 1, hit, found_by, query)
-            cost = estimate_tokens(src.for_prompt())
+            handle = handle_for(hit.doc_sha, hit.chunk_index)
+            carried = by_handle.get(handle) if by_handle else None
+            if carried is not None and (carried.doc_sha, carried.chunk_index) != (hit.doc_sha, hit.chunk_index):
+                # A blake2b collision -- astronomically unlikely (~7.4M handle
+                # space), but silent misattribution is exactly what handles
+                # exist to avoid, so this hit is dropped rather than risked.
+                log.warning("citation handle collision on %s: %s:%s vs %s:%s", handle, carried.doc_sha,
+                           carried.chunk_index, hit.doc_sha, hit.chunk_index)
+                continue
+            candidate = Source.from_hit(carried.number if carried else len(sources) + 1, hit, found_by, query)
+            cost = estimate_tokens(candidate.for_prompt())
             if cost > allowance and (new or sources):  # always allow at least one source
                 continue
             allowance -= cost
             budget[0] -= cost
             seen.update(hit.ids)
-            sources.append(src)
-            new.append(src)
+            if carried is not None:
+                carried.found_by, carried.query, carried.point_id = found_by, query, hit.point_id
+                carried.pages, carried.headings, carried.text = hit.pages, hit.headings, hit.text
+                carried.rerank_score = hit.rerank_score
+                new.append(carried)
+            else:
+                sources.append(candidate)
+                new.append(candidate)
         return new
 
     def run_turn(self, question: str, history: list[dict], preset_name: str | None = None,
                  extra_system: str | None = None, doc_shas: set[str] | None = None,
-                 library_overview: list[dict] | None = None) -> Iterator[dict]:
+                 library_overview: list[dict] | None = None, numbers: CitationNumbers | None = None,
+                 earlier: list[dict] | None = None) -> Iterator[dict]:
         """Yields events: plan, searching, sources, listing, thinking, token, done.
         The done event carries the TurnResult. `doc_shas` restricts every
         search and the document listing to a library scope (None: every
         indexed document; empty: none) -- see Retriever.search. `library_overview`
         is Accounts.library_overview()'s output, offered back to the model
         verbatim through list_libraries -- already filtered to libraries the
-        caller can read, so the model never learns about ones it can't."""
+        caller can read, so the model never learns about ones it can't.
+
+        `numbers` is the conversation's citation numbering so far (db.citation_state);
+        default-empty is exactly what a caller with no conversation (openai_compat)
+        wants. Copied immediately, so a turn that fails part-way leaves the
+        caller's copy untouched -- nothing here is numbered until the turn
+        that numbered it actually finishes. `earlier` is citation_state's list
+        of passages already cited in this conversation (uncapped -- see
+        CHAT_CARRY_SOURCES below), offered back so the model can cite one
+        again without re-searching for it."""
         preset = self.cfg.preset(preset_name)
         result = TurnResult(model=preset.model, preset=preset.name)
+        numbers = numbers.copy() if numbers is not None else CitationNumbers()
         t_start = time.monotonic()
         history = trim_history(history, self.cfg.history_max_tokens)
+
+        # 0. Carry forward what this conversation has already cited: put
+        # these sources in first, so _search's len(sources) + 1 numbering
+        # continues over them unchanged, and index them by handle so a hit
+        # that re-finds one of them upgrades it in place (_search) instead
+        # of appearing twice.
+        by_handle: dict[str, Source] = {}
+        if earlier:
+            carried = [Source.from_earlier(i + 1, row) for i, row in enumerate(earlier)]
+            result.sources.extend(carried)
+            by_handle = {s.handle: s for s in carried}
+            yield {"type": "sources", "sources": [asdict(s) for s in carried]}
 
         # 1. Decide whether the message needs a search at all, and write the
         #    standalone queries for it.
@@ -443,7 +511,7 @@ class ChatService:
             for q in queries:
                 yield {"type": "searching", "query": q, "found_by": "auto"}
                 new = self._search(q, self.cfg.initial_sources, seen, result.sources, "auto", budget,
-                                   each, doc_shas)
+                                   each, doc_shas, by_handle)
                 result.search_queries.append(q)
                 yield {"type": "sources", "sources": [asdict(s) for s in new]}
             result.stats["search_s"] = round(time.monotonic() - t0, 2)
@@ -459,12 +527,32 @@ class ChatService:
             system += "\n" + (PROMPTS / "tools.md").read_text(encoding="utf-8")
         if extra_system:
             system += f"\n\nAdditional instructions:\n{extra_system}"
+        # Retrieved-this-turn sources go in the normal Sources: block with
+        # their full text; carried-forward ones that never got re-found (an
+        # upgraded one is found_by "auto"/"tool" by now, and belongs above)
+        # get their own label-only block below instead.
+        fresh_sources = [s for s in result.sources if s.found_by != "earlier"]
+        earlier_sources = [s for s in result.sources if s.found_by == "earlier"]
         if not do_search:
             context = prompt_text("no_search.md")
-        elif result.sources:
-            context = "Sources:\n\n" + "\n\n".join(s.for_prompt() for s in result.sources)
+        elif fresh_sources:
+            context = "Sources:\n\n" + "\n\n".join(s.for_prompt() for s in fresh_sources)
         else:
             context = prompt_text("no_sources.md")
+        if earlier_sources:
+            # Most recent first-cited, then sorted by [doc:chunk] for
+            # readability -- capped so a long conversation's prompt doesn't
+            # grow without bound; citation_state itself was read uncapped
+            # (`earlier` above), so a passage evicted from this list can
+            # still be cited and reattached in step 4 if the model remembers
+            # its handle from an earlier answer.
+            kept = earlier_sources[-self.cfg.carry_sources:]
+            kept.sort(key=lambda s: (s.doc_number, s.chunk_number))
+            carry_block = ("Cited earlier in this conversation (identifier and location only "
+                           "-- search if you need the text):\n\n" +
+                           "\n".join(s.for_prompt(text=False) for s in kept))
+            budget[0] -= estimate_tokens(carry_block)
+            context = f"{context}\n\n{carry_block}"
         user_turn = f"{context}\n\n---\n\nQuestion: {question}"
         if tools_on and not do_search:
             # The planner's call not to search is a guess made before seeing
@@ -552,16 +640,26 @@ class ChatService:
                 else:
                     yield {"type": "searching", "query": tool_query, "found_by": "tool"}
                     new = self._search(tool_query, self.cfg.tool_results, seen, result.sources, "tool", budget,
-                                       doc_shas=doc_shas)
+                                       doc_shas=doc_shas, by_handle=by_handle)
                     result.search_queries.append(tool_query)
                     yield {"type": "sources", "sources": [asdict(s) for s in new]}
                     reply = ("\n\n".join(s.for_prompt() for s in new) if new
                              else "No further relevant passages found for this query.")
                 messages.append({"role": "tool", "tool_name": name or "", "content": reply})
 
-        # 4. Resolve citations.
+        # 4. Resolve citations: handles the answer cites, against this
+        # turn's sources plus the conversation's numbering (so a handle
+        # cited earlier still resolves even if this turn evicted it from
+        # the carry-forward block). Assigning writes each cited Source's
+        # [doc:chunk] back onto it, so a caller storing result.sources sees
+        # the number without re-deriving it.
         result.answer = "\n\n".join(p.strip() for p in parts if p.strip())
-        result.cited, result.invalid_citations = resolve_citations(result.answer, result.sources)
+        known = {s.handle: s for s in result.sources}
+        citations = parse_citations(result.answer)
+        result.cited, result.invalid_citations = resolve(citations, numbers, known)
+        result.refs = assign_numbers(result.cited, {h: known[h].doc_sha for h in result.cited}, numbers)
+        for handle, (doc_n, chunk_n) in result.refs.items():
+            known[handle].doc_number, known[handle].chunk_number = doc_n, chunk_n
         context_limit = self.context_length(preset.model)
         context_used = round_prompt_tokens + round_eval_tokens
         result.stats.update(
