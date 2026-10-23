@@ -896,3 +896,8 @@ them out with `-m "not integration"`.
 - **Postgres**, on the day the query service runs more than one worker
   process. Until then SQLite in WAL mode is the right answer, and every query
   is already scoped by `user_id`.
+
+## License
+
+© 2026 Ruzgar Altiner. All rights reserved. This code is published for viewing
+only; no license is granted to use, copy, modify or distribute it.
