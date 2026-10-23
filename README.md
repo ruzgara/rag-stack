@@ -122,7 +122,10 @@ Edit `.env`:
 **Developing on a smaller machine?** Set `CHAT_PROVIDER=openrouter` and
 `OPENROUTER_API_KEY`, and give `CHAT_MODEL_EVERYDAY` / `CHAT_MODEL_HARD`
 OpenRouter model ids (e.g. `anthropic/claude-sonnet-5`) to run the chat models
-on OpenRouter instead of Ollama. Only chat moves; embeddings, the VLM fallback
+on OpenRouter instead of Ollama. Requests use floor routing (`:floor`, the
+cheapest provider for the model); an id that already has a suffix such as
+`:free` or `:nitro` is sent as written, and `OPENROUTER_URL` can point at an
+OpenRouter-compatible proxy. Only chat moves; embeddings, the VLM fallback
 and the reranker stay local, so Ollama is still required. The passages
 retrieved for each question are sent to OpenRouter, so use documents you can
 share. Switch back with `CHAT_PROVIDER=ollama`; the change takes effect when
@@ -432,7 +435,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `POST /api/conversations` · `GET /api/conversations` | create (`{preset?, title?, library_ids?, workspace_id?}`; `library_ids` only outside a workspace, 422 otherwise), list (`?archived=true` / `?deleted=true` for the archive and the Recently deleted tray) |
 | `GET` · `PATCH` · `DELETE /api/conversations/{id}` | open (messages with their sources), rename / change preset / change `library_ids`, delete (moves it to Recently deleted) |
 | `POST /api/conversations/{id}/restore` · `/archive` · `/unarchive` | bring a deleted chat back; move a chat out of the normal list and back (an archived chat still opens) |
-| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `queued` (position in line), `user`, `plan` (the planned queries), `searching`, `listing`, `sources`, `thinking`, `citation` (a handle's `[doc:chunk]`, sent as its bracket closes), `token`, `done` (message id, cited handles, `refs` mapping each to its `[doc, chunk]`, all sources, timings), `title` (after the first answer), `error`, `stopped` |
+| `POST /api/conversations/{id}/messages` | `{content, preset?}` → server-sent events: `queued` (position in line), `user`, `plan` (the planned queries), `searching`, `listing`, `sources`, `thinking`, `citation` (a handle's `[doc:chunk]`, sent as its bracket closes), `token`, `done` (message id, cited handles, `refs` mapping each to its `[doc, chunk]`, all sources, timings, and `cost` -- the turn's model calls in US dollars on OpenRouter, `null` on Ollama, not stored with the message), `title` (after the first answer), `error`, `stopped` |
 | `POST /api/conversations/{id}/retry` | regenerate the last answer: it's deleted and the turn reruns, streaming the same events minus `user` |
 | `POST /api/conversations/{id}/stop` | stops the conversation's turn -- the one streaming and any queued behind it → `{stopped: n}` (0 if it had already finished). The turn's own stream ends with `stopped` (`{message_id, answer, cited}`; `{}` if it never left the queue), and the partial answer is kept with status `stopped`. Closing the stream alone doesn't stop a turn |
 | `POST /api/search` | `{query, limit?, fused?, library_ids?}` → ranked chunks |
@@ -459,7 +462,7 @@ answers in a few seconds but rarely searches beyond the automatic search.
 | `GET /api/admin/documents` | every indexed document on the machine, unfiltered, for assigning into libraries (admin-only) |
 | `/api/admin/system/env` (`GET`, `PUT`, `/check`, `/example`, `/backups`) | read, validate, back up and replace `.env` from the admin console. Values the shell would act on when `ragctl` sources the file (`;`, `&&`, `\|`, `$VAR`, unclosed quotes, `KEY =x`…) are refused |
 | `POST /api/admin/system/reload` · `/stack-reload` · `/restart` | apply `.env` changes: rebuild everything that reads it in-process; re-render the LaunchAgents and restart Qdrant, docling and the watcher (poll `GET /stack-reload`); or restart the query service itself for what a reload can't reach (session cookie, port) |
-| `GET /api/health` | Ollama, the Qdrant collection, the database, reranker device, presets, current load |
+| `GET /api/health` | Ollama, OpenRouter (only with `CHAT_PROVIDER=openrouter`), the Qdrant collection, the database, reranker device, presets, current load |
 
 History is stored in `data/chat.db` (SQLite): the UI sends only the new
 message, and the service loads earlier turns, sending the model the most
@@ -496,7 +499,8 @@ are rejected.
                                # smoke test), docling-serve, Qdrant and the query service
 ./ragctl logs [docling|ollama|ingest|query|qdrant]
 ./ragctl logs rotate         # rotate data/logs now (also runs hourly on its own)
-./ragctl models check         # confirm .env model names exist in Ollama
+./ragctl models check         # confirm .env model names exist in Ollama (chat models
+                               # on OpenRouter, with CHAT_PROVIDER=openrouter)
 ./ragctl search "question"    # hybrid search + reranking (-v, --fused, --json)
 ./ragctl user list            # accounts and groups (see below)
 ./ragctl ui <install|dev|build|check|test>  # the web UI -- needs Node only for this
@@ -623,6 +627,8 @@ ragctl user member add Analysts alice@example.com
 ragctl user passwd alice@example.com         # reset a password (signs them out)
 ragctl user rename alice@example.com --name "Alice Smith"
 ragctl user admin alice@example.com [--revoke]   # promote or demote -- terminal only
+ragctl user disable alice@example.com [--enable]   # refuse sign-in and tokens, deleting nothing
+ragctl user delete alice@example.com        # see "Deleting a user" below
 ragctl user list                            # who exists, and their groups
 ```
 
@@ -851,6 +857,7 @@ retrieval, the chat pipeline (planning, source budget, tool rounds,
 citation handles, numbering as they stream and carrying them across turns),
 the streaming endpoint, chat history storage and the reuse of freed citation
 numbers, `.env` validation and reloads, the OpenAI adapter's helpers, the
+OpenRouter ↔ Ollama translation (requests, streamed tool calls, cost), the
 knowledge-base listing tool, the admission queue and ingest quotas, and
 accounts — library ownership and sharing, the highest role winning across a
 user's own access and its groups', session lifecycle, login throttling, and
